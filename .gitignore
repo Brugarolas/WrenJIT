@@ -1,0 +1,13 @@
+/target
+.DS_Store
+/.idea
+/.gradle
+/build
+/out
+/.vscode
+/.settings
+/.classpath
+Cargo.lock
+.zig-cache
+zig-out
+log.txt

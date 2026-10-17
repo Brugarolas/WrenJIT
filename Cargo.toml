@@ -1,0 +1,11 @@
+[package]
+name = "WrenJIT"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+lto = true
+opt-level = 3
+overflow-checks = false
+
+[dependencies]
