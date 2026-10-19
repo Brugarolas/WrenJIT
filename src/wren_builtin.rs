@@ -415,6 +415,14 @@ impl BuiltinHost {
 }
 
 impl Host for BuiltinHost {
+    fn standard_numeric_method(&self, primitive: PrimitiveId, name: &str, arity: u8) -> bool {
+        use BuiltinPrimitive::*;
+        matches!((self.manifest.implementation(primitive), name, arity),
+            (Some(NumAdd), "+", 1) | (Some(NumSub), "-", 1) | (Some(NumMul), "*", 1)
+            | (Some(NumDiv), "/", 1) | (Some(NumNeg), "-", 0)
+            | (Some(NumLt), "<", 1) | (Some(NumLe), "<=", 1) | (Some(NumGt), ">", 1)
+            | (Some(NumGe), ">=", 1) | (Some(NumEq), "==", 1) | (Some(NumNe), "!=", 1))
+    }
     fn call_primitive(
         &mut self,
         context: &mut HostContext<'_>,

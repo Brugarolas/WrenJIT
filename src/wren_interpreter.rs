@@ -21,6 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
+use crate::wren_traceir::{FrameSlot, TraceConstant, TraceLocation};
+use crate::wren_tracingjit::{TraceActivation, TraceActivationInputs, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats};
 
 use crate::wren_bytecode::{
     decode_bailout_reason, function_kind_uses_this, instruction_word_len,
@@ -618,6 +620,7 @@ impl HostContext<'_> {
 }
 
 pub trait Host {
+    fn standard_numeric_method(&self, _primitive: PrimitiveId, _name: &str, _arity: u8) -> bool { false }
     fn call_primitive(
         &mut self,
         _context: &mut HostContext<'_>,
@@ -800,6 +803,7 @@ impl PreparedSwitch {
 struct PreparedFunction {
     handlers: Vec<Handler>,
     ops: Vec<PreparedOp>,
+    original_ops: Vec<PreparedOp>,
     call_args: Vec<Reg>,
     switches: Vec<PreparedSwitch>,
     gc_maps: Vec<ReferenceMap>,
@@ -1055,6 +1059,7 @@ impl PreparedProgram {
             if let Ok(target) = map_word_target(resume.pc.0) { target_ops.insert(target); }
         }
 
+        let original_ops = ops.clone();
         install_superinstructions(&temps, &mut handlers, &mut ops, &target_ops);
 
         let module_slot = *module_by_id.get(&function.module).ok_or_else(|| {
@@ -1064,6 +1069,7 @@ impl PreparedProgram {
         Ok(PreparedFunction {
             handlers,
             ops,
+            original_ops,
             call_args,
             switches,
             gc_maps,
@@ -1445,6 +1451,7 @@ enum RunState {
 }
 
 pub struct Interpreter<'p> {
+    jit: Option<TracingJit>,
     program: &'p BytecodeProgram,
     prepared: PreparedProgram,
     host: Box<dyn Host>,
@@ -1590,6 +1597,7 @@ impl<'p> Interpreter<'p> {
         main.registers.reserve(4096);
 
         Ok(Self {
+            jit: Some(TracingJit::default()),
             program,
             prepared,
             host,
@@ -1623,7 +1631,25 @@ impl<'p> Interpreter<'p> {
         self.gc_enabled = enabled;
     }
 
+    /// Set to None for an interpreter-only run, or provide tracing thresholds.
+    pub fn set_jit_options(&mut self, options: Option<TracingJitOptions>) {
+        self.jit = options.map(TracingJit::new);
+    }
+
+    pub fn jit_stats(&self) -> Option<&TracingJitStats> {
+        self.jit.as_ref().map(TracingJit::stats)
+    }
+
+    fn invalidate_method_traces(&mut self) {
+        if let Some(jit) = &self.jit { self.jit = Some(TracingJit::new(jit.options().clone())); }
+        self.megamorphic_cache.clear();
+        for function in &mut self.inline_caches {
+            for cache in function { *cache = InlineCacheState::default(); }
+        }
+    }
+
     pub fn bind_builtin_primitive(&mut self, class: BuiltinClass, method: MethodSymbol, primitive: PrimitiveId) {
+        self.invalidate_method_traces();
         if let Some(slot) = self
             .builtin_methods
             .get_mut(class as usize)
@@ -1669,6 +1695,7 @@ impl<'p> Interpreter<'p> {
     }
 
     pub fn bind_builtin_native(&mut self, class: BuiltinClass, method: MethodSymbol, native: NativeBuiltin) {
+        self.invalidate_method_traces();
         if let Some(slot) = self
             .builtin_methods
             .get_mut(class as usize)
@@ -1689,6 +1716,7 @@ impl<'p> Interpreter<'p> {
     }
 
     pub fn bind_builtin_foreign(&mut self, class: BuiltinClass, method: MethodSymbol, foreign: ForeignFnId) {
+        self.invalidate_method_traces();
         if let Some(slot) = self
             .builtin_methods
             .get_mut(class as usize)
@@ -1809,6 +1837,14 @@ impl<'p> Interpreter<'p> {
             if self.hot_frame.is_null() {
                 self.fail(RuntimeError::new("running fiber has no frame"));
                 break;
+            }
+            if let Some(mut jit) = self.jit.take() {
+                let result = jit.on_loop_header(self);
+                self.jit = Some(jit);
+                if let Err(error) = result {
+                    self.fail(RuntimeError::new(error.to_string()));
+                }
+                if self.run_state != RunState::Running { break; }
             }
             let frame = unsafe { &*self.hot_frame };
             let pc = frame.pc as usize;
@@ -3365,8 +3401,142 @@ impl Interpreter<'_> {
 }
 
 // =============================================================================
+// Trace runtime adapter. Prepared op indexes and bytecode word PCs are distinct;
+// all transitions between the two use the validated preparation tables.
+// =============================================================================
+
+impl TraceRuntime for Interpreter<'_> {
+    type RuntimeError = RuntimeError;
+
+    fn trace_program(&self) -> &BytecodeProgram { self.program }
+
+    fn trace_standard_numeric_method(&self, function: FuncId, cache: u32) -> bool {
+        let Some(function) = self.program.function(function) else { return false; };
+        let Some(cache) = function.chunk.inline_caches.get(cache as usize) else { return false; };
+        let Some(CallTarget::Primitive(primitive)) = self.builtin_methods[BuiltinClass::Num as usize][cache.method.0 as usize] else { return false; };
+        let Some(signature) = self.program.metadata.method(cache.method) else { return false; };
+        let name = self.program.metadata.string(signature.name).unwrap_or("");
+        signature.kind == crate::wren_ir::MethodKind::Method
+            && self.host.standard_numeric_method(primitive, name, signature.arity)
+    }
+
+    fn trace_current_location(&self) -> TraceLocation {
+        if self.hot_frame.is_null() {
+            return TraceLocation::new(FuncId(u32::MAX), BytecodePc(u32::MAX));
+        }
+        let frame = self.current_frame();
+        let function = &self.prepared.functions[frame.function as usize];
+        let pc = function.original_ops.get(frame.pc as usize).map_or(u32::MAX, |op| op.raw_pc);
+        TraceLocation::new(function.id, BytecodePc(pc))
+    }
+
+    fn trace_read_slot(&self, slot: FrameSlot) -> Result<RegisterWord, RuntimeError> {
+        let frame = self.current_frame();
+        let value = match slot {
+            FrameSlot::General(reg) if reg.0 as u16 >= frame.reg_count => None,
+            FrameSlot::General(reg) => Some(unsafe { &*self.hot_registers.add(reg.index()) }),
+            FrameSlot::Argument(reg) => frame.arguments.get(reg.0 as usize),
+            FrameSlot::Return(reg) => frame.returns.get(reg.0 as usize),
+            FrameSlot::Special(reg) => frame.special.get(reg.index()),
+        };
+        value.copied().ok_or_else(|| RuntimeError::new("trace slot out of bounds"))
+    }
+
+    fn trace_write_slot(&mut self, slot: FrameSlot, value: RegisterWord) -> Result<(), RuntimeError> {
+        let bank = self.hot_registers;
+        let frame = self.current_frame_mut();
+        let target = match slot {
+            FrameSlot::General(reg) if reg.0 as u16 >= frame.reg_count => None,
+            FrameSlot::General(reg) => Some(unsafe { &mut *bank.add(reg.index()) }),
+            FrameSlot::Argument(reg) => frame.arguments.get_mut(reg.0 as usize),
+            FrameSlot::Return(reg) => frame.returns.get_mut(reg.0 as usize),
+            FrameSlot::Special(reg) => frame.special.get_mut(reg.index()),
+        }.ok_or_else(|| RuntimeError::new("trace slot out of bounds"))?;
+        *target = value; Ok(())
+    }
+
+    fn trace_set_location(&mut self, location: TraceLocation) -> Result<(), RuntimeError> {
+        let prepared = self.current_prepared();
+        if prepared.id != location.function { return Err(RuntimeError::new("trace function mismatch")); }
+        let pc = prepared.word_to_op.get(location.pc.0 as usize).copied()
+            .filter(|pc| *pc != NO_INDEX && (*pc as usize) < prepared.original_ops.len())
+            .ok_or_else(|| RuntimeError::new("invalid trace resume PC"))?;
+        unsafe { self.set_pc(pc); } Ok(())
+    }
+
+    fn trace_execute_unfused_step(&mut self) -> Result<TraceStep, RuntimeError> {
+        let before = self.trace_current_location();
+        let fiber = self.current_fiber;
+        let depth = self.fiber(fiber).frames.len();
+        let function = self.current_frame().function;
+        let op = self.current_prepared().original_ops[self.current_frame().pc as usize];
+        let opcode = self.program.functions[function as usize].chunk.code[op.raw_pc as usize].opcode().unwrap();
+        unsafe { handler_for(opcode)(self, &op); }
+        let running = self.run_state == RunState::Running;
+        let after = self.trace_current_location();
+        let frame_changed = self.current_fiber != fiber || self.fiber(self.current_fiber).frames.len() != depth
+            || self.hot_frame.is_null() || self.current_frame().function != function;
+        Ok(TraceStep { before, after, frame_changed, running })
+    }
+
+    fn trace_activation_inputs(&mut self) -> Result<TraceActivationInputs, RuntimeError> {
+        let general = self.hot_registers;
+        let runtime = self as *mut Self as *mut std::ffi::c_void;
+        let frame = self.current_frame_mut();
+        Ok(TraceActivationInputs { general, arguments: frame.arguments.as_mut_ptr(),
+            returns: frame.returns.as_mut_ptr(), special: frame.special.as_mut_ptr(), runtime,
+            execute: execute_trace_runtime })
+    }
+
+    fn trace_materialize_constant(&self, constant: TraceConstant) -> Result<RegisterWord, RuntimeError> {
+        Ok(match constant {
+            TraceConstant::Null => Value::NULL.word(),
+            TraceConstant::Bool(v) => Value::from_bool(v).word(),
+            TraceConstant::NumBits(v) | TraceConstant::F64Bits(v) => RegisterWord(v),
+            TraceConstant::Int32(v) => i32_word(v),
+            TraceConstant::String(id) => self.strings.get(id.0 as usize).ok_or_else(|| RuntimeError::new("unknown string"))?.word(),
+            TraceConstant::BuiltinClass(id) => self.builtin_value(id).word(),
+        })
+    }
+
+    fn trace_unsupported_constant_error(&self, _: TraceConstant) -> RuntimeError {
+        RuntimeError::new("unsupported trace constant")
+    }
+}
+
+/// The native caller has committed all dirty registers. A helper may collect,
+/// throw, suspend or replace the frame: only a matching continuation may resume.
+unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, function: u32, pc: u32, next: u32) -> u32 {
+    // Rust unwinding must never cross generated code (it has no unwind metadata).
+    let activation = unsafe { &mut *activation };
+    let vm = unsafe { &mut *(activation.runtime as *mut Interpreter<'_>) };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vm.trace_set_location(TraceLocation::new(FuncId(function), BytecodePc(pc)))?;
+        vm.trace_execute_unfused_step()
+    }));
+    match result {
+        Ok(Ok(step)) if step.running && !step.frame_changed
+            && step.after == TraceLocation::new(FuncId(function), BytecodePc(next)) => {
+                let inputs = vm.trace_activation_inputs().unwrap();
+                activation.general = inputs.general;
+                activation.arguments = inputs.arguments;
+                activation.returns = inputs.returns;
+                activation.special = inputs.special;
+                0
+            },
+        Ok(Ok(_)) => 1,
+        Ok(Err(error)) => { vm.fail(error); 1 },
+        Err(_) => { vm.fail(RuntimeError::new("panic in JIT runtime helper")); 1 },
+    }
+}
+
+// =============================================================================
 // Tests that require only hand-built bytecode.
 // =============================================================================
+
+#[cfg(test)]
+#[path = "wren_jit_tests.rs"]
+mod jit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3402,6 +3572,61 @@ mod tests {
         let mut vm = Interpreter::new(&program).unwrap();
         let result = vm.run_function(FuncId(0), &[]).unwrap();
         match result { ExecutionResult::Returned(value) => assert_eq!(value.as_num(), Some(42.0)), _ => panic!() }
+    }
+
+    #[test]
+    fn jit_executes_native_return_and_integer_loop() {
+        let mut asm = Assembler::new();
+        asm.emit_ab(Opcode::LoadI8, 0, 0);
+        asm.emit_ab(Opcode::LoadI8, 1, 1);
+        asm.emit_ab(Opcode::LoadI8, 2, 100);
+        let head = asm.label();
+        let done = asm.label();
+        asm.bind(head);
+        asm.emit_abc(Opcode::ICmpLt, 3, 0, 2);
+        asm.emit_jump_if_false(Reg(3), done);
+        asm.emit_abc(Opcode::IAdd, 0, 0, 1);
+        asm.emit_jump(head);
+        asm.bind(done);
+        asm.emit_ab(Opcode::Int32ToNum, 4, 0);
+        asm.emit_a(Opcode::Return, 4);
+        let program = simple_program(asm.finish().unwrap(), 5);
+        let mut vm = Interpreter::new(&program).unwrap();
+        vm.set_jit_options(Some(TracingJitOptions { hot_loop_threshold: 2, ..Default::default() }));
+        for iteration in 0..3 {
+            let ExecutionResult::Returned(value) = vm.run_function(FuncId(0), &[]).unwrap() else { panic!() };
+            assert_eq!(value.as_num(), Some(100.0), "iteration {iteration}: {:?}\n{:#?}", vm.jit_stats(), vm.jit.as_ref().unwrap().trace(crate::wren_traceir::TraceId(0)));
+        }
+        let stats = vm.jit_stats().unwrap();
+        assert!(stats.native_entries > 0, "{stats:?}");
+        assert_eq!(stats.recordings_aborted, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn jit_executes_runtime_helpers_and_gc() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::AllocList, 0);
+        asm.emit_a(Opcode::LoadTrue, 1);
+        asm.emit_ab(Opcode::ListAppend, 0, 1);
+        asm.emit_ab(Opcode::ListLen, 2, 0);
+        asm.emit_ab(Opcode::Int32ToNum, 3, 2);
+        asm.emit_a(Opcode::Return, 3);
+        let mut chunk = asm.finish().unwrap();
+        chunk.safepoints.push(SafepointEntry { pc: BytecodePc(0), kind: SafepointKind::Allocation, references: ReferenceMap::default() });
+        let mut roots = ReferenceMap::default();
+        roots.set_general(Reg(0), true);
+        chunk.safepoints.push(SafepointEntry { pc: BytecodePc(2), kind: SafepointKind::RuntimeMutation, references: roots });
+        let program = simple_program(chunk, 4);
+        let mut vm = Interpreter::new(&program).unwrap();
+        vm.set_jit_options(Some(TracingJitOptions { hot_loop_threshold: 1, ..Default::default() }));
+        for _ in 0..3 {
+            vm.heap.next_gc = 0;
+            let ExecutionResult::Returned(value) = vm.run_function(FuncId(0), &[]).unwrap() else { panic!() };
+            assert_eq!(value.as_num(), Some(1.0));
+        }
+        let stats = vm.jit_stats().unwrap();
+        assert!(stats.native_entries >= 2, "{stats:?}");
+        assert_eq!(stats.recordings_aborted, 0, "{stats:?}");
     }
 
     #[test]

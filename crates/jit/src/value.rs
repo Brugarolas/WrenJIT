@@ -222,7 +222,7 @@ impl Value {
 
     pub fn is_int32_of(&self, val: i32) -> bool {
         match self.kind.opcode() {
-            Opcode::Const64 => self.as_int32() == Some(val),
+            Opcode::Const32 => self.as_int32() == Some(val),
             _ => false,
         }
     }

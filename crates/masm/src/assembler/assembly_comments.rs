@@ -76,9 +76,6 @@ impl AssemblyCommentsRegistry {
         let end = end as usize;
 
         let mut comments = self.lock.lock();
-        for (pos, comment) in new_comments.iter() {
-            println!("{:x}: {}", pos, comment);
-        }
         comments.push((start, end, new_comments));
     }
 }

@@ -795,7 +795,11 @@ impl<'a> BasicBlockBuilder<'a> {
     pub fn binary(&mut self, op: Opcode, lhs: ValueId, rhs: ValueId) -> ValueId {
         assert!(op.is_binary());
         assert!(self.procedure.value(lhs).typ() == self.procedure.value(rhs).typ());
-        let typ = self.procedure.value(lhs).typ();
+        let typ = if matches!(op, Opcode::Equal | Opcode::NotEqual | Opcode::LessThan
+            | Opcode::LessEqual | Opcode::GreaterThan | Opcode::GreaterEqual
+            | Opcode::Above | Opcode::AboveEqual | Opcode::Below | Opcode::BelowEqual) {
+            Type::Int32
+        } else { self.procedure.value(lhs).typ() };
         let value = Value::new(op, typ, NumChildren::Two, &[lhs, rhs], ValueData::None);
 
         let x = self.procedure.add(value);

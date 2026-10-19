@@ -2452,6 +2452,7 @@ impl<'a> ReduceStrength<'a> {
                     .proc
                     .value(self.value.child(self.proc, 1))
                     .is_int32_of(0)
+                    && self.proc.value(self.value.child(self.proc, 0)).returns_bool(self.proc)
                 {
                     let bool = self.value.child(self.proc, 0);
                     let one = self.proc.add_int_constant(Type::Int32, 1);
@@ -2474,6 +2475,7 @@ impl<'a> ReduceStrength<'a> {
                     .proc
                     .value(self.value.child(self.proc, 1))
                     .is_int32_of(1)
+                    && self.proc.value(self.value.child(self.proc, 0)).returns_bool(self.proc)
                 {
                     let bool = self.value.child(self.proc, 0);
                     self.replace_with_identity(bool);
@@ -2704,6 +2706,7 @@ impl<'a> ReduceStrength<'a> {
                         self.proc
                             .value_mut(self.value)
                             .replace_with_jump(self.block, taken);
+                        self.proc.block_mut(self.block).successor_list = vec![taken];
                         self.changed_cfg = true;
                     }
                     TriState::False => {
@@ -2713,6 +2716,7 @@ impl<'a> ReduceStrength<'a> {
                         self.proc
                             .value_mut(self.value)
                             .replace_with_jump(self.block, not_taken);
+                        self.proc.block_mut(self.block).successor_list = vec![not_taken];
                         self.changed_cfg = true;
                     }
                     TriState::Undeterminate => (),

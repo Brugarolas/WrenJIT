@@ -105,7 +105,8 @@ pub fn compute_ccalling_convention(code: &mut Code, value: ValueId) -> Vec<Arg> 
 
     let mut gp_argument_count = 0;
     let mut fp_argument_count = 0;
-    let mut stack_offset = 0;
+    // Win64 reserves four eight-byte home slots even for register-only calls.
+    let mut stack_offset = if cfg!(all(target_os = "windows", target_arch = "x86_64")) { 32 } else { 0 };
 
     for i in 1..code.proc.value(value).children.len() {
         let child = code.proc.value(value).children[i];

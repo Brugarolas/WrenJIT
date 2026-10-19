@@ -11,3 +11,4 @@ overflow-checks = false
 [dependencies]
 ariadne = "0.6"
 logos = "0.16"
+b3 = { path = "crates/jit" }
