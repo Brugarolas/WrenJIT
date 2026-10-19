@@ -51,13 +51,11 @@ impl<'a> MoveConstants<'a> {
     fn goes_in_table(val: ValueId, proc: &Procedure) -> bool {
         match proc.value(val).kind.opcode() {
             Opcode::ConstDouble => {
-                let double_zero = 0.0;
-                proc.value(val).as_double().unwrap() != double_zero
+                proc.value(val).as_double().unwrap().to_bits() != 0
             }
 
             Opcode::ConstFloat => {
-                let float_zero = 0.0;
-                proc.value(val).as_float().unwrap() != float_zero
+                proc.value(val).as_float().unwrap().to_bits() != 0
             }
 
             _ => false,

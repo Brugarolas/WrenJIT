@@ -2797,6 +2797,7 @@ impl FunctionEmitter<'_> {
             id: self.function.id,
             module: self.function.module,
             kind: self.function.kind,
+            field_owner: self.function.field_owner,
             name: self.function.signature.name,
             arity,
             capture_count,

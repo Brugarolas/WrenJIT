@@ -71,6 +71,63 @@ fn test_simple_double() {
 }
 
 #[test]
+fn test_floating_point_division() {
+    for typ in [b3::Type::Float, b3::Type::Double] {
+        let mut proc = b3::Procedure::new(Default::default());
+        let entry = proc.add_block(1.0);
+        let mut builder = b3::BasicBlockBuilder::new(&mut proc, entry);
+        let numerator = builder.argument(Reg::new_fpr(ARGUMENT_FPR0), typ);
+        let denominator = builder.argument(Reg::new_fpr(ARGUMENT_FPR1), typ);
+        let quotient = builder.binary(b3::Opcode::Div, numerator, denominator);
+        builder.return_(Some(quotient));
+
+        let compilation = b3::compile(proc);
+        if typ == b3::Type::Float {
+            let func: extern "C" fn(f32, f32) -> f32 =
+                unsafe { std::mem::transmute(compilation.code_ref().start()) };
+            assert_eq!(func(9.0, 3.0), 3.0);
+            assert_eq!(func(3.0, 9.0), 1.0 / 3.0);
+            assert_eq!(func(-9.0, 3.0), -3.0);
+        } else {
+            let func: extern "C" fn(f64, f64) -> f64 =
+                unsafe { std::mem::transmute(compilation.code_ref().start()) };
+            assert_eq!(func(9.0, 3.0), 3.0);
+            assert_eq!(func(3.0, 9.0), 1.0 / 3.0);
+            assert_eq!(func(-9.0, 3.0), -3.0);
+        }
+    }
+}
+
+#[test]
+fn test_floating_point_zero_constants() {
+    for negative in [false, true] {
+        for typ in [b3::Type::Float, b3::Type::Double] {
+            let mut proc = b3::Procedure::new(Default::default());
+            let entry = proc.add_block(1.0);
+            let mut builder = b3::BasicBlockBuilder::new(&mut proc, entry);
+            let zero = if negative { -0.0 } else { 0.0 };
+            let value = if typ == b3::Type::Float {
+                builder.const_float(zero as f32)
+            } else {
+                builder.const_double(zero)
+            };
+            builder.return_(Some(value));
+
+            let compilation = b3::compile(proc);
+            if typ == b3::Type::Float {
+                let func: extern "C" fn() -> f32 =
+                    unsafe { std::mem::transmute(compilation.code_ref().start()) };
+                assert_eq!(func().to_bits(), (zero as f32).to_bits());
+            } else {
+                let func: extern "C" fn() -> f64 =
+                    unsafe { std::mem::transmute(compilation.code_ref().start()) };
+                assert_eq!(func().to_bits(), zero.to_bits());
+            }
+        }
+    }
+}
+
+#[test]
 fn test_stack_slot() {
     let mut proc = b3::Procedure::new(Default::default());
 

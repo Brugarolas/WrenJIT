@@ -45,11 +45,11 @@ const MAX_WREN_FIELDS: usize = u16::MAX as usize;
 
 #[derive(Clone, Debug)]
 pub struct LowerOptions {
-    /// Emit an error when a class with instance fields has a superclass whose
-    /// field layout is not statically known to this compilation unit.
+    /// Retained for source/API compatibility.
     ///
-    /// The current IR uses absolute `FieldSlot`s, so silently guessing an
-    /// inherited field offset would be incorrect.
+    /// Field slots are now class-local in WIR and relocated once at runtime
+    /// class-link time, so dynamic/imported superclasses no longer make field
+    /// layout ambiguous and this option no longer rejects them.
     pub require_static_super_layout_for_fields: bool,
     /// Warn for declarations that shadow another local in an outer lexical scope.
     pub warn_shadowing: bool,
@@ -726,7 +726,8 @@ struct ClassPlan {
     name: String,
     declaration_span: Span,
     superclass: Option<ClassId>,
-    superclass_known_layout: bool,
+    /// Instance fields declared directly by this class. Slots always start at
+    /// zero; runtime class linking adds the inherited field base once.
     fields: HashMap<String, FieldSlot>,
     static_fields: HashMap<String, StaticFieldSlot>,
     methods: Vec<MethodPlan>,
@@ -939,7 +940,6 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     name: class.name.value.clone(),
                     declaration_span: class.name.span,
                     superclass: None,
-                    superclass_known_layout: false,
                     fields: HashMap::new(),
                     static_fields: HashMap::new(),
                     methods: Vec::new(),
@@ -965,9 +965,10 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             local_static_fields.insert(class.name.span, statics);
         }
 
-        // Resolve known top-level superclasses and compute absolute field slots.
-        // Unknown/dynamic superclasses are still legal when no instance field
-        // offset is required by this class.
+        // Resolve statically-known superclass identities for metadata/cycle
+        // diagnostics. Instance field slots remain local to the declaring class;
+        // runtime class linking relocates them after the actual superclass is
+        // known, so imported/dynamic superclasses are fully supported.
         let mut resolving = HashSet::new();
         let mut resolved = HashSet::new();
         for (class, _) in &declarations {
@@ -1007,10 +1008,13 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             _ => None,
         });
 
-        let mut inherited = 0usize;
-        let mut superclass_known_layout = class.superclass.is_none();
+        // Recurse only to preserve the useful compile-time cycle diagnostic.
+        // Slot numbering itself is independent of the superclass layout.
         if let Some(super_id) = static_super {
-            if let Some((super_decl, _)) = find_class_by_id(self.program, super_id, self.ast).map(|(decl, top)| (decl.clone(), top)) {
+            if let Some((super_decl, _)) =
+                find_class_by_id(self.program, super_id, self.ast)
+                    .map(|(decl, top)| (decl.clone(), top))
+            {
                 self.resolve_class_layout(
                     &super_decl,
                     local_instance_fields,
@@ -1019,31 +1023,10 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     resolved,
                 );
             }
-            if let Some(info) = self.program.class(super_id) {
-                inherited = info.instance_field_count as usize;
-                superclass_known_layout = true;
-            }
         }
 
         let locals = local_instance_fields.get(&key).cloned().unwrap_or_default();
-        if !superclass_known_layout
-            && !locals.is_empty()
-            && self.options.require_static_super_layout_for_fields
-        {
-            self.error(
-                "WREN-L004",
-                format!(
-                    "class '{}' has instance fields but its superclass layout is dynamic",
-                    class.name.value
-                ),
-                class.superclass.as_ref().map(|expr| expr.span).unwrap_or(class.name.span),
-            );
-            self.diagnostics.last_mut().unwrap().notes.push(
-                "The current WIR stores absolute FieldSlot indices. Compile the superclass in the same program, or extend WIR with runtime-relative field slots.".to_owned(),
-            );
-        }
-
-        if inherited + locals.len() > MAX_WREN_FIELDS {
+        if locals.len() > MAX_WREN_FIELDS {
             self.error(
                 "WREN-L005",
                 "class contains too many instance fields",
@@ -1060,10 +1043,17 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             );
         }
 
+        // Fixed-layout slots are local to the declaring class here. The runtime
+        // turns them into absolute slots:
+        //
+        //   absolute = superclass.total_instance_fields + local_slot
+        //
+        // once, when CreateClass executes.
         let mut fields = HashMap::new();
         for (index, name) in locals.into_iter().enumerate() {
-            fields.insert(name, FieldSlot((inherited + index) as u16));
+            fields.insert(name, FieldSlot(index as u16));
         }
+
         let mut static_fields = HashMap::new();
         for (index, name) in statics.into_iter().enumerate() {
             static_fields.insert(name, StaticFieldSlot(index as u16));
@@ -1072,12 +1062,12 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         let id = self.class_plans[&key].id;
         if let Some(info) = self.program.classes.iter_mut().find(|info| info.id == id) {
             info.superclass = static_super;
-            info.instance_field_count = (inherited + fields.len()) as u16;
+            info.own_instance_field_count = fields.len() as u16;
             info.static_field_count = static_fields.len() as u16;
         }
+
         let plan = self.class_plans.get_mut(&key).unwrap();
         plan.superclass = static_super;
-        plan.superclass_known_layout = superclass_known_layout;
         plan.fields = fields;
         plan.static_fields = static_fields;
 
@@ -1293,6 +1283,12 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             param_types,
             Type::Top,
         );
+        if let Some(class) = spec.class {
+            // Methods and closures nested inside them use field slots local to
+            // this declaring class. The runtime relocates them exactly once when
+            // CreateClass knows the actual superclass layout.
+            builder.set_field_owner(class);
+        }
 
         // Captures must be declared before *any* emitted instruction.
         let mut capture_values = HashMap::new();
@@ -3470,4 +3466,89 @@ class Counter {
         );
         assert!(output.program.functions.len() >= 3);
     }
+    #[test]
+    fn instance_field_slots_are_local_to_declaring_class() {
+        let source = r#"
+class Parent {
+  parent { _parent }
+}
+
+class Child is Parent {
+  construct new(v) { _child = v }
+  child { _child }
+}
+"#;
+        let module = parse(source);
+        let output = lower_new_program("test.wren", source, "test", &module);
+        assert!(
+            !output.has_errors(),
+            "lower diagnostics: {:#?}",
+            output.diagnostics
+        );
+
+        let child = output
+            .program
+            .classes
+            .iter()
+            .find(|class| output.program.string(class.name) == Some("Child"))
+            .expect("Child class");
+        assert_eq!(child.own_instance_field_count, 1);
+
+        let mut saw_child_field = false;
+        for function in &output.program.functions {
+            if function.field_owner != Some(child.id) {
+                continue;
+            }
+            for node in &function.nodes {
+                match &node.kind {
+                    Inst::LoadField { slot, .. } | Inst::StoreField { slot, .. } => {
+                        assert_eq!(
+                            *slot,
+                            FieldSlot(0),
+                            "Child's own field must stay class-local before runtime relocation"
+                        );
+                        saw_child_field = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_child_field);
+    }
+
+    #[test]
+    fn dynamic_superclass_with_fields_no_longer_requires_static_layout() {
+        let source = r#"
+class Parent {
+  parent { _parent }
+}
+
+var Alias = Parent
+
+class Child is Alias {
+  construct new(v) { _child = v }
+  child { _child }
+}
+"#;
+        let module = parse(source);
+        let output = lower_new_program("test.wren", source, "test", &module);
+        assert!(
+            !output.has_errors(),
+            "dynamic superclass field layout should be relocated at runtime: {:#?}",
+            output.diagnostics
+        );
+
+        let child = output
+            .program
+            .classes
+            .iter()
+            .find(|class| output.program.string(class.name) == Some("Child"))
+            .expect("Child class");
+        assert_eq!(child.own_instance_field_count, 1);
+        assert_eq!(
+            child.superclass, None,
+            "Alias is intentionally dynamic from the lowerer's point of view"
+        );
+    }
+
 }

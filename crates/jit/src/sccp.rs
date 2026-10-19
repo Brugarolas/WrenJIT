@@ -58,10 +58,8 @@ impl Lattice {
         if self.level == LatticeLevel::Constant {
             let v1 = self.val.unwrap();
             let v2 = other.val.unwrap();
-
-
-            return proc.value(v1).kind.opcode() == proc.value(v2).kind.opcode()
-                && proc.value(v1).as_int().unwrap() == proc.value(v2).as_int().unwrap();
+            return proc.value(v1).key().expect("constant must have a value key")
+                == proc.value(v2).key().expect("constant must have a value key");
         }
 
         true
@@ -731,5 +729,107 @@ fn possible_const(proc: &Procedure, val: ValueId) -> bool {
         | Below | BelowEqual | GreaterThan | GreaterEqual | LessThan | LessEqual | Shl | SShr
         | ZShr | BitAnd | BitOr | BitXor => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_lattice_equality() {
+        let cases = [
+            (Value::make_const32(7), Value::make_const32(7), true),
+            (Value::make_const32(7), Value::make_const32(8), false),
+            (Value::make_const64(7), Value::make_const64(7), true),
+            (Value::make_const64(7), Value::make_const64(8), false),
+            (Value::make_const32(7), Value::make_const64(7), false),
+            (Value::make_const_float(1.5), Value::make_const_float(1.5), true),
+            (Value::make_const_float(1.5), Value::make_const_float(2.5), false),
+            (
+                Value::make_const_double(1.5),
+                Value::make_const_double(1.5),
+                true,
+            ),
+            (
+                Value::make_const_double(1.5),
+                Value::make_const_double(2.5),
+                false,
+            ),
+            (
+                Value::make_const_float(1.5),
+                Value::make_const_double(1.5),
+                false,
+            ),
+            (
+                Value::make_const_float(0.0),
+                Value::make_const_float(-0.0),
+                false,
+            ),
+            (
+                Value::make_const_double(0.0),
+                Value::make_const_double(-0.0),
+                false,
+            ),
+            (
+                Value::make_const_float(f32::NAN),
+                Value::make_const_float(f32::NAN),
+                true,
+            ),
+            (
+                Value::make_const_double(f64::NAN),
+                Value::make_const_double(f64::NAN),
+                true,
+            ),
+            (
+                Value::make_const_float(f32::from_bits(0x7fc0_0001)),
+                Value::make_const_float(f32::from_bits(0x7fc0_0002)),
+                false,
+            ),
+            (
+                Value::make_const_double(f64::from_bits(0x7ff8_0000_0000_0001)),
+                Value::make_const_double(f64::from_bits(0x7ff8_0000_0000_0002)),
+                false,
+            ),
+        ];
+
+        let mut proc = Procedure::new(Default::default());
+        for (left, right, expected) in cases {
+            let left = Lattice {
+                level: LatticeLevel::Constant,
+                val: Some(proc.add(left)),
+            };
+            let right = Lattice {
+                level: LatticeLevel::Constant,
+                val: Some(proc.add(right)),
+            };
+            assert_eq!(left.equals(&right, &proc), expected);
+            assert_eq!(right.equals(&left, &proc), expected);
+        }
+    }
+
+    #[test]
+    fn propagates_floating_point_constants_on_revisit() {
+        for constant in [
+            Value::make_const_float(1.5),
+            Value::make_const_double(1.5),
+            Value::make_const_float(f32::NAN),
+            Value::make_const_double(f64::NAN),
+            Value::make_const_float(-0.0),
+            Value::make_const_double(-0.0),
+        ] {
+            let mut proc = Procedure::new(Default::default());
+            let entry = proc.add_block(1.0);
+            let value = proc.add(constant);
+            let mut builder = crate::BasicBlockBuilder::new(&mut proc, entry);
+            builder.add_value(value);
+            let identity = builder.identity(value);
+            builder.return_(Some(identity));
+
+            sccp(&mut proc);
+
+            assert!(proc.value(identity).is_constant());
+            assert!(proc.value(identity).key() == proc.value(value).key());
+        }
     }
 }

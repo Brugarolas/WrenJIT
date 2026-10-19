@@ -1,3 +1,5 @@
+var start = System.clock
+
 class JitBench {
   static integratePi(steps) {
     var sum = 0.0
@@ -78,3 +80,10 @@ class JitBench {
     return checksum + escaped
   }
 }
+
+JitBench.integratePi(1000000)
+JitBench.xorshift(1000000)
+JitBench.mandelbrot(800, 600, 1000)
+
+var elapsed = System.clock - start
+System.print("elapsed: %(elapsed)")

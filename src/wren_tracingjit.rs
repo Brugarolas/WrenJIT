@@ -357,7 +357,10 @@ impl Default for TracingJitOptions {
             b3_dump_ir: false,
             b3_dump_air: false,
 
-            no_runtime_calls_in_native_trace: false,
+            // Until an opcode has a real native lowering, do not compile a
+            // trace that bounces through Rust for it on every iteration. Such a
+            // trace is normally slower than the threaded interpreter.
+            no_runtime_calls_in_native_trace: true,
         }
     }
 }

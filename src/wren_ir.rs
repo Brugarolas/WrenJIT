@@ -343,10 +343,18 @@ pub struct ClassInfo {
     pub id: ClassId,
     pub module: ModuleId,
     pub name: StringId,
+    /// Statically known superclass, when the superclass expression resolves to a
+    /// class in this Program. Runtime class linking remains authoritative.
     pub superclass: Option<ClassId>,
-    /// Total instance slots visible to this class, including inherited slots.
-    pub instance_field_count: u16,
-    /// Static storage slots owned by this class.
+    /// Instance fields declared directly by this class.
+    ///
+    /// FieldSlot operands in WIR/bytecode are class-local until runtime class
+    /// linking. The interpreter relocates every method/closure owned by the class
+    /// by the inherited field count exactly once, after the actual superclass is
+    /// known. Hot execution therefore sees absolute fixed-layout field offsets.
+    pub own_instance_field_count: u16,
+    /// Static storage slots owned by this class. Static fields are not folded
+    /// into the inherited instance layout.
     pub static_field_count: u16,
     pub is_foreign: bool,
 }
@@ -657,10 +665,13 @@ pub enum Inst {
         class: ClassId,
         size: ValueId,
     },
+    /// Loads an instance field. `slot` is local to Function::field_owner in WIR
+    /// and is relocated to an absolute fixed-layout slot by runtime class linking.
     LoadField {
         object: ValueId,
         slot: FieldSlot,
     },
+    /// Stores an instance field; slot relocation follows LoadField semantics.
     StoreField {
         object: ValueId,
         slot: FieldSlot,
@@ -1343,6 +1354,12 @@ pub struct Function {
     pub id: FuncId,
     pub module: ModuleId,
     pub kind: FunctionKind,
+    /// Class whose instance-field layout this function was compiled against.
+    ///
+    /// This is set for methods and for closures lexically nested inside methods.
+    /// Their FieldSlot operands are local to this declaring class and are
+    /// relocated to absolute offsets when the runtime class is linked.
+    pub field_owner: Option<ClassId>,
     pub signature: Signature,
     pub entry: BlockId,
     pub blocks: Vec<Block>,
@@ -1499,7 +1516,7 @@ impl Program {
         module: ModuleId,
         name: impl AsRef<str>,
         superclass: Option<ClassId>,
-        instance_field_count: u16,
+        own_instance_field_count: u16,
         static_field_count: u16,
         is_foreign: bool,
     ) -> ClassId {
@@ -1510,7 +1527,7 @@ impl Program {
             module,
             name: self.intern_string(name),
             superclass,
-            instance_field_count,
+            own_instance_field_count,
             static_field_count,
             is_foreign,
         };
@@ -1603,6 +1620,7 @@ impl<'p> Builder<'p> {
             id: function_id,
             module,
             kind,
+            field_owner: None,
             signature: Signature {
                 name,
                 params: params.clone(),
@@ -1647,6 +1665,14 @@ impl<'p> Builder<'p> {
             current_effect: entry_effect,
             current_source: None,
         }
+    }
+
+    /// Marks this function as using instance-field slots local to `class`.
+    ///
+    /// Runtime class linking converts those local slots to absolute fixed-layout
+    /// offsets exactly once, after the actual superclass is known.
+    pub fn set_field_owner(&mut self, class: ClassId) {
+        self.function.field_owner = Some(class);
     }
 
     pub fn function_id(&self) -> FuncId {

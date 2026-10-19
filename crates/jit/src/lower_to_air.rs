@@ -2958,7 +2958,7 @@ impl<'a> LowerToAir<'a> {
                 let left = self.child_id(self.value, 0);
                 let right = self.child_id(self.value, 1);
 
-                self.append_bin_op::<{ AirOpcode::Div32 as i16 }, { AirOpcode::Div64 as i16 }, { AirOpcode::DivFloat as i16 }, { AirOpcode::DivDouble as i16 }, false>(left, right);
+                self.append_bin_op::<{ AirOpcode::Div32 as i16 }, { AirOpcode::Div64 as i16 }, { AirOpcode::DivFloat as i16 }, { AirOpcode::DivDouble as i16 }, true>(left, right);
             }
 
             Opcode::UDiv => {
@@ -3286,7 +3286,16 @@ impl<'a> LowerToAir<'a> {
             }
 
             Opcode::ConstDouble | Opcode::ConstFloat => {
-                unreachable!("move_constants phase should fuse these");
+                let value = self.value(self.value);
+                let opcode = if value.kind.opcode() == Opcode::ConstDouble {
+                    assert_eq!(value.as_double().unwrap().to_bits(), 0);
+                    AirOpcode::MoveZeroToDouble
+                } else {
+                    assert_eq!(value.as_float().unwrap().to_bits(), 0);
+                    AirOpcode::MoveZeroToFloat
+                };
+                let result = self.tmp(self.value);
+                self.append(opcode, &[Arg::new_tmp(result)]);
             }
 
             Opcode::FramePointer => (),

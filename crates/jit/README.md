@@ -6,6 +6,15 @@ Backend based on [Bare Bones Backend](https://webkit.org/docs/b3/) from WebKit. 
 
 See examples and `src/tests.rs`.
 
+The optional SCCP pass (`Options::enable_sccp`) supports integer and floating-point
+constants. Constant equality uses typed, bitwise value keys, preserving signed
+zeros and NaN payloads.
+
+On x86, scalar floating-point division uses two-operand SSE instructions;
+three-register division forms are only selected on ARM.
+Positive floating-point zero is materialized directly, while negative zero is
+loaded from the constant table to preserve its sign bit.
+
 Here's iterative factorial generator:
 
 ```rust

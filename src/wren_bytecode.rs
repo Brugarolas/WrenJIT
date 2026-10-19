@@ -1473,6 +1473,11 @@ pub struct BytecodeFunction {
     pub id: FuncId,
     pub module: ModuleId,
     pub kind: FunctionKind,
+    /// Declaring class for class-local instance FieldSlot operands.
+    ///
+    /// The interpreter relocates LoadField/StoreField operands in the prepared
+    /// function once the actual runtime superclass layout is known.
+    pub field_owner: Option<ClassId>,
     pub name: StringId,
     /// Number of explicit Wren parameters; the implicit receiver is not counted.
     pub arity: u8,
@@ -2429,7 +2434,30 @@ impl BytecodeVerifier {
                     function.id, function.name
                 )));
             }
+            if let Some(owner) = function.field_owner {
+                if program.metadata.class(owner).is_none() {
+                    return Err(VerificationError::function(format!(
+                        "function {:?} references unknown field-owner class {:?}",
+                        function.id, owner
+                    )));
+                }
+            }
             Self::verify(function)?;
+
+            if function.field_owner.is_none() {
+                for decoded in Decoder::new(&function.chunk.code) {
+                    let decoded = decoded.map_err(|error| VerificationError {
+                        pc: error.pc,
+                        message: error.message,
+                    })?;
+                    if matches!(decoded.opcode, Opcode::LoadField | Opcode::StoreField) {
+                        return Err(VerificationError::function(format!(
+                            "function {:?} contains instance field access but has no field-owner class",
+                            function.id
+                        )));
+                    }
+                }
+            }
 
             for constant in &function.chunk.constants {
                 if let Constant::String(string) = constant {
@@ -3451,7 +3479,7 @@ pub const fn extension_description(opcode: Opcode) -> &'static str {
         CreateClass | AllocInstance | AllocForeign => "x0=ClassId",
         BindMethod => "x0=MethodSymbol, x1=FuncId",
         BindForeignMethod => "x0=MethodSymbol, x1=ForeignFnId",
-        LoadField | StoreField => "x0=FieldSlot",
+        LoadField | StoreField => "x0=class-local FieldSlot (relocated to absolute slot by runtime linker)",
         LoadStaticField | StoreStaticField => "x0=StaticFieldSlot",
         ImportModule => "x0=StringId(module name)",
         ImportVariable => "x0=StringId(variable name)",
