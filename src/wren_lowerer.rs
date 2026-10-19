@@ -21,9 +21,9 @@
 #![allow(clippy::type_complexity)]
 
 use crate::wren_front::{
-    self as front, BinaryOp, ClassDecl, Diagnostic, DiagnosticLabel, DiagnosticSeverity, Expr,
+    self as front, BinaryOp, ClassDecl, Diagnostic, DiagnosticSeverity, Expr,
     ExprKind, FunctionBody, FunctionBodyKind, Ident, ImportDecl, InvokeSyntax, LogicalOp,
-    MethodDecl, MethodSignatureAst, ModuleAst, OperatorName, Span, Stmt, StmtKind, StringPart,
+    MethodDecl, MethodSignatureAst, ModuleAst, Span, Stmt, StmtKind, StringPart,
     UnaryOp,
 };
 use crate::wren_ir::{
@@ -133,6 +133,25 @@ pub fn lower_module_with_options(
     module: &ModuleAst,
     options: LowerOptions,
 ) -> LowerOutput {
+    // Compile the core once per Program. Its classes and method bodies travel
+    // through the same IR and bytecode pipeline as application code.
+    if module_name != crate::wren_core::MODULE_NAME
+        && !program.modules.iter().any(|module| {
+            program.string(module.name) == Some(crate::wren_core::MODULE_NAME)
+        })
+    {
+        let core = front::parse(crate::wren_core::MODULE_NAME, crate::wren_core::SOURCE);
+        assert!(!core.has_errors(), "invalid built-in core source: {:?}", core.diagnostics);
+        let output = lower_module_with_options(
+            program,
+            crate::wren_core::MODULE_NAME,
+            crate::wren_core::SOURCE,
+            crate::wren_core::MODULE_NAME,
+            &core.module,
+            LowerOptions::default(),
+        );
+        assert!(!output.has_errors(), "invalid built-in core IR: {:?}", output.diagnostics);
+    }
     let mut lowerer = ModuleLowerer::new(program, source_name, source, module_name, module, options);
     let lowered = lowerer.lower();
     LowerOutput {
@@ -734,6 +753,7 @@ struct ClassPlan {
 #[derive(Clone, Debug)]
 struct ModuleLayout {
     slots: HashMap<String, ModuleSlot>,
+    core: Option<ModuleId>,
 }
 
 impl ModuleLayout {
@@ -771,6 +791,9 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         options: LowerOptions,
     ) -> Self {
         let source_file = program.intern_string(source_name);
+        let core = program.modules.iter().find(|module| {
+            program.string(module.name) == Some(crate::wren_core::MODULE_NAME)
+        }).map(|module| module.id);
         Self {
             program,
             source_name,
@@ -783,6 +806,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             module_id: None,
             module_layout: ModuleLayout {
                 slots: HashMap::new(),
+                core,
             },
             symbols: SymbolTable::default(),
             class_plans: HashMap::new(),
@@ -2099,6 +2123,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 Type::Top,
             );
         }
+        if let (Some(module), Some(slot)) = (
+            self.context.module_layout.core,
+            crate::wren_core::global_slot(&name.value),
+        ) {
+            return self.builder.emit1(Inst::LoadModuleVar { module, slot }, Type::Top);
+        }
         if self.context.method_context.is_some() {
             let receiver = self.lower_this(name.span);
             let method = self.context.symbols.expect(&name.value, MethodKind::Getter, 0);
@@ -2404,6 +2434,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                         slot,
                         value,
                     });
+                } else if crate::wren_core::global_slot(&name.value).is_some() {
+                    self.error("WREN-L028", "cannot assign to a built-in global; declare a variable to shadow it", name.span);
                 } else if self.context.method_context.is_some() {
                     let receiver = self.lower_this(name.span);
                     let setter = self.context.symbols.expect(&name.value, MethodKind::Setter, 1);
@@ -3373,7 +3405,7 @@ mod tests {
 var f = null
 {
   var x = 1
-  f = { x = x + 1 }
+  f = Fn.new { x = x + 1 }
 }
 "#;
         let module = parse(source);
@@ -3389,7 +3421,7 @@ var f = null
         let source = r#"
 {
   var x = 1
-  var f = { x }
+  var f = Fn.new { x }
 }
 "#;
         let module = parse(source);
@@ -3425,7 +3457,7 @@ if (a < b) {
 class Counter {
   construct new(v) { _v = v }
   inc() {
-    var add = { |n| _v = _v + n }
+    var add = Fn.new { |n| _v = _v + n }
     add.call(1)
     return _v
   }

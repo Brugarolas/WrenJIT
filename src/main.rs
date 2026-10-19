@@ -17,6 +17,7 @@
 //!
 //! ```text
 //! cargo run -- path/to/program.wren
+//! cargo run -- src/builtins_example.wren
 //! ```
 //!
 //! The pipeline is:
@@ -32,10 +33,14 @@
 
 pub mod wren_bytecode;
 pub mod wren_bytecodecompiler;
+pub mod wren_core;
 pub mod wren_front;
 pub mod wren_interpreter;
 pub mod wren_ir;
 pub mod wren_lowerer;
+
+#[cfg(test)]
+mod wren_core_tests;
 
 use std::env;
 use std::ffi::OsStr;

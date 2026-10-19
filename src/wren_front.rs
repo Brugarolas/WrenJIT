@@ -18,7 +18,6 @@
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::too_many_arguments)]
 
-use std::fmt;
 use std::io;
 use std::ops::Range;
 
@@ -604,6 +603,13 @@ fn lex_with_offset(source: &str, base_offset: usize) -> LexOutput {
                 // as whitespace, including any newlines contained in it.
             }
             Ok(kind) => {
+                if kind == RawTokenKind::Hash && source[raw_span.start..].starts_with("#!/") {
+                    diagnostics.push(Diagnostic::error(
+                        "WREN-L008",
+                        "a shebang is only allowed at the start of the source",
+                        span,
+                    ));
+                }
                 if let Some(kind) = map_raw_token(kind) {
                     tokens.push(Token::new(kind, span));
                 }
@@ -1333,6 +1339,7 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
 
         while !self.at(TokenKind::Eof) {
+            let before = self.current;
             match self.parse_declaration() {
                 Ok(statement) => {
                     statements.push(statement);
@@ -1340,6 +1347,11 @@ impl<'a> Parser<'a> {
                     self.skip_newlines();
                 }
                 Err(()) => self.synchronize_statement(),
+            }
+            // A stray '}' belongs to no enclosing block here. Recovery normally
+            // leaves it for the caller, but at module scope we must consume it.
+            if self.current == before {
+                self.advance();
             }
         }
 

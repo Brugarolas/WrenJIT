@@ -20,7 +20,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
+
+pub use crate::wren_core::BuiltinClass;
+use crate::wren_core::{self as core, NativeMethod};
 
 use crate::wren_bytecode::{
     decode_bailout_reason, function_kind_uses_this, instruction_word_len,
@@ -424,6 +429,14 @@ impl HostContext<'_> {
 }
 
 pub trait Host {
+    /// Output from System.print/write. Embedders can capture it without
+    /// replacing the core library or allocating their own primitive IDs.
+    fn write(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(bytes).and_then(|()| stdout.flush())
+            .map_err(|error| RuntimeError::new(format!("output failed: {error}")))
+    }
+
     fn call_primitive(
         &mut self,
         _context: &mut HostContext<'_>,
@@ -1017,21 +1030,9 @@ const fn is_compare_opcode(opcode: Opcode) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CallTarget {
     Bytecode(u32),
+    Native(NativeMethod),
     Primitive(PrimitiveId),
     Foreign(ForeignFnId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BuiltinClass {
-    Null,
-    Bool,
-    Num,
-    String,
-    List,
-    Map,
-    Range,
-    Closure,
-    Fiber,
 }
 
 const BUILTIN_CLASS_COUNT: usize = 9;
@@ -1244,6 +1245,8 @@ pub struct Interpreter<'p> {
     error: Option<RuntimeError>,
     inline_caches: Vec<Vec<InlineCacheState>>,
     builtin_methods: Vec<Vec<Option<CallTarget>>>,
+    core_foreign_methods: HashMap<ForeignFnId, NativeMethod>,
+    started_at: Instant,
     megamorphic_cache: HashMap<(ReceiverClass, MethodSymbol, Option<u32>), CallTarget>,
     profile_counters: Vec<Vec<u64>>,
     roots: Vec<Option<Value>>,
@@ -1356,7 +1359,7 @@ impl<'p> Interpreter<'p> {
         let mut main = FiberState::new(main_object, FiberStatus::Running);
         main.registers.reserve(4096);
 
-        Ok(Self {
+        let mut vm = Self {
             program,
             prepared,
             host,
@@ -1373,6 +1376,8 @@ impl<'p> Interpreter<'p> {
             error: None,
             inline_caches,
             builtin_methods: vec![vec![None; program.metadata.methods.len()]; BUILTIN_CLASS_COUNT],
+            core_foreign_methods: HashMap::new(),
+            started_at: Instant::now(),
             megamorphic_cache: HashMap::new(),
             profile_counters,
             roots: Vec::new(),
@@ -1381,7 +1386,53 @@ impl<'p> Interpreter<'p> {
             hot_frame: std::ptr::null_mut(),
             hot_registers: std::ptr::null_mut(),
             hot_function: std::ptr::null(),
-        })
+        };
+        vm.install_core()?;
+        Ok(vm)
+    }
+
+    fn install_core(&mut self) -> Result<(), RuntimeError> {
+        use BuiltinClass::*;
+        for class in [Null, Bool, Num, String, List, Map, Range, Closure, Fiber] {
+            for (index, method) in self.program.metadata.methods.iter().enumerate() {
+                let name = self.program.metadata.string(method.name).unwrap_or("");
+                if let Some(native) = core::instance_method(class, name, method.kind, method.arity) {
+                    self.builtin_methods[class as usize][index] = Some(CallTarget::Native(native));
+                }
+            }
+        }
+        for foreign in &self.program.metadata.foreign_functions {
+            if self.program.metadata.string(foreign.module) != Some(core::MODULE_NAME) {
+                continue;
+            }
+            let signature = self.program.metadata.method(foreign.signature)
+                .ok_or_else(|| RuntimeError::new("missing core method signature"))?;
+            let class = self.program.metadata.string(foreign.class).unwrap_or("");
+            let name = self.program.metadata.string(signature.name).unwrap_or("");
+            let native = core::foreign_method(class, name, signature.kind, signature.arity)
+                .filter(|_| foreign.is_static)
+                .ok_or_else(|| RuntimeError::new(format!("unknown core method {class}.{name}")))?;
+            self.core_foreign_methods.insert(foreign.id, native);
+        }
+        let entry = self.program.functions.iter().find(|function| {
+            function.kind == FunctionKind::ModuleBody
+                && self.program.metadata.module(function.module)
+                    .and_then(|module| self.program.metadata.string(module.name)) == Some(core::MODULE_NAME)
+        }).map(|function| function.id);
+        if let Some(entry) = entry {
+            match self.run_module(entry)? {
+                ExecutionResult::Returned(_) => {}
+                ExecutionResult::Suspended(_) => return Err(RuntimeError::new("core initialization suspended")),
+            }
+        }
+        Ok(())
+    }
+
+    fn invalidate_method_caches(&mut self) {
+        for caches in &mut self.inline_caches {
+            caches.fill_with(InlineCacheState::default);
+        }
+        self.megamorphic_cache.clear();
     }
 
     pub fn set_gc_enabled(&mut self, enabled: bool) {
@@ -1395,6 +1446,7 @@ impl<'p> Interpreter<'p> {
             .and_then(|table| table.get_mut(method.0 as usize))
         {
             *slot = Some(CallTarget::Primitive(primitive));
+            self.invalidate_method_caches();
         }
     }
 
@@ -1405,6 +1457,7 @@ impl<'p> Interpreter<'p> {
             .and_then(|table| table.get_mut(method.0 as usize))
         {
             *slot = Some(CallTarget::Foreign(foreign));
+            self.invalidate_method_caches();
         }
     }
 
@@ -1681,6 +1734,12 @@ impl<'p> Interpreter<'p> {
         if args.len() > ARGUMENT_REGISTER_COUNT {
             return Err(RuntimeError::new("too many call arguments"));
         }
+        let arity = self.program.functions[function_index as usize].arity as usize;
+        if args.len() < arity {
+            return Err(RuntimeError::new(format!(
+                "function requires {arity} argument(s), got {}", args.len()
+            )));
+        }
         // `prepared` is immutable for the lifetime of the interpreter. Keeping a
         // raw pointer here lets us mutate disjoint VM state below without cloning
         // FrameLayout (which contains Vecs and would allocate on every call).
@@ -1884,7 +1943,9 @@ impl Interpreter<'_> {
             }
             slot = match class.superclass { Some(next) => next, None => break };
         }
-        None
+        let signature = self.program.metadata.method(method)?;
+        let name = self.program.metadata.string(signature.name)?;
+        core::object_method(name, signature.kind, signature.arity).map(CallTarget::Native)
     }
 
     #[inline(always)]
@@ -1920,7 +1981,10 @@ impl Interpreter<'_> {
         }
 
         let target = self.lookup_method(class, descriptor.method, home_slot).ok_or_else(|| {
-            RuntimeError::new(format!("method {:?} is not defined for receiver", descriptor.method))
+            let signature = self.program.metadata.method(descriptor.method);
+            let name = signature.and_then(|signature| self.program.metadata.string(signature.name)).unwrap_or("<unknown>");
+            let arity = signature.map_or(0, |signature| signature.arity);
+            RuntimeError::new(format!("method '{name}' with {arity} argument(s) is not defined for receiver"))
         })?;
         let cache = &mut self.inline_caches[function_index as usize][ic_slot as usize];
         cache.insert(class, target);
@@ -1938,6 +2002,30 @@ impl Interpreter<'_> {
         args: &[RegisterWord],
     ) {
         match target {
+            CallTarget::Native(NativeMethod::ClosureCall) => {
+                let closure = Value::from_word(receiver);
+                let function = match self.heap.get(closure) {
+                    Some(HeapObject::Closure { function_index, .. }) => *function_index,
+                    _ => { self.fail_at(op, "call receiver must be a function"); return; }
+                };
+                self.mark_gc_point(op);
+                self.current_frame_mut().pc = op.next;
+                if let Err(error) = self.push_frame(function, None, args, Some(closure), Some(Reg(op.a))) {
+                    self.fail_at(op, error.message);
+                }
+            }
+            CallTarget::Native(native) => {
+                self.mark_gc_point(op);
+                self.stage_invoke_args(receiver, args);
+                let mut values = [Value::NULL; 17];
+                values[0] = Value::from_word(receiver);
+                for (index, word) in args.iter().copied().enumerate() { values[index + 1] = Value::from_word(word); }
+                self.maybe_collect();
+                match self.call_native(native, &values[..args.len() + 1]) {
+                    Ok(result) => unsafe { self.set_reg(op.a, result.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
             CallTarget::Bytecode(function) => {
                 self.mark_gc_point(op);
                 self.current_frame_mut().pc = op.next;
@@ -1996,9 +2084,90 @@ impl Interpreter<'_> {
 
     fn call_host_foreign(&mut self, foreign: ForeignFnId, args: &[Value]) -> Result<Value, RuntimeError> {
         self.maybe_collect();
+        if let Some(native) = self.core_foreign_methods.get(&foreign).copied() {
+            return self.call_native(native, args);
+        }
         let (host, heap) = (&mut self.host, &mut self.heap);
         let mut context = HostContext { heap };
         host.call_foreign(&mut context, foreign, args)
+    }
+
+    fn call_native(&mut self, method: NativeMethod, args: &[Value]) -> Result<Value, RuntimeError> {
+        use NativeMethod::*;
+        let receiver = args.first().copied().ok_or_else(|| RuntimeError::new("missing native receiver"))?;
+        let argument = || args.get(1).copied().ok_or_else(|| RuntimeError::new("missing native argument"));
+        match method {
+            WriteString => {
+                let value = argument()?;
+                let Some(HeapObject::String(bytes)) = self.heap.get(value) else {
+                    return Err(RuntimeError::new("toString must return a string"));
+                };
+                self.host.write(bytes)?;
+                Ok(Value::NULL)
+            }
+            Clock => Ok(Value::from_num(self.started_at.elapsed().as_secs_f64())),
+            CollectGarbage => { self.collect_garbage(); Ok(Value::NULL) }
+            FnNew => {
+                let value = argument()?;
+                if !matches!(self.heap.get(value), Some(HeapObject::Closure { .. })) {
+                    return Err(RuntimeError::new("Fn.new expects a function"));
+                }
+                Ok(value)
+            }
+            ClosureArity => match self.heap.get(receiver) {
+                Some(HeapObject::Closure { function_index, .. }) =>
+                    Ok(Value::from_num(self.program.functions[*function_index as usize].arity as f64)),
+                _ => Err(RuntimeError::new("arity receiver must be a function")),
+            },
+            ClosureCall => Err(RuntimeError::new("closure calls require an interpreter frame")),
+            ToString => {
+                if matches!(self.heap.get(receiver), Some(HeapObject::String(_))) {
+                    return Ok(receiver);
+                }
+                let text = self.value_to_string(receiver);
+                Ok(self.heap.alloc(HeapObject::String(Arc::from(text.as_bytes()))))
+            }
+            Not => Ok(Value::from_bool(receiver.is_null() || receiver.as_bool() == Some(false))),
+            Equal | NotEqual => {
+                let other = argument()?;
+                let equal = match (receiver.as_num(), other.as_num()) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => match (self.heap.get(receiver), self.heap.get(other)) {
+                        (Some(HeapObject::String(a)), Some(HeapObject::String(b))) => a == b,
+                        _ => receiver == other,
+                    },
+                };
+                Ok(Value::from_bool(if matches!(method, Equal) { equal } else { !equal }))
+            }
+            StringConcat => {
+                let other = argument()?;
+                let (Some(HeapObject::String(a)), Some(HeapObject::String(b))) =
+                    (self.heap.get(receiver), self.heap.get(other)) else {
+                        return Err(RuntimeError::new("string '+' expects a string argument"));
+                    };
+                let mut bytes = Vec::with_capacity(a.len() + b.len());
+                bytes.extend_from_slice(a);
+                bytes.extend_from_slice(b);
+                Ok(self.heap.alloc(HeapObject::String(Arc::from(bytes))))
+            }
+            Negate => Ok(Value::from_num(-receiver.as_num().ok_or_else(|| RuntimeError::new("expected a number"))?)),
+            Add | Subtract | Multiply | Divide | Remainder | Less | LessEqual | Greater | GreaterEqual => {
+                let a = receiver.as_num().ok_or_else(|| RuntimeError::new("expected a number"))?;
+                let b = argument()?.as_num().ok_or_else(|| RuntimeError::new("numeric operator expects a number argument"))?;
+                Ok(match method {
+                    Add => Value::from_num(a + b),
+                    Subtract => Value::from_num(a - b),
+                    Multiply => Value::from_num(a * b),
+                    Divide => Value::from_num(a / b),
+                    Remainder => Value::from_num(a % b),
+                    Less => Value::from_bool(a < b),
+                    LessEqual => Value::from_bool(a <= b),
+                    Greater => Value::from_bool(a > b),
+                    GreaterEqual => Value::from_bool(a >= b),
+                    _ => unreachable!(),
+                })
+            }
+        }
     }
 
     #[inline(always)]
