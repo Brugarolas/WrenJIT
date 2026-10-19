@@ -1,4 +1,4 @@
-System.Print("Hola, Wren!")
+System.print("Hola, Wren!")
 System.print("6 * 7 = %(6 * 7)")
 System.write("Sin salto de linea")
 System.print()

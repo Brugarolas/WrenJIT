@@ -2428,7 +2428,7 @@ impl<'a> Parser<'a> {
                 ))
             }
             TokenKind::LeftBracket => self.parse_list_literal(token.span.start),
-            TokenKind::LeftBrace => self.parse_map_literal(token.span.start),
+            TokenKind::LeftBrace => self.parse_brace_expression(token.span.start),
             _ => {
                 self.current = self.current.saturating_sub(1);
                 self.error_at_current(
@@ -2718,6 +2718,57 @@ impl<'a> Parser<'a> {
             ExprKind::Map(entries),
             Span::new(start, self.previous().span.end),
         ))
+    }
+
+    fn parse_brace_expression(&mut self, start: usize) -> PResult<Expr> {
+        if self.brace_starts_closure() {
+            let body = self.parse_function_body_after_open(start, true)?;
+            let span = body.span;
+            Ok(Expr::new(ExprKind::Closure(body), span))
+        } else {
+            self.parse_map_literal(start)
+        }
+    }
+
+    fn brace_starts_closure(&self) -> bool {
+        if self.at(TokenKind::Pipe) {
+            return true;
+        }
+        if self.at(TokenKind::RightBrace) {
+            return false;
+        }
+
+        let mut parentheses = 0usize;
+        let mut brackets = 0usize;
+        let mut braces = 0usize;
+        let mut conditional = 0usize;
+
+        for token in self.tokens.iter().skip(self.current) {
+            match token.kind {
+                TokenKind::LeftParen => parentheses += 1,
+                TokenKind::RightParen => parentheses = parentheses.saturating_sub(1),
+                TokenKind::LeftBracket => brackets += 1,
+                TokenKind::RightBracket => brackets = brackets.saturating_sub(1),
+                TokenKind::LeftBrace => braces += 1,
+                TokenKind::RightBrace if braces > 0 => braces -= 1,
+                TokenKind::RightBrace => return true,
+                _ => {}
+            }
+
+            if parentheses != 0 || brackets != 0 || braces != 0 {
+                continue;
+            }
+
+            match token.kind {
+                TokenKind::Question => conditional += 1,
+                TokenKind::Colon if conditional > 0 => conditional -= 1,
+                TokenKind::Colon => return false,
+                TokenKind::Comma | TokenKind::Equal => return true,
+                _ => {}
+            }
+        }
+
+        true
     }
 
     fn parse_normal_string_expr(&mut self, token: Token) -> PResult<Expr> {
@@ -3661,6 +3712,19 @@ class Example {
         assert_eq!(where_call.name.value, "where");
         assert_eq!(where_call.args.len(), 1);
         assert!(matches!(&where_call.args[0].kind, ExprKind::Closure(_)));
+    }
+
+    #[test]
+    fn parses_map_literals_with_top_level_colons() {
+        let module = parse_ok("var values = {\"answer\": 42}\n");
+        let StmtKind::Variable {
+            initializer: Some(value),
+            ..
+        } = &module.statements[0].kind
+        else {
+            panic!("expected initialized variable");
+        };
+        assert!(matches!(value.kind, ExprKind::Map(_)));
     }
 
     #[test]

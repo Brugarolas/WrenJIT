@@ -21,14 +21,15 @@
 #![allow(clippy::type_complexity)]
 
 use crate::wren_front::{
-    self as front, BinaryOp, ClassDecl, Diagnostic, DiagnosticSeverity, Expr,
+    self as front, BinaryOp, ClassDecl, Diagnostic, DiagnosticLabel, DiagnosticSeverity, Expr,
     ExprKind, FunctionBody, FunctionBodyKind, Ident, ImportDecl, InvokeSyntax, LogicalOp,
-    MethodDecl, MethodSignatureAst, ModuleAst, Span, Stmt, StmtKind, StringPart,
+    MethodDecl, MethodSignatureAst, ModuleAst, OperatorName, Span, Stmt, StmtKind, StringPart,
     UnaryOp,
 };
 use crate::wren_ir::{
-    self as ir, Builder, CaptureMode, ClassId, ClassSet, FieldSlot, FuncId, FunctionKind, Inst,
-    MethodKind, MethodSymbol, ModuleId, ModuleSlot, SourceSpan, StaticFieldSlot, Type, ValueId,
+    self as ir, Builder, BuiltinBinding, BuiltinId, CaptureMode, ClassId, ClassSet, FieldSlot,
+    FuncId, FunctionKind, Inst, MethodKind, MethodSymbol, ModuleId, ModuleSlot, SourceSpan,
+    StaticFieldSlot, Type, ValueId,
 };
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
@@ -133,25 +134,6 @@ pub fn lower_module_with_options(
     module: &ModuleAst,
     options: LowerOptions,
 ) -> LowerOutput {
-    // Compile the core once per Program. Its classes and method bodies travel
-    // through the same IR and bytecode pipeline as application code.
-    if module_name != crate::wren_core::MODULE_NAME
-        && !program.modules.iter().any(|module| {
-            program.string(module.name) == Some(crate::wren_core::MODULE_NAME)
-        })
-    {
-        let core = front::parse(crate::wren_core::MODULE_NAME, crate::wren_core::SOURCE);
-        assert!(!core.has_errors(), "invalid built-in core source: {:?}", core.diagnostics);
-        let output = lower_module_with_options(
-            program,
-            crate::wren_core::MODULE_NAME,
-            crate::wren_core::SOURCE,
-            crate::wren_core::MODULE_NAME,
-            &core.module,
-            LowerOptions::default(),
-        );
-        assert!(!output.has_errors(), "invalid built-in core IR: {:?}", output.diagnostics);
-    }
     let mut lowerer = ModuleLowerer::new(program, source_name, source, module_name, module, options);
     let lowered = lowerer.lower();
     LowerOutput {
@@ -753,7 +735,6 @@ struct ClassPlan {
 #[derive(Clone, Debug)]
 struct ModuleLayout {
     slots: HashMap<String, ModuleSlot>,
-    core: Option<ModuleId>,
 }
 
 impl ModuleLayout {
@@ -791,9 +772,6 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         options: LowerOptions,
     ) -> Self {
         let source_file = program.intern_string(source_name);
-        let core = program.modules.iter().find(|module| {
-            program.string(module.name) == Some(crate::wren_core::MODULE_NAME)
-        }).map(|module| module.id);
         Self {
             program,
             source_name,
@@ -806,7 +784,6 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             module_id: None,
             module_layout: ModuleLayout {
                 slots: HashMap::new(),
-                core,
             },
             symbols: SymbolTable::default(),
             class_plans: HashMap::new(),
@@ -823,6 +800,16 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             .program
             .add_module(self.module_name, self.module_layout.slots.len() as u32);
         self.module_id = Some(module_id);
+        let builtin_bindings = BuiltinId::ALL
+            .into_iter()
+            .filter_map(|builtin| {
+                self.module_layout
+                    .get(builtin.name())
+                    .map(|slot| BuiltinBinding { slot, builtin })
+            })
+            .collect();
+        self.program
+            .set_module_builtin_bindings(module_id, builtin_bindings);
 
         self.plan_classes(module_id);
         self.collect_and_intern_symbols();
@@ -891,6 +878,17 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         }
 
         let mut next = 0u32;
+
+        // Core globals are ordinary module slots after lowering. This keeps the
+        // runtime hot path identical to user globals: one indexed load, no name
+        // lookup and no dedicated LoadBuiltin opcode.
+        for builtin in BuiltinId::ALL {
+            self.module_layout
+                .slots
+                .insert(builtin.name().to_owned(), ModuleSlot(next));
+            next += 1;
+        }
+
         for (name, span) in declarations {
             self.insert_module_slot(&name, span, &mut next);
         }
@@ -2123,12 +2121,6 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 Type::Top,
             );
         }
-        if let (Some(module), Some(slot)) = (
-            self.context.module_layout.core,
-            crate::wren_core::global_slot(&name.value),
-        ) {
-            return self.builder.emit1(Inst::LoadModuleVar { module, slot }, Type::Top);
-        }
         if self.context.method_context.is_some() {
             let receiver = self.lower_this(name.span);
             let method = self.context.symbols.expect(&name.value, MethodKind::Getter, 0);
@@ -2429,13 +2421,19 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 if let Some(binding) = self.context.analysis.use_map.get(&name.span).copied() {
                     self.write_binding(binding, value);
                 } else if let Some(slot) = self.context.module_layout.get(&name.value) {
-                    self.builder.emit0(Inst::StoreModuleVar {
-                        module: self.context.module,
-                        slot,
-                        value,
-                    });
-                } else if crate::wren_core::global_slot(&name.value).is_some() {
-                    self.error("WREN-L028", "cannot assign to a built-in global; declare a variable to shadow it", name.span);
+                    if BuiltinId::ALL.iter().any(|builtin| builtin.name() == name.value) {
+                        self.error(
+                            "WREN-L038",
+                            format!("cannot assign to core global '{}'", name.value),
+                            name.span,
+                        );
+                    } else {
+                        self.builder.emit0(Inst::StoreModuleVar {
+                            module: self.context.module,
+                            slot,
+                            value,
+                        });
+                    }
                 } else if self.context.method_context.is_some() {
                     let receiver = self.lower_this(name.span);
                     let setter = self.context.symbols.expect(&name.value, MethodKind::Setter, 1);
@@ -3405,7 +3403,7 @@ mod tests {
 var f = null
 {
   var x = 1
-  f = Fn.new { x = x + 1 }
+  f = { x = x + 1 }
 }
 "#;
         let module = parse(source);
@@ -3421,7 +3419,7 @@ var f = null
         let source = r#"
 {
   var x = 1
-  var f = Fn.new { x }
+  var f = { x }
 }
 "#;
         let module = parse(source);
@@ -3457,7 +3455,7 @@ if (a < b) {
 class Counter {
   construct new(v) { _v = v }
   inc() {
-    var add = Fn.new { |n| _v = _v + n }
+    var add = { |n| _v = _v + n }
     add.call(1)
     return _v
   }

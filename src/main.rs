@@ -6,6 +6,7 @@
 //! src/
 //! ├── main.rs
 //! ├── wren_front.rs
+//! ├── wren_builtin.rs
 //! ├── wren_lowerer.rs
 //! ├── wren_ir.rs
 //! ├── wren_bytecode.rs
@@ -17,7 +18,6 @@
 //!
 //! ```text
 //! cargo run -- path/to/program.wren
-//! cargo run -- src/builtins_example.wren
 //! ```
 //!
 //! The pipeline is:
@@ -31,16 +31,13 @@
 //!   -> interpreter
 //! ```
 
+pub mod wren_builtin;
 pub mod wren_bytecode;
 pub mod wren_bytecodecompiler;
-pub mod wren_core;
 pub mod wren_front;
 pub mod wren_interpreter;
 pub mod wren_ir;
 pub mod wren_lowerer;
-
-#[cfg(test)]
-mod wren_core_tests;
 
 use std::env;
 use std::ffi::OsStr;
@@ -49,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::wren_interpreter::{ExecutionResult, Interpreter};
+use crate::wren_ir::Program;
 
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_COMPILE_ERROR: u8 = 1;
@@ -99,7 +97,10 @@ fn run() -> u8 {
     // Lowering: AST -> SSA HIR
     // -------------------------------------------------------------------------
 
-    let lowered = wren_lowerer::lower_new_program(
+    let mut hir = Program::new();
+    let builtin_manifest = wren_builtin::install_hir_builtins(&mut hir);
+    let lowered = wren_lowerer::lower_module(
+        &mut hir,
         &source_name,
         &source,
         &module_name,
@@ -127,7 +128,7 @@ fn run() -> u8 {
     // Backend: HIR -> register bytecode
     // -------------------------------------------------------------------------
 
-    let bytecode = match wren_bytecodecompiler::compile_program(&lowered.program) {
+    let bytecode = match wren_bytecodecompiler::compile_program(&hir) {
         Ok(program) => program,
         Err(error) => {
             eprintln!("bytecode compilation error: {error}");
@@ -139,13 +140,15 @@ fn run() -> u8 {
     // Runtime: bytecode -> execution
     // -------------------------------------------------------------------------
 
-    let mut interpreter = match Interpreter::new(&bytecode) {
+    let host = Box::new(wren_builtin::BuiltinHost::new(builtin_manifest.clone()));
+    let mut interpreter = match Interpreter::with_host(&bytecode, host) {
         Ok(interpreter) => interpreter,
         Err(error) => {
             eprintln!("VM initialization error: {error}");
             return EXIT_RUNTIME_ERROR;
         }
     };
+    wren_builtin::install_vm_builtins(&mut interpreter, &builtin_manifest);
 
     match interpreter.run_module(lowered_module.entry) {
         Ok(ExecutionResult::Returned(_)) => EXIT_SUCCESS,

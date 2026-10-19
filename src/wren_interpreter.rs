@@ -20,12 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::io::Write;
 use std::sync::Arc;
-use std::time::Instant;
-
-pub use crate::wren_core::BuiltinClass;
-use crate::wren_core::{self as core, NativeMethod};
 
 use crate::wren_bytecode::{
     decode_bailout_reason, function_kind_uses_this, instruction_word_len,
@@ -35,7 +30,7 @@ use crate::wren_bytecode::{
     ARGUMENT_REGISTER_COUNT, RETURN_REGISTER_COUNT, SPECIAL_REGISTER_COUNT,
 };
 use crate::wren_ir::{
-    BailoutReason, ClassId, ClassSet, Constant, ForeignFnId, FuncId, FunctionKind,
+    BailoutReason, BuiltinId, ClassId, ClassSet, Constant, ForeignFnId, FuncId, FunctionKind,
     MethodSymbol, ModuleId, PrimitiveId, StringId, Type,
 };
 
@@ -282,6 +277,9 @@ enum HeapObject {
     ClassObject {
         class_slot: u32,
     },
+    BuiltinClass {
+        builtin: BuiltinId,
+    },
     Instance {
         class_slot: u32,
         fields: Box<[Value]>,
@@ -426,17 +424,200 @@ impl HostContext<'_> {
     pub fn allocate_bytes(&mut self, value: impl AsRef<[u8]>) -> Value {
         self.heap.alloc(HeapObject::String(Arc::<[u8]>::from(value.as_ref())))
     }
+
+    pub fn allocate_list(&mut self, values: Vec<Value>) -> Value {
+        self.heap.alloc(HeapObject::List(values))
+    }
+
+    pub fn allocate_map(&mut self) -> Value {
+        self.heap.alloc(HeapObject::Map(WrenMap::default()))
+    }
+
+    pub fn allocate_range(&mut self, from: f64, to: f64, inclusive: bool) -> Value {
+        self.heap.alloc(HeapObject::Range { from, to, inclusive })
+    }
+
+    #[inline]
+    pub fn list_len(&self, value: Value) -> Option<usize> {
+        match self.heap.get(value) { Some(HeapObject::List(list)) => Some(list.len()), _ => None }
+    }
+
+    #[inline]
+    pub fn list_get(&self, value: Value, index: usize) -> Option<Value> {
+        match self.heap.get(value) { Some(HeapObject::List(list)) => list.get(index).copied(), _ => None }
+    }
+
+    pub fn list_set(&mut self, value: Value, index: usize, item: Value) -> Result<Value, RuntimeError> {
+        match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) => {
+                let slot = list.get_mut(index).ok_or_else(|| RuntimeError::new("list index out of bounds"))?;
+                *slot = item;
+                Ok(item)
+            }
+            _ => Err(RuntimeError::new("receiver is not a List")),
+        }
+    }
+
+    pub fn list_push(&mut self, value: Value, item: Value) -> Result<Value, RuntimeError> {
+        match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) => { list.push(item); Ok(item) }
+            _ => Err(RuntimeError::new("receiver is not a List")),
+        }
+    }
+
+    pub fn list_insert(&mut self, value: Value, index: usize, item: Value) -> Result<Value, RuntimeError> {
+        match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) if index <= list.len() => { list.insert(index, item); Ok(item) }
+            Some(HeapObject::List(_)) => Err(RuntimeError::new("list index out of bounds")),
+            _ => Err(RuntimeError::new("receiver is not a List")),
+        }
+    }
+
+    pub fn list_remove_at(&mut self, value: Value, index: usize) -> Result<Value, RuntimeError> {
+        match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) if index < list.len() => Ok(list.remove(index)),
+            Some(HeapObject::List(_)) => Err(RuntimeError::new("list index out of bounds")),
+            _ => Err(RuntimeError::new("receiver is not a List")),
+        }
+    }
+
+    pub fn list_clear(&mut self, value: Value) -> Result<(), RuntimeError> {
+        match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) => { list.clear(); Ok(()) }
+            _ => Err(RuntimeError::new("receiver is not a List")),
+        }
+    }
+
+    fn map_key(&self, value: Value) -> Result<MapKey, RuntimeError> {
+        if value.is_null() { return Ok(MapKey::Null); }
+        if let Some(value) = value.as_bool() { return Ok(MapKey::Bool(value)); }
+        if let Some(value) = value.as_num() {
+            let normalized = if value == 0.0 { 0.0 } else { value };
+            return Ok(MapKey::Num(normalized.to_bits()));
+        }
+        if let Some(handle) = value.heap_handle() {
+            if let Some(HeapObject::String(string)) = self.heap.get(value) {
+                return Ok(MapKey::String(string.clone()));
+            }
+            return Ok(MapKey::Object(handle));
+        }
+        Err(RuntimeError::new("value cannot be used as a map key"))
+    }
+
+    pub fn map_len(&self, value: Value) -> Option<usize> {
+        match self.heap.get(value) { Some(HeapObject::Map(map)) => Some(map.entries.len()), _ => None }
+    }
+
+    pub fn map_get(&self, value: Value, key: Value) -> Result<Value, RuntimeError> {
+        let key = self.map_key(key)?;
+        match self.heap.get(value) {
+            Some(HeapObject::Map(map)) => Ok(map.entries.get(&key).copied().unwrap_or(Value::NULL)),
+            _ => Err(RuntimeError::new("receiver is not a Map")),
+        }
+    }
+
+    pub fn map_set(&mut self, value: Value, key: Value, item: Value) -> Result<Value, RuntimeError> {
+        let key = self.map_key(key)?;
+        match self.heap.get_mut(value) {
+            Some(HeapObject::Map(map)) => { map.entries.insert(key, item); Ok(item) }
+            _ => Err(RuntimeError::new("receiver is not a Map")),
+        }
+    }
+
+    pub fn map_remove(&mut self, value: Value, key: Value) -> Result<Value, RuntimeError> {
+        let key = self.map_key(key)?;
+        match self.heap.get_mut(value) {
+            Some(HeapObject::Map(map)) => Ok(map.entries.remove(&key).unwrap_or(Value::NULL)),
+            _ => Err(RuntimeError::new("receiver is not a Map")),
+        }
+    }
+
+    pub fn map_contains_key(&self, value: Value, key: Value) -> Result<bool, RuntimeError> {
+        let key = self.map_key(key)?;
+        match self.heap.get(value) {
+            Some(HeapObject::Map(map)) => Ok(map.entries.contains_key(&key)),
+            _ => Err(RuntimeError::new("receiver is not a Map")),
+        }
+    }
+
+    pub fn map_nth_key(&self, value: Value, index: usize) -> Result<Value, RuntimeError> {
+        let map = match self.heap.get(value) {
+            Some(HeapObject::Map(map)) => map,
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        };
+        let key = map.entries.keys().nth(index).ok_or_else(|| RuntimeError::new("map iterator out of range"))?;
+        Ok(match key {
+            MapKey::Null => Value::NULL,
+            MapKey::Bool(value) => Value::from_bool(*value),
+            MapKey::Num(bits) => Value::from_num(f64::from_bits(*bits)),
+            MapKey::String(bytes) => {
+                // Keys own Arc bytes; allocate a Wren string handle for the exposed key.
+                // This is a cold iterator path and avoids retaining internal map keys as handles.
+                return Err(RuntimeError::new(format!("string map-key iteration requires key materialization: {}", String::from_utf8_lossy(bytes))));
+            }
+            MapKey::Object(handle) => Value::from_heap(*handle),
+        })
+    }
+
+    pub fn map_nth_value(&self, value: Value, index: usize) -> Result<Value, RuntimeError> {
+        match self.heap.get(value) {
+            Some(HeapObject::Map(map)) => map.entries.values().nth(index).copied().ok_or_else(|| RuntimeError::new("map iterator out of range")),
+            _ => Err(RuntimeError::new("receiver is not a Map")),
+        }
+    }
+
+    pub fn range_parts(&self, value: Value) -> Option<(f64, f64, bool)> {
+        match self.heap.get(value) {
+            Some(HeapObject::Range { from, to, inclusive }) => Some((*from, *to, *inclusive)),
+            _ => None,
+        }
+    }
+
+    pub fn format_value(&self, value: Value) -> String {
+        let mut seen = HashSet::new();
+        self.format_value_inner(value, &mut seen)
+    }
+
+    fn format_value_inner(&self, value: Value, seen: &mut HashSet<u32>) -> String {
+        if value.is_null() { return "null".to_owned(); }
+        if let Some(value) = value.as_bool() { return value.to_string(); }
+        if let Some(value) = value.as_num() {
+            if value.fract() == 0.0 && value.is_finite() { return format!("{value:.0}"); }
+            return value.to_string();
+        }
+        let Some(handle) = value.heap_handle() else { return format!("{value:?}"); };
+        match self.heap.get(value) {
+            Some(HeapObject::String(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+            Some(HeapObject::List(values)) => {
+                if !seen.insert(handle) { return "[...]".to_owned(); }
+                let text = values.iter().map(|v| self.format_value_inner(*v, seen)).collect::<Vec<_>>().join(", " );
+                seen.remove(&handle);
+                format!("[{text}]")
+            }
+            Some(HeapObject::Map(map)) => {
+                if !seen.insert(handle) { return "{...}".to_owned(); }
+                let text = map.entries.values().map(|v| self.format_value_inner(*v, seen)).collect::<Vec<_>>().join(", " );
+                seen.remove(&handle);
+                format!("{{{text}}}")
+            }
+            Some(HeapObject::Range { from, to, inclusive }) => {
+                let op = if *inclusive { ".." } else { "..." };
+                format!("{from}{op}{to}")
+            }
+            Some(HeapObject::Closure { .. }) => "<fn>".to_owned(),
+            Some(HeapObject::ClassObject { class_slot }) => format!("<class#{class_slot}>"),
+            Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
+            Some(HeapObject::Instance { class_slot, .. }) => format!("<instance class#{class_slot}>"),
+            Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign class#{class_slot}>"),
+            Some(HeapObject::FiberObject { fiber }) => format!("<fiber#{fiber}>"),
+            Some(HeapObject::ModuleObject { module_slot }) => format!("<module#{module_slot}>"),
+            Some(HeapObject::Cell(_)) => "<cell>".to_owned(),
+            None => "<dead object>".to_owned(),
+        }
+    }
 }
 
 pub trait Host {
-    /// Output from System.print/write. Embedders can capture it without
-    /// replacing the core library or allocating their own primitive IDs.
-    fn write(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(bytes).and_then(|()| stdout.flush())
-            .map_err(|error| RuntimeError::new(format!("output failed: {error}")))
-    }
-
     fn call_primitive(
         &mut self,
         _context: &mut HostContext<'_>,
@@ -628,6 +809,7 @@ struct PreparedFunction {
     id: FuncId,
     module_slot: u32,
     kind: FunctionKind,
+    arity: u8,
     return_kind: RegisterKind,
     capture_count: u16,
 }
@@ -891,6 +1073,7 @@ impl PreparedProgram {
             id: function.id,
             module_slot,
             kind: function.kind,
+            arity: function.arity,
             return_kind: function.frame.return_kind,
             capture_count: function.capture_count,
         })
@@ -1030,9 +1213,41 @@ const fn is_compare_opcode(opcode: Opcode) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CallTarget {
     Bytecode(u32),
-    Native(NativeMethod),
     Primitive(PrimitiveId),
     Foreign(ForeignFnId),
+    NativeBuiltin(NativeBuiltin),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeBuiltin {
+    FnNew,
+    FnArity,
+    FnCall,
+    FiberCurrent,
+    FiberNew,
+    FiberCall,
+    FiberTry,
+    FiberTransfer,
+    FiberTransferError,
+    FiberYield,
+    FiberSuspend,
+    FiberAbort,
+    FiberError,
+    FiberIsDone,
+    SystemGc,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BuiltinClass {
+    Null,
+    Bool,
+    Num,
+    String,
+    List,
+    Map,
+    Range,
+    Closure,
+    Fiber,
 }
 
 const BUILTIN_CLASS_COUNT: usize = 9;
@@ -1044,6 +1259,7 @@ const CLASS_KIND_INSTANCE: u64 = 1 << 56;
 const CLASS_KIND_STATIC: u64 = 2 << 56;
 const CLASS_KIND_BUILTIN: u64 = 3 << 56;
 const CLASS_KIND_FOREIGN: u64 = 4 << 56;
+const CLASS_KIND_CORE_STATIC: u64 = 5 << 56;
 
 #[inline(always)]
 fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
@@ -1062,6 +1278,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Fiber as u64),
         HeapObject::ClassObject { class_slot } =>
             ReceiverClass(CLASS_KIND_STATIC | *class_slot as u64),
+        HeapObject::BuiltinClass { builtin } =>
+            ReceiverClass(CLASS_KIND_CORE_STATIC | builtin.index() as u64),
         HeapObject::Instance { class_slot, .. } =>
             ReceiverClass(CLASS_KIND_INSTANCE | *class_slot as u64),
         HeapObject::Foreign { class_slot, .. } =>
@@ -1234,6 +1452,8 @@ pub struct Interpreter<'p> {
     classes: Vec<RuntimeClass>,
     modules: Vec<RuntimeModule>,
     strings: Vec<Value>,
+    builtin_values: Vec<Value>,
+    builtin_static_methods: Vec<Vec<Option<CallTarget>>>,
     /// Constants pre-resolved to physical register words once at VM startup.
     /// Hot LOAD_CONST never reinterprets Constant or performs metadata lookup.
     resolved_constants: Vec<Vec<RegisterWord>>,
@@ -1245,8 +1465,6 @@ pub struct Interpreter<'p> {
     error: Option<RuntimeError>,
     inline_caches: Vec<Vec<InlineCacheState>>,
     builtin_methods: Vec<Vec<Option<CallTarget>>>,
-    core_foreign_methods: HashMap<ForeignFnId, NativeMethod>,
-    started_at: Instant,
     megamorphic_cache: HashMap<(ReceiverClass, MethodSymbol, Option<u32>), CallTarget>,
     profile_counters: Vec<Vec<u64>>,
     roots: Vec<Option<Value>>,
@@ -1278,13 +1496,25 @@ impl<'p> Interpreter<'p> {
             strings.push(heap.alloc(HeapObject::String(Arc::<[u8]>::from(string.as_bytes()))));
         }
 
+        let mut builtin_values = Vec::with_capacity(BuiltinId::COUNT);
+        for builtin in BuiltinId::ALL {
+            builtin_values.push(heap.alloc(HeapObject::BuiltinClass { builtin }));
+        }
+
         let mut modules = Vec::with_capacity(program.metadata.modules.len());
         for (slot, info) in program.metadata.modules.iter().enumerate() {
             let module_value = heap.alloc(HeapObject::ModuleObject { module_slot: slot as u32 });
+            let mut variables = vec![Value::NULL; info.variable_count as usize];
+            for binding in &info.builtin_bindings {
+                let Some(target) = variables.get_mut(binding.slot.0 as usize) else {
+                    return Err(RuntimeError::new("builtin module binding slot out of range"));
+                };
+                *target = builtin_values[binding.builtin.index()];
+            }
             modules.push(RuntimeModule {
                 id: info.id,
                 name: info.name,
-                variables: vec![Value::NULL; info.variable_count as usize],
+                variables,
                 exports: HashMap::new(),
                 module_value,
                 body: None,
@@ -1359,7 +1589,7 @@ impl<'p> Interpreter<'p> {
         let mut main = FiberState::new(main_object, FiberStatus::Running);
         main.registers.reserve(4096);
 
-        let mut vm = Self {
+        Ok(Self {
             program,
             prepared,
             host,
@@ -1367,6 +1597,8 @@ impl<'p> Interpreter<'p> {
             classes,
             modules,
             strings,
+            builtin_values,
+            builtin_static_methods: vec![vec![None; program.metadata.methods.len()]; BuiltinId::COUNT],
             resolved_constants,
             fibers: vec![Some(main)],
             free_fibers: Vec::new(),
@@ -1376,8 +1608,6 @@ impl<'p> Interpreter<'p> {
             error: None,
             inline_caches,
             builtin_methods: vec![vec![None; program.metadata.methods.len()]; BUILTIN_CLASS_COUNT],
-            core_foreign_methods: HashMap::new(),
-            started_at: Instant::now(),
             megamorphic_cache: HashMap::new(),
             profile_counters,
             roots: Vec::new(),
@@ -1386,53 +1616,7 @@ impl<'p> Interpreter<'p> {
             hot_frame: std::ptr::null_mut(),
             hot_registers: std::ptr::null_mut(),
             hot_function: std::ptr::null(),
-        };
-        vm.install_core()?;
-        Ok(vm)
-    }
-
-    fn install_core(&mut self) -> Result<(), RuntimeError> {
-        use BuiltinClass::*;
-        for class in [Null, Bool, Num, String, List, Map, Range, Closure, Fiber] {
-            for (index, method) in self.program.metadata.methods.iter().enumerate() {
-                let name = self.program.metadata.string(method.name).unwrap_or("");
-                if let Some(native) = core::instance_method(class, name, method.kind, method.arity) {
-                    self.builtin_methods[class as usize][index] = Some(CallTarget::Native(native));
-                }
-            }
-        }
-        for foreign in &self.program.metadata.foreign_functions {
-            if self.program.metadata.string(foreign.module) != Some(core::MODULE_NAME) {
-                continue;
-            }
-            let signature = self.program.metadata.method(foreign.signature)
-                .ok_or_else(|| RuntimeError::new("missing core method signature"))?;
-            let class = self.program.metadata.string(foreign.class).unwrap_or("");
-            let name = self.program.metadata.string(signature.name).unwrap_or("");
-            let native = core::foreign_method(class, name, signature.kind, signature.arity)
-                .filter(|_| foreign.is_static)
-                .ok_or_else(|| RuntimeError::new(format!("unknown core method {class}.{name}")))?;
-            self.core_foreign_methods.insert(foreign.id, native);
-        }
-        let entry = self.program.functions.iter().find(|function| {
-            function.kind == FunctionKind::ModuleBody
-                && self.program.metadata.module(function.module)
-                    .and_then(|module| self.program.metadata.string(module.name)) == Some(core::MODULE_NAME)
-        }).map(|function| function.id);
-        if let Some(entry) = entry {
-            match self.run_module(entry)? {
-                ExecutionResult::Returned(_) => {}
-                ExecutionResult::Suspended(_) => return Err(RuntimeError::new("core initialization suspended")),
-            }
-        }
-        Ok(())
-    }
-
-    fn invalidate_method_caches(&mut self) {
-        for caches in &mut self.inline_caches {
-            caches.fill_with(InlineCacheState::default);
-        }
-        self.megamorphic_cache.clear();
+        })
     }
 
     pub fn set_gc_enabled(&mut self, enabled: bool) {
@@ -1446,7 +1630,61 @@ impl<'p> Interpreter<'p> {
             .and_then(|table| table.get_mut(method.0 as usize))
         {
             *slot = Some(CallTarget::Primitive(primitive));
-            self.invalidate_method_caches();
+        }
+    }
+
+    pub fn bind_builtin_static_primitive(
+        &mut self,
+        builtin: BuiltinId,
+        method: MethodSymbol,
+        primitive: PrimitiveId,
+    ) {
+        if let Some(slot) = self
+            .builtin_static_methods
+            .get_mut(builtin.index())
+            .and_then(|table| table.get_mut(method.0 as usize))
+        {
+            *slot = Some(CallTarget::Primitive(primitive));
+        }
+    }
+
+    pub fn bind_builtin_static_foreign(
+        &mut self,
+        builtin: BuiltinId,
+        method: MethodSymbol,
+        foreign: ForeignFnId,
+    ) {
+        if let Some(slot) = self
+            .builtin_static_methods
+            .get_mut(builtin.index())
+            .and_then(|table| table.get_mut(method.0 as usize))
+        {
+            *slot = Some(CallTarget::Foreign(foreign));
+        }
+    }
+
+    #[inline]
+    pub fn builtin_value(&self, builtin: BuiltinId) -> Value {
+        self.builtin_values[builtin.index()]
+    }
+
+    pub fn bind_builtin_native(&mut self, class: BuiltinClass, method: MethodSymbol, native: NativeBuiltin) {
+        if let Some(slot) = self
+            .builtin_methods
+            .get_mut(class as usize)
+            .and_then(|table| table.get_mut(method.0 as usize))
+        {
+            *slot = Some(CallTarget::NativeBuiltin(native));
+        }
+    }
+
+    pub fn bind_builtin_static_native(&mut self, builtin: BuiltinId, method: MethodSymbol, native: NativeBuiltin) {
+        if let Some(slot) = self
+            .builtin_static_methods
+            .get_mut(builtin.index())
+            .and_then(|table| table.get_mut(method.0 as usize))
+        {
+            *slot = Some(CallTarget::NativeBuiltin(native));
         }
     }
 
@@ -1457,7 +1695,6 @@ impl<'p> Interpreter<'p> {
             .and_then(|table| table.get_mut(method.0 as usize))
         {
             *slot = Some(CallTarget::Foreign(foreign));
-            self.invalidate_method_caches();
         }
     }
 
@@ -1734,12 +1971,6 @@ impl<'p> Interpreter<'p> {
         if args.len() > ARGUMENT_REGISTER_COUNT {
             return Err(RuntimeError::new("too many call arguments"));
         }
-        let arity = self.program.functions[function_index as usize].arity as usize;
-        if args.len() < arity {
-            return Err(RuntimeError::new(format!(
-                "function requires {arity} argument(s), got {}", args.len()
-            )));
-        }
         // `prepared` is immutable for the lifetime of the interpreter. Keeping a
         // raw pointer here lets us mutate disjoint VM state below without cloning
         // FrameLayout (which contains Vecs and would allocate on every call).
@@ -1928,6 +2159,14 @@ impl Interpreter<'_> {
                 .copied()
                 .flatten();
         }
+        if kind == (CLASS_KIND_CORE_STATIC >> 56) {
+            return self
+                .builtin_static_methods
+                .get(payload as usize)?
+                .get(method.0 as usize)
+                .copied()
+                .flatten();
+        }
 
         let is_static = kind == (CLASS_KIND_STATIC >> 56);
         let mut slot = if let Some(home) = home_class {
@@ -1943,9 +2182,7 @@ impl Interpreter<'_> {
             }
             slot = match class.superclass { Some(next) => next, None => break };
         }
-        let signature = self.program.metadata.method(method)?;
-        let name = self.program.metadata.string(signature.name)?;
-        core::object_method(name, signature.kind, signature.arity).map(CallTarget::Native)
+        None
     }
 
     #[inline(always)]
@@ -1981,10 +2218,7 @@ impl Interpreter<'_> {
         }
 
         let target = self.lookup_method(class, descriptor.method, home_slot).ok_or_else(|| {
-            let signature = self.program.metadata.method(descriptor.method);
-            let name = signature.and_then(|signature| self.program.metadata.string(signature.name)).unwrap_or("<unknown>");
-            let arity = signature.map_or(0, |signature| signature.arity);
-            RuntimeError::new(format!("method '{name}' with {arity} argument(s) is not defined for receiver"))
+            RuntimeError::new(format!("method {:?} is not defined for receiver", descriptor.method))
         })?;
         let cache = &mut self.inline_caches[function_index as usize][ic_slot as usize];
         cache.insert(class, target);
@@ -2002,30 +2236,6 @@ impl Interpreter<'_> {
         args: &[RegisterWord],
     ) {
         match target {
-            CallTarget::Native(NativeMethod::ClosureCall) => {
-                let closure = Value::from_word(receiver);
-                let function = match self.heap.get(closure) {
-                    Some(HeapObject::Closure { function_index, .. }) => *function_index,
-                    _ => { self.fail_at(op, "call receiver must be a function"); return; }
-                };
-                self.mark_gc_point(op);
-                self.current_frame_mut().pc = op.next;
-                if let Err(error) = self.push_frame(function, None, args, Some(closure), Some(Reg(op.a))) {
-                    self.fail_at(op, error.message);
-                }
-            }
-            CallTarget::Native(native) => {
-                self.mark_gc_point(op);
-                self.stage_invoke_args(receiver, args);
-                let mut values = [Value::NULL; 17];
-                values[0] = Value::from_word(receiver);
-                for (index, word) in args.iter().copied().enumerate() { values[index + 1] = Value::from_word(word); }
-                self.maybe_collect();
-                match self.call_native(native, &values[..args.len() + 1]) {
-                    Ok(result) => unsafe { self.set_reg(op.a, result.word()); self.advance(op); },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
             CallTarget::Bytecode(function) => {
                 self.mark_gc_point(op);
                 self.current_frame_mut().pc = op.next;
@@ -2054,6 +2264,96 @@ impl Interpreter<'_> {
                     Ok(result) => unsafe { self.set_reg(op.a, result.word()); self.advance(op); },
                     Err(error) => self.fail_at(op, error.message),
                 }
+            }
+            CallTarget::NativeBuiltin(native) => self.invoke_native_builtin(op, native, receiver, args),
+        }
+    }
+
+    fn invoke_native_builtin(
+        &mut self,
+        op: &PreparedOp,
+        native: NativeBuiltin,
+        receiver: RegisterWord,
+        args: &[RegisterWord],
+    ) {
+        let arg = |index: usize| args.get(index).copied().map(Value::from_word).unwrap_or(Value::NULL);
+        match native {
+            NativeBuiltin::FnNew => {
+                let closure = arg(0);
+                if !matches!(self.heap.get(closure), Some(HeapObject::Closure { .. })) {
+                    self.fail_at(op, "Fn.new expects a function");
+                    return;
+                }
+                unsafe { self.set_reg(op.a, closure.word()); self.advance(op); }
+            }
+            NativeBuiltin::FnArity => {
+                let closure = Value::from_word(receiver);
+                let function = match self.heap.get(closure) {
+                    Some(HeapObject::Closure { function_index, .. }) => *function_index,
+                    _ => { self.fail_at(op, "Fn.arity receiver is not a closure"); return; }
+                };
+                let arity = self.prepared.functions[function as usize].arity;
+                unsafe { self.set_reg(op.a, Value::from_num(arity as f64).word()); self.advance(op); }
+            }
+            NativeBuiltin::FnCall => {
+                let closure = Value::from_word(receiver);
+                let function = match self.heap.get(closure) {
+                    Some(HeapObject::Closure { function_index, .. }) => *function_index,
+                    _ => { self.fail_at(op, "Fn.call receiver is not a closure"); return; }
+                };
+                self.mark_gc_point(op);
+                self.current_frame_mut().pc = op.next;
+                if let Err(error) = self.push_frame(function, None, args, Some(closure), Some(Reg(op.a))) {
+                    self.fail_at(op, error.message);
+                }
+            }
+            NativeBuiltin::FiberCurrent => {
+                let value = self.fiber(self.current_fiber).object;
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::FiberNew => {
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                match self.allocate_fiber(arg(0)) {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::FiberCall => self.activate_fiber(op, Value::from_word(receiver), arg(0), true, false),
+            NativeBuiltin::FiberTry => self.activate_fiber(op, Value::from_word(receiver), arg(0), true, true),
+            NativeBuiltin::FiberTransfer => self.activate_fiber(op, Value::from_word(receiver), arg(0), false, false),
+            NativeBuiltin::FiberTransferError => self.transfer_error_to_fiber(op, Value::from_word(receiver), arg(0)),
+            NativeBuiltin::FiberYield => self.yield_current_fiber(op, arg(0), Some(Reg(op.a))),
+            NativeBuiltin::FiberSuspend => self.suspend_vm(op, Reg(op.a)),
+            NativeBuiltin::FiberAbort => {
+                let error = arg(0);
+                if error.is_null() {
+                    unsafe { self.set_reg(op.a, Value::NULL.word()); self.advance(op); }
+                } else {
+                    self.abort_current_fiber(op, error);
+                }
+            }
+            NativeBuiltin::FiberError => {
+                let fiber = Value::from_word(receiver);
+                let id = match self.heap.get(fiber) {
+                    Some(HeapObject::FiberObject { fiber }) => *fiber,
+                    _ => { self.fail_at(op, "Fiber.error receiver is not a Fiber"); return; }
+                };
+                let value = self.fibers.get(id as usize).and_then(|slot| slot.as_ref()).map(|state| state.error).unwrap_or(Value::NULL);
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::FiberIsDone => {
+                let fiber = Value::from_word(receiver);
+                let id = match self.heap.get(fiber) {
+                    Some(HeapObject::FiberObject { fiber }) => *fiber,
+                    _ => { self.fail_at(op, "Fiber.isDone receiver is not a Fiber"); return; }
+                };
+                let done = self.fibers.get(id as usize).and_then(|slot| slot.as_ref()).map_or(true, |state| matches!(state.status, FiberStatus::Done | FiberStatus::Failed));
+                unsafe { self.set_reg(op.a, Value::from_bool(done).word()); self.advance(op); }
+            }
+            NativeBuiltin::SystemGc => {
+                self.collect_garbage();
+                unsafe { self.set_reg(op.a, Value::NULL.word()); self.advance(op); }
             }
         }
     }
@@ -2084,90 +2384,9 @@ impl Interpreter<'_> {
 
     fn call_host_foreign(&mut self, foreign: ForeignFnId, args: &[Value]) -> Result<Value, RuntimeError> {
         self.maybe_collect();
-        if let Some(native) = self.core_foreign_methods.get(&foreign).copied() {
-            return self.call_native(native, args);
-        }
         let (host, heap) = (&mut self.host, &mut self.heap);
         let mut context = HostContext { heap };
         host.call_foreign(&mut context, foreign, args)
-    }
-
-    fn call_native(&mut self, method: NativeMethod, args: &[Value]) -> Result<Value, RuntimeError> {
-        use NativeMethod::*;
-        let receiver = args.first().copied().ok_or_else(|| RuntimeError::new("missing native receiver"))?;
-        let argument = || args.get(1).copied().ok_or_else(|| RuntimeError::new("missing native argument"));
-        match method {
-            WriteString => {
-                let value = argument()?;
-                let Some(HeapObject::String(bytes)) = self.heap.get(value) else {
-                    return Err(RuntimeError::new("toString must return a string"));
-                };
-                self.host.write(bytes)?;
-                Ok(Value::NULL)
-            }
-            Clock => Ok(Value::from_num(self.started_at.elapsed().as_secs_f64())),
-            CollectGarbage => { self.collect_garbage(); Ok(Value::NULL) }
-            FnNew => {
-                let value = argument()?;
-                if !matches!(self.heap.get(value), Some(HeapObject::Closure { .. })) {
-                    return Err(RuntimeError::new("Fn.new expects a function"));
-                }
-                Ok(value)
-            }
-            ClosureArity => match self.heap.get(receiver) {
-                Some(HeapObject::Closure { function_index, .. }) =>
-                    Ok(Value::from_num(self.program.functions[*function_index as usize].arity as f64)),
-                _ => Err(RuntimeError::new("arity receiver must be a function")),
-            },
-            ClosureCall => Err(RuntimeError::new("closure calls require an interpreter frame")),
-            ToString => {
-                if matches!(self.heap.get(receiver), Some(HeapObject::String(_))) {
-                    return Ok(receiver);
-                }
-                let text = self.value_to_string(receiver);
-                Ok(self.heap.alloc(HeapObject::String(Arc::from(text.as_bytes()))))
-            }
-            Not => Ok(Value::from_bool(receiver.is_null() || receiver.as_bool() == Some(false))),
-            Equal | NotEqual => {
-                let other = argument()?;
-                let equal = match (receiver.as_num(), other.as_num()) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => match (self.heap.get(receiver), self.heap.get(other)) {
-                        (Some(HeapObject::String(a)), Some(HeapObject::String(b))) => a == b,
-                        _ => receiver == other,
-                    },
-                };
-                Ok(Value::from_bool(if matches!(method, Equal) { equal } else { !equal }))
-            }
-            StringConcat => {
-                let other = argument()?;
-                let (Some(HeapObject::String(a)), Some(HeapObject::String(b))) =
-                    (self.heap.get(receiver), self.heap.get(other)) else {
-                        return Err(RuntimeError::new("string '+' expects a string argument"));
-                    };
-                let mut bytes = Vec::with_capacity(a.len() + b.len());
-                bytes.extend_from_slice(a);
-                bytes.extend_from_slice(b);
-                Ok(self.heap.alloc(HeapObject::String(Arc::from(bytes))))
-            }
-            Negate => Ok(Value::from_num(-receiver.as_num().ok_or_else(|| RuntimeError::new("expected a number"))?)),
-            Add | Subtract | Multiply | Divide | Remainder | Less | LessEqual | Greater | GreaterEqual => {
-                let a = receiver.as_num().ok_or_else(|| RuntimeError::new("expected a number"))?;
-                let b = argument()?.as_num().ok_or_else(|| RuntimeError::new("numeric operator expects a number argument"))?;
-                Ok(match method {
-                    Add => Value::from_num(a + b),
-                    Subtract => Value::from_num(a - b),
-                    Multiply => Value::from_num(a * b),
-                    Divide => Value::from_num(a / b),
-                    Remainder => Value::from_num(a % b),
-                    Less => Value::from_bool(a < b),
-                    LessEqual => Value::from_bool(a <= b),
-                    Greater => Value::from_bool(a > b),
-                    GreaterEqual => Value::from_bool(a >= b),
-                    _ => unreachable!(),
-                })
-            }
-        }
     }
 
     #[inline(always)]
@@ -2261,7 +2480,12 @@ impl Interpreter<'_> {
 
     pub fn collect_garbage(&mut self) {
         let mut work = Vec::<u32>::new();
-        for &value in self.strings.iter().chain(self.roots.iter().filter_map(|x| x.as_ref())) {
+        for &value in self
+            .strings
+            .iter()
+            .chain(self.builtin_values.iter())
+            .chain(self.roots.iter().filter_map(|x| x.as_ref()))
+        {
             mark_value_handle(&mut self.heap, value, &mut work);
         }
         for class in &self.classes {
@@ -2307,7 +2531,7 @@ impl Interpreter<'_> {
                     if traced_fibers.insert(*fiber) { self.mark_fiber_roots(*fiber, &mut work); }
                 }
                 HeapObject::String(_) | HeapObject::Range { .. } | HeapObject::ClassObject { .. }
-                | HeapObject::Foreign { .. } | HeapObject::ModuleObject { .. } => {}
+                | HeapObject::BuiltinClass { .. } | HeapObject::Foreign { .. } | HeapObject::ModuleObject { .. } => {}
             }
         }
 
@@ -3129,6 +3353,7 @@ impl Interpreter<'_> {
             Some(HeapObject::Range { from, to, inclusive }) => format!("{}{}{}", from, if *inclusive { ".." } else { "..." }, to),
             Some(HeapObject::Closure { function_index, .. }) => format!("<closure {:?}>", self.prepared.functions[*function_index as usize].id),
             Some(HeapObject::ClassObject { class_slot }) => self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("<class>").to_owned(),
+            Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
             Some(HeapObject::Instance { class_slot, .. }) => format!("<{} instance>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign {}>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
             Some(HeapObject::FiberObject { fiber }) => format!("<fiber:{fiber}>") ,
@@ -3153,7 +3378,7 @@ mod tests {
 
     fn simple_program(chunk: crate::wren_bytecode::BytecodeChunk, gprs: u16) -> BytecodeProgram {
         let mut program = BytecodeProgram::new();
-        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0 });
+        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, builtin_bindings: Vec::new() });
         program.metadata.strings.push("main".to_owned());
         program.push_function(BytecodeFunction {
             id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,

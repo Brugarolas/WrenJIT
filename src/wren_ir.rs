@@ -272,6 +272,54 @@ pub enum FunctionKind {
     ForeignStub,
 }
 
+/// Engine-provided core globals that are implicitly visible in every Wren module.
+///
+/// These are semantic identities, not runtime class slots. The interpreter owns
+/// the concrete values and installs them into each module's reserved builtin
+/// bindings before executing its body.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BuiltinId {
+    Object = 0,
+    Class = 1,
+    Bool = 2,
+    Null = 3,
+    Num = 4,
+    String = 5,
+    List = 6,
+    Map = 7,
+    Range = 8,
+    Fn = 9,
+    Fiber = 10,
+    System = 11,
+    Date = 12,
+}
+
+impl BuiltinId {
+    pub const ALL: [Self; 13] = [
+        Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
+        Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
+        Self::Fiber, Self::System, Self::Date,
+    ];
+    pub const COUNT: usize = Self::ALL.len();
+    #[inline] pub const fn name(self) -> &'static str {
+        match self {
+            Self::Object => "Object", Self::Class => "Class", Self::Bool => "Bool",
+            Self::Null => "Null", Self::Num => "Num", Self::String => "String",
+            Self::List => "List", Self::Map => "Map", Self::Range => "Range",
+            Self::Fn => "Fn", Self::Fiber => "Fiber", Self::System => "System",
+            Self::Date => "Date",
+        }
+    }
+    #[inline] pub const fn index(self) -> usize { self as usize }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BuiltinBinding {
+    pub slot: ModuleSlot,
+    pub builtin: BuiltinId,
+}
+
 #[derive(Clone, Debug)]
 pub struct Signature {
     pub name: StringId,
@@ -286,6 +334,8 @@ pub struct ModuleInfo {
     pub id: ModuleId,
     pub name: StringId,
     pub variable_count: u32,
+    /// Slots preinitialized by the VM with engine-provided core class objects.
+    pub builtin_bindings: Vec<BuiltinBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -1421,6 +1471,7 @@ impl Program {
             id,
             name: self.intern_string(name),
             variable_count,
+            builtin_bindings: Vec::new(),
         };
         let index = self.modules.len();
         self.modules.push(info);
@@ -1432,6 +1483,15 @@ impl Program {
         self.module_index
             .get(&id)
             .and_then(|index| self.modules.get(*index))
+    }
+
+    pub fn set_module_builtin_bindings(&mut self, id: ModuleId, bindings: Vec<BuiltinBinding>) {
+        let index = *self.module_index.get(&id).unwrap_or_else(|| panic!("unknown module {id:?}"));
+        let module = &mut self.modules[index];
+        for binding in &bindings {
+            assert!(binding.slot.0 < module.variable_count, "builtin module slot {:?} out of range for {:?}", binding.slot, id);
+        }
+        module.builtin_bindings = bindings;
     }
 
     pub fn add_class(
