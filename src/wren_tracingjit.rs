@@ -46,7 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
-use std::mem::offset_of;
+use std::mem::{offset_of, MaybeUninit};
 use std::rc::Rc;
 
 use b3::air::generate::emit_function_epilogue;
@@ -100,6 +100,24 @@ fn word_is_num(word: RegisterWord) -> bool {
 #[inline]
 fn word_num(word: RegisterWord) -> Option<f64> {
     word_is_num(word).then(|| f64::from_bits(word.0))
+}
+
+#[inline]
+fn word_exact_i32(word: RegisterWord) -> Option<i32> {
+    let number = word_num(word)?;
+    // Preserve Wren/IEEE-754 signed-zero semantics. Integer speculation is only
+    // valid when converting to i32 and back produces the identical numeric value.
+    if number == 0.0 && number.to_bits() != 0.0f64.to_bits() {
+        return None;
+    }
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || number < i32::MIN as f64
+        || number > i32::MAX as f64
+    {
+        return None;
+    }
+    Some(number as i32)
 }
 
 #[inline]
@@ -160,7 +178,7 @@ pub struct TraceActivation {
     pub result_code: u32,
 
     /// Raw `RegisterWord` representation of dynamic side-exit values.
-    pub exit_values: [u64; MAX_TRACE_EXIT_VALUES],
+    pub exit_values: [MaybeUninit<u64>; MAX_TRACE_EXIT_VALUES],
 }
 
 impl TraceActivation {
@@ -174,7 +192,7 @@ impl TraceActivation {
             execute: inputs.execute,
             exit_id: u32::MAX,
             result_code: TRACE_RESULT_CONTINUE,
-            exit_values: [0; MAX_TRACE_EXIT_VALUES],
+            exit_values: [MaybeUninit::uninit(); MAX_TRACE_EXIT_VALUES],
         }
     }
 
@@ -377,6 +395,11 @@ pub struct TracingJitStats {
     pub blacklisted_loops: u64,
     pub stitched_exits: u64,
     pub recorded_bytecodes: u64,
+    pub promoted_f64_loop_phis: u64,
+    pub promoted_i32_loop_phis: u64,
+    pub eliminated_trace_guards: u64,
+    pub eliminated_trace_boxes: u64,
+    pub eliminated_trace_copies: u64,
     pub last_abort: Option<String>,
 }
 
@@ -839,6 +862,50 @@ impl<'a> TraceRecorder<'a> {
 
         match name {
             "+" | "-" | "*" | "/" => {
+                // For exact small integers, speculate on i32 and guard overflow.
+                // A failed guard/overflow resumes at the original Invoke, which
+                // computes full Wren f64 semantics. Division intentionally stays
+                // f64 because Wren `/` is not integer division.
+                let int_bin = if name != "/" {
+                    match (word_exact_i32(receiver_word), word_exact_i32(rhs_word)) {
+                        (Some(lhs), Some(rhs)) => {
+                            let observed_fits = match name {
+                                "+" => lhs.checked_add(rhs).is_some(),
+                                "-" => lhs.checked_sub(rhs).is_some(),
+                                "*" => lhs.checked_mul(rhs).is_some(),
+                                _ => false,
+                            };
+                            observed_fits.then_some(match name {
+                                "+" => IntBinOp::Add,
+                                "-" => IntBinOp::Sub,
+                                "*" => IntBinOp::Mul,
+                                _ => unreachable!(),
+                            })
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(bin) = int_bin {
+                    let lhs = self.num_to_i32_guard(builder, receiver, resume);
+                    let rhs = self.num_to_i32_guard(builder, rhs, resume);
+                    let overflow = builder.add_side_exit(ExitReason::GuardInteger, resume);
+                    let raw = builder.emit1(
+                        TraceInst::IntBinaryChecked { op: bin, lhs, rhs, exit: overflow },
+                        TraceType::Int32,
+                        TraceRep::Int32,
+                    );
+                    let boxed = builder.emit1(
+                        TraceInst::BoxInt32 { value: raw },
+                        TraceType::Num,
+                        TraceRep::Tagged,
+                    );
+                    self.write_gpr(builder, op.a, boxed);
+                    return Ok(true);
+                }
+
                 let lhs = self.num_to_f64_guard(builder, receiver, resume);
                 let rhs = self.num_to_f64_guard(builder, rhs, resume);
                 let bin = match name {
@@ -849,11 +916,7 @@ impl<'a> TraceRecorder<'a> {
                     _ => unreachable!(),
                 };
                 let raw = builder.emit1(
-                    TraceInst::F64Binary {
-                        op: bin,
-                        lhs,
-                        rhs,
-                    },
+                    TraceInst::F64Binary { op: bin, lhs, rhs },
                     TraceType::F64,
                     TraceRep::F64,
                 );
@@ -867,8 +930,6 @@ impl<'a> TraceRecorder<'a> {
             }
 
             "<" | "<=" | ">" | ">=" | "==" | "!=" => {
-                let lhs = self.num_to_f64_guard(builder, receiver, resume);
-                let rhs = self.num_to_f64_guard(builder, rhs, resume);
                 let cmp = match name {
                     "<" => CmpKind::Lt,
                     "<=" => CmpKind::Le,
@@ -878,11 +939,26 @@ impl<'a> TraceRecorder<'a> {
                     "!=" => CmpKind::Ne,
                     _ => unreachable!(),
                 };
-                let condition = builder.emit1(
-                    TraceInst::F64Compare { op: cmp, lhs, rhs },
-                    TraceType::Bool,
-                    TraceRep::Bool,
-                );
+
+                let condition = if word_exact_i32(receiver_word).is_some()
+                    && word_exact_i32(rhs_word).is_some()
+                {
+                    let lhs = self.num_to_i32_guard(builder, receiver, resume);
+                    let rhs = self.num_to_i32_guard(builder, rhs, resume);
+                    builder.emit1(
+                        TraceInst::IntCompare { op: cmp, lhs, rhs },
+                        TraceType::Bool,
+                        TraceRep::Bool,
+                    )
+                } else {
+                    let lhs = self.num_to_f64_guard(builder, receiver, resume);
+                    let rhs = self.num_to_f64_guard(builder, rhs, resume);
+                    builder.emit1(
+                        TraceInst::F64Compare { op: cmp, lhs, rhs },
+                        TraceType::Bool,
+                        TraceRep::Bool,
+                    )
+                };
                 let boxed = self.tagged_bool(builder, condition);
                 self.write_gpr(builder, op.a, boxed);
                 Ok(true)
@@ -1765,7 +1841,10 @@ impl<'a> TraceRecorder<'a> {
                     for frame in &mut exit.frames {
                         if !frame.writes.iter().any(|write| write.slot == slot) {
                             frame.writes.push(crate::wren_traceir::SnapshotWrite {
-                                slot, kind: RegisterKind::Value, value: SnapshotValue::Value(phi),
+                                slot,
+                                kind: RegisterKind::Value,
+                                target_rep: rep,
+                                value: SnapshotValue::Value(phi),
                             });
                         }
                         for write in &mut frame.writes {
@@ -1987,6 +2066,12 @@ enum ExitWriteSource {
     Dynamic(u16),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CompiledExitValue {
+    value: TraceValueId,
+    target_rep: TraceRep,
+}
+
 #[derive(Clone, Debug)]
 struct CompiledExitWrite {
     slot: FrameSlot,
@@ -1999,7 +2084,7 @@ struct CompiledExitPlan {
     id: SideExitId,
     target: ExitTarget,
     writes: Vec<CompiledExitWrite>,
-    dynamic_values: Vec<TraceValueId>,
+    dynamic_values: Vec<CompiledExitValue>,
 }
 
 impl CompiledExitPlan {
@@ -2025,8 +2110,8 @@ impl CompiledExitPlan {
             });
         }
 
-        let mut dynamic_values = Vec::<TraceValueId>::new();
-        let mut dynamic_index = HashMap::<TraceValueId, u16>::new();
+        let mut dynamic_values = Vec::<CompiledExitValue>::new();
+        let mut dynamic_index = HashMap::<(TraceValueId, TraceRep), u16>::new();
         let mut writes = Vec::with_capacity(frame.writes.len());
 
         for write in &frame.writes {
@@ -2034,7 +2119,8 @@ impl CompiledExitPlan {
                 SnapshotValue::Constant(constant) => ExitWriteSource::Constant(constant),
                 SnapshotValue::Value(value) => {
                     let value = trace.canonical_value(value);
-                    let index = if let Some(index) = dynamic_index.get(&value).copied() {
+                    let key = (value, write.target_rep);
+                    let index = if let Some(index) = dynamic_index.get(&key).copied() {
                         index
                     } else {
                         if dynamic_values.len() >= MAX_TRACE_EXIT_VALUES {
@@ -2044,8 +2130,11 @@ impl CompiledExitPlan {
                             });
                         }
                         let index = dynamic_values.len() as u16;
-                        dynamic_values.push(value);
-                        dynamic_index.insert(value, index);
+                        dynamic_values.push(CompiledExitValue {
+                            value,
+                            target_rep: write.target_rep,
+                        });
+                        dynamic_index.insert(key, index);
                         index
                     };
                     ExitWriteSource::Dynamic(index)
@@ -2192,18 +2281,33 @@ impl<'a> B3TraceCompiler<'a> {
             let origin = self.trace.value(id).unwrap().origin.clone();
             if matches!(
                 origin,
-                TraceValueOrigin::EntrySlot { .. } | TraceValueOrigin::Constant(_)
+                TraceValueOrigin::EntrySlot { .. }
+                    | TraceValueOrigin::GuardedEntry { .. }
+                    | TraceValueOrigin::Constant(_)
             ) {
                 let _ = state.lower_value(id)?;
             }
         }
 
-        // Each LoopPhi is represented as a B3 variable. B3's own SSA conversion
-        // subsequently turns these into backend phis/upsilons.
+        // Each LoopPhi is represented as a B3 variable. Representation-promoted
+        // phis guard/unbox their tagged architectural entry value once here, in
+        // the preheader, instead of repeating box/guard traffic every iteration.
         for phi in &self.trace.loop_phis {
             let ty = b3_type(phi.rep);
             let variable = state.builder.procedure.add_variable(ty);
-            let initial = state.lower_value(phi.initial)?;
+            let mut initial = state.lower_value(phi.initial)?;
+            if let Some(exit) = phi.entry_exit {
+                initial = match phi.rep {
+                    TraceRep::F64 => state.guard_numeric(initial, exit)?,
+                    TraceRep::Int32 => state.guard_int32_numeric(initial, exit)?,
+                    _ => {
+                        return Err(TracingJitError::B3Lowering {
+                            trace: self.trace.id,
+                            message: format!("unsupported promoted LoopPhi representation {:?}", phi.rep),
+                        })
+                    }
+                };
+            }
             state.builder.var_set(variable, initial);
             state.phi_vars.insert(phi.value, variable);
         }
@@ -2338,6 +2442,20 @@ impl B3LoweringState<'_, '_> {
                 self.load_frame_slot(slot, value_rep)?
             }
 
+            TraceValueOrigin::GuardedEntry { value: source, exit } => {
+                let tagged = self.lower_value(source)?;
+                match value_rep {
+                    TraceRep::F64 => self.guard_numeric(tagged, exit)?,
+                    TraceRep::Int32 => self.guard_int32_numeric(tagged, exit)?,
+                    _ => {
+                        return Err(TracingJitError::B3Lowering {
+                            trace: self.trace.id,
+                            message: format!("unsupported guarded-entry representation {value_rep:?}"),
+                        })
+                    }
+                }
+            }
+
             TraceValueOrigin::Constant(constant) => self.lower_constant(constant)?,
 
             TraceValueOrigin::InstResult { .. } => {
@@ -2434,6 +2552,52 @@ impl B3LoweringState<'_, '_> {
             TraceRep::Int32 | TraceRep::Bool => self.builder.zext32(value),
             TraceRep::F64 => self.builder.bitwise_cast(b3::Type::Int64, value),
         }
+    }
+
+    /// Materialize an optimized native value into the representation expected by
+    /// the baseline VM at a side-exit resume point. This is the cold-path half of
+    /// loop representation promotion.
+    fn materialize_exit_word(
+        &mut self,
+        value: b3::ValueId,
+        source_rep: TraceRep,
+        target_rep: TraceRep,
+    ) -> Result<b3::ValueId, TracingJitError> {
+        if source_rep == target_rep {
+            return Ok(self.normalize_to_word(value, source_rep));
+        }
+
+        let result = match (source_rep, target_rep) {
+            (TraceRep::F64, TraceRep::Tagged) => self.box_f64(value),
+            (TraceRep::Int32, TraceRep::Tagged) => {
+                let number = self.builder.i2d(value);
+                self.builder.bitwise_cast(b3::Type::Int64, number)
+            }
+            (TraceRep::Bool, TraceRep::Tagged) => self.box_bool(value),
+            (TraceRep::HeapHandle, TraceRep::Tagged) => {
+                let tag = self.builder.const64(TAG_HEAP as i64);
+                self.builder.binary(b3::Opcode::BitOr, value, tag)
+            }
+            (TraceRep::Int32, TraceRep::F64) => {
+                let number = self.builder.i2d(value);
+                self.builder.bitwise_cast(b3::Type::Int64, number)
+            }
+            (TraceRep::Bool, TraceRep::Int32) => self.builder.zext32(value),
+            (TraceRep::Tagged, TraceRep::HeapHandle) => {
+                let payload = self.builder.const64(PAYLOAD_MASK as i64);
+                self.builder.binary(b3::Opcode::BitAnd, value, payload)
+            }
+            _ => {
+                return Err(TracingJitError::B3Lowering {
+                    trace: self.trace.id,
+                    message: format!(
+                        "cannot materialize side-exit value from {:?} to {:?}",
+                        source_rep, target_rep
+                    ),
+                })
+            }
+        };
+        Ok(result)
     }
 
     fn binary_compare(
@@ -2573,6 +2737,34 @@ impl B3LoweringState<'_, '_> {
         Ok(self.builder.bitwise_cast(b3::Type::Double, tagged))
     }
 
+    fn guard_int32_numeric(
+        &mut self,
+        tagged: b3::ValueId,
+        exit: SideExitId,
+    ) -> Result<b3::ValueId, TracingJitError> {
+        let number = self.guard_numeric(tagged, exit)?;
+        // Do not speculate -0.0 as i32: converting it to integer and boxing it
+        // back would produce +0.0 and observably change IEEE-754 behavior.
+        let negative_zero = self.builder.const64((-0.0f64).to_bits() as i64);
+        let is_negative_zero = self.builder.binary(b3::Opcode::Equal, tagged, negative_zero);
+        self.emit_side_exit(exit, is_negative_zero)?;
+
+        let min = self.builder.const_double(i32::MIN as f64);
+        let max = self.builder.const_double(i32::MAX as f64);
+        let ge_min = self.builder.binary(b3::Opcode::GreaterEqual, number, min);
+        let le_max = self.builder.binary(b3::Opcode::LessEqual, number, max);
+        let in_range = self.bool_and(ge_min, le_max);
+        let failure = self.bool_not(in_range);
+        self.emit_side_exit(exit, failure)?;
+
+        let i64_value = self.double_to_int64(number);
+        let back = self.builder.i2d(i64_value);
+        let exact = self.builder.binary(b3::Opcode::Equal, number, back);
+        let not_exact = self.bool_not(exact);
+        self.emit_side_exit(exit, not_exact)?;
+        Ok(self.builder.trunc(i64_value))
+    }
+
     fn emit_side_exit(
         &mut self,
         exit_id: SideExitId,
@@ -2591,10 +2783,10 @@ impl B3LoweringState<'_, '_> {
         let resume = self.builder.procedure.add_block(1.0);
         self.builder.branch(failure_condition, stop, (resume, Frequency::Normal));
         self.builder.block = stop;
-        for (index, value) in plan.dynamic_values.iter().enumerate() {
-            let rep = self.trace.value(*value).unwrap().rep;
-            let value = self.lower_value(*value)?;
-            let word = self.normalize_to_word(value, rep);
+        for (index, dynamic) in plan.dynamic_values.iter().enumerate() {
+            let source_rep = self.trace.value(dynamic.value).unwrap().rep;
+            let value = self.lower_value(dynamic.value)?;
+            let word = self.materialize_exit_word(value, source_rep, dynamic.target_rep)?;
             self.builder.store(word, self.activation,
                 offset_of!(TraceActivation, exit_values) as i32 + index as i32 * 8, None, None);
         }
@@ -2724,28 +2916,7 @@ impl B3LoweringState<'_, '_> {
 
             GuardInt32 { value, exit } => {
                 let tagged = self.lower_value(*value)?;
-                let number = self.guard_numeric(tagged, *exit)?;
-
-                // Reject NaN/out-of-range before DToI.
-                let min = self.builder.const_double(i32::MIN as f64);
-                let max = self.builder.const_double(i32::MAX as f64);
-                let ge_min = self
-                    .builder
-                    .binary(b3::Opcode::GreaterEqual, number, min);
-                let le_max = self
-                    .builder
-                    .binary(b3::Opcode::LessEqual, number, max);
-                let in_range = self.bool_and(ge_min, le_max);
-                let failure = self.bool_not(in_range);
-                self.emit_side_exit(*exit, failure)?;
-
-                let i64_value = self.double_to_int64(number);
-                let back = self.builder.i2d(i64_value);
-                let exact = self.builder.binary(b3::Opcode::Equal, number, back);
-                let not_exact = self.bool_not(exact);
-                self.emit_side_exit(*exit, not_exact)?;
-
-                let i32_value = self.builder.trunc(i64_value);
+                let i32_value = self.guard_int32_numeric(tagged, *exit)?;
                 let result = one_result(node)?;
                 set_result(self, result, i32_value);
             }
@@ -3263,6 +3434,11 @@ impl TracingJit {
 
         self.stats.recordings_succeeded += 1;
         self.stats.recorded_bytecodes += trace.stats.recorded_bytecodes as u64;
+        self.stats.promoted_f64_loop_phis += trace.stats.promoted_f64_loop_phis as u64;
+        self.stats.promoted_i32_loop_phis += trace.stats.promoted_i32_loop_phis as u64;
+        self.stats.eliminated_trace_guards += trace.stats.eliminated_guards as u64;
+        self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
+        self.stats.eliminated_trace_copies += trace.stats.eliminated_copies as u64;
 
         let compiled = match B3TraceCompiler::new(&trace, &self.options)
             .and_then(B3TraceCompiler::compile)
@@ -3415,7 +3591,7 @@ impl TracingJit {
                     .map_err(runtime_error)?,
 
                 ExitWriteSource::Dynamic(index) => {
-                    let raw = activation.exit_values[index as usize];
+                    let raw = unsafe { activation.exit_values[index as usize].assume_init() };
                     RegisterWord(raw)
                 }
             };
@@ -3541,6 +3717,15 @@ mod tests {
         assert!(word_is_falsey(RegisterWord(TAG_FALSE)));
         assert!(!word_is_falsey(RegisterWord(TAG_TRUE)));
         assert!(!word_is_falsey(RegisterWord(0.0f64.to_bits())));
+    }
+
+    #[test]
+    fn exact_i32_speculation_rejects_negative_zero_and_fractional_values() {
+        assert_eq!(word_exact_i32(RegisterWord(42.0f64.to_bits())), Some(42));
+        assert_eq!(word_exact_i32(RegisterWord(0.0f64.to_bits())), Some(0));
+        assert_eq!(word_exact_i32(RegisterWord((-0.0f64).to_bits())), None);
+        assert_eq!(word_exact_i32(RegisterWord(1.5f64.to_bits())), None);
+        assert_eq!(word_exact_i32(RegisterWord((i32::MAX as f64 + 1.0).to_bits())), None);
     }
 
     #[test]
