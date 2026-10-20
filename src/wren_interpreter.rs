@@ -5949,6 +5949,118 @@ mod tests {
     }
 
     #[test]
+    fn source_ranges_and_list_slices() {
+        let cases = [
+            ("trees[1..2]", "[birch, oak]"),
+            ("trees[1..-1]", "[birch, oak, willow]"),
+            ("trees[1...3]", "[birch, oak]"),
+            ("trees[0...4]", "[cedar, birch, oak, willow]"),
+            ("trees[0..-1]", "[cedar, birch, oak, willow]"),
+            ("trees[-3..-2]", "[birch, oak]"),
+            ("trees[3..1]", "[willow, oak, birch]"),
+            ("trees[3...1]", "[willow, oak]"),
+            ("trees[-1..0]", "[willow, oak, birch, cedar]"),
+            ("trees[-1...-4]", "[willow, oak, birch]"),
+            ("trees[2..2]", "[oak]"),
+            ("trees[2...2]", "[]"),
+            ("trees[4...4]", "[]"),
+            ("trees[4..-1]", "[]"),
+            ("trees[0...-5]", "[cedar]"),
+            ("[][0..-1]", "[]"),
+            ("[][0...0]", "[]"),
+            ("trees[1..3][1..-1]", "[oak, willow]"),
+            ("trees[0]", "cedar"),
+            ("trees[-1]", "willow"),
+            ("(1..3).toString", "1..3"),
+            ("(3...1).toString", "3...1"),
+            ("(1..3).from", "1"),
+            ("(1..3).to", "3"),
+            ("(3...1).min", "1"),
+            ("(3...1).max", "3"),
+            ("(1..3).isInclusive", "true"),
+            ("(1...3).isInclusive", "false"),
+        ];
+        for (expression, expected) in cases {
+            let source = format!(
+                "var trees = [\"cedar\", \"birch\", \"oak\", \"willow\"]\nvar result = {expression}\n"
+            );
+            let (program, entry, manifest) = compile_wren_module(&source);
+            for jit_enabled in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                vm.set_jit_options(jit_enabled.then(|| TracingJitOptions {
+                    hot_loop_threshold: 2,
+                    ..Default::default()
+                }));
+                vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
+                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let context = HostContext { heap: &mut vm.heap };
+                assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_range_iteration_and_slice_copy_semantics() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var total = 0
+            for (i in 1..3) { total = total + i }
+            for (i in 3...0) { total = total + i }
+            for (i in 2...2) { total = total + 1000 }
+            for (i in 0.5..2.5) { total = total + i }
+            var original = [10, 20, 30]
+            var copy = original[0..-1]
+            copy[0] = 99
+            original[1] = 77
+            var nested = [[1]]
+            var shallow = nested[0..0]
+            shallow[0][0] = 5
+            var bounds = 1...3
+            var selected = original[bounds]
+            return total + original[0] + copy[1] + nested[0][0] + selected.count
+        "#);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                ..Default::default()
+            }));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 53.5, "jit={jit_enabled}");
+        }
+    }
+
+    #[test]
+    fn source_list_slices_reject_invalid_bounds() {
+        let cases = [
+            ("trees[4..4]", "range start out of bounds"),
+            ("trees[-5..1]", "range start out of bounds"),
+            ("trees[0..4]", "range end out of bounds"),
+            ("trees[0...5]", "range end out of bounds"),
+            ("trees[0..-5]", "range end out of bounds"),
+            ("trees[1.5..2]", "range start must be an integer"),
+            ("trees[0..1.5]", "range end must be an integer"),
+            ("trees[Num.infinity..1]", "range start must be an integer"),
+            ("trees[0..Num.nan]", "range end must be an integer"),
+            ("trees[1e30..1]", "range start out of bounds"),
+            ("trees[0..1e30]", "range end out of bounds"),
+            ("[][0..0]", "range start out of bounds"),
+            ("trees[true]", "index must be a Num"),
+            ("trees[1..2] = []", "index must be a Num"),
+            ("1..\"two\"", "range end must be a Num"),
+            ("trees[4]", "index out of bounds"),
+            ("trees[0.5]", "index must be an integer"),
+        ];
+        for (expression, expected) in cases {
+            let source = format!("var trees = [0, 1, 2, 3]\n{expression}\n");
+            let (program, entry, manifest) = compile_wren_module(&source);
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(None);
+            let error = vm.run_module(entry).err().expect(expression);
+            assert!(error.message.contains(expected), "{expression}: {error:?}");
+        }
+    }
+
+    #[test]
     fn optimized_source_preserves_closures_branches_and_side_effects() {
         let (program, entry, manifest) = compile_local_wren(r#"
             var value = 0
@@ -5975,6 +6087,75 @@ mod tests {
             }));
             vm.run_module(entry).unwrap();
             assert_eq!(source_result(&vm), 42.0);
+        }
+    }
+
+    #[test]
+    fn scalar_replacement_preserves_object_cell_and_closure_semantics() {
+        let source = r#"
+class Point {
+  construct new(x, y) {
+    _x = x
+    _y = y
+    _sum = _x + _y
+  }
+  x { _x }
+  sum { _sum }
+  shift(dx) {
+    _x = _x + dx
+    return _x * 2 + _y
+  }
+}
+
+class Sroa {
+  static run() {
+    var total = 0
+    var counter = 0
+    var bump = Fn.new { counter = counter + 1 }
+    var i = 0
+    while (i < 30) {
+      var p = Point.new(i, 2)
+      total = total + p.sum
+      if (i % 3 == 0) {
+        total = total + p.shift(1)
+      }
+      var unused = Point.new(i, i)
+      var dead = Fn.new { unused }
+      var acc = 0
+      var add = Fn.new { |v| acc = acc + v }
+      if (i % 2 == 0) {
+        acc = acc + i
+      } else {
+        acc = acc - 1
+      }
+      total = total + acc
+      bump.call()
+      i = i + 1
+    }
+    return total + counter
+  }
+}
+var result = Sroa.run()
+"#;
+        // Reference value computed by hand from the Wren semantics above.
+        let mut expected = 0.0f64;
+        for i in 0..30 {
+            let i = i as f64;
+            expected += i + 2.0;
+            if i % 3.0 == 0.0 { expected += (i + 1.0) * 2.0 + 2.0; }
+            expected += if i % 2.0 == 0.0 { i } else { -1.0 };
+        }
+        expected += 30.0;
+
+        let (program, entry, manifest) = compile_wren_module(source);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                ..Default::default()
+            }));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), expected, "jit_enabled={jit_enabled}");
         }
     }
 

@@ -22,6 +22,58 @@ stage. Bytecode lowering has its own options, configurable through
 after HIR optimization. `wren_bytecodecompiler` remains the direct backend API
 for callers that already prepared their HIR.
 
+### Ranges and list slices
+
+Numeric `from..to` ranges include the endpoint; `from...to` ranges exclude it.
+Both ascending and descending ranges support `for` iteration and the `from`,
+`to`, `min`, `max`, and `isInclusive` getters.
+
+Use a range as a list subscript to create a new, shallow-copy list:
+
+```wren
+var trees = ["cedar", "birch", "oak", "willow"]
+trees[1..2]    // [birch, oak]
+trees[1..-1]   // [birch, oak, willow]
+trees[0...2]   // [cedar, birch]
+trees[3..1]    // [willow, oak, birch]
+trees[0...0]   // []
+```
+
+Negative bounds count from the end. Slice bounds must be finite integers and
+within bounds; an exclusive endpoint may be just beyond the selected elements.
+`list[0..-1]` and `list[0...list.count]` copy even an empty list. Slices do not
+modify the original list, but nested objects remain shared. Subscript assignment
+continues to accept a single integer index, not a range.
+
+### HIR escape analysis and scalar replacement
+
+`wren_ir_escape.rs` implements partial escape analysis (Graal-style) plus full
+SROA over HIR. `ScalarReplacement` runs at the end of the default
+`InterpreterOptimizationBundle`; if it changes anything, simplify/copy/DCE run
+once more. `EscapeAnalysis::analyze(&function)` exposes the per-allocation
+classification (`NoEscape`, `PartialEscape`, `GlobalEscape`) without rewriting.
+
+- Candidates: `AllocInstance`, `AllocCell`, `AllocList` (constant capacity),
+  `MakeRange` (numeric bounds), `MakeClosure` and `AllocMap`.
+- Field, cell and list accesses (`LoadField`/`StoreField`, `LoadCell`/`StoreCell`,
+  `ListLen`, constant-index `ListGet`/`ListSet`, `ListAppend`) become SSA values
+  (block parameters built with Braun-style lazy SSA construction). Write
+  barriers on virtual objects are dropped, and `RefEq` folds to a constant.
+- `NoEscape` allocations disappear entirely. On `PartialEscape` paths the object
+  is materialized (allocation plus stores of its current virtual state) only
+  right before the first escaping use, or at a merge with an already
+  materialized path. Reads before that point are still forwarded from SSA.
+- Nested virtual objects are resolved over several rounds (up to 4).
+- Allocations referenced by deopt snapshots or inlined frames are pinned.
+  Out-of-range virtual list accesses and other error-preserving cases also
+  force materialization, so runtime errors are not lost.
+
+There is no HIR inliner yet. Any `Invoke` with the object as receiver or
+argument (including `Fn.new { ... }` and list/range methods) is a real escape,
+so today's main wins are forwarded field reads in constructors, dead
+allocations, and branches where the object escapes on only one path.
+`ScalarReplacement::stats` reports the removed, sunk and forwarded allocations.
+
 Trace compilation has the same split: `wren_trace_ir_optimizer.rs` owns the
 extensible, verified pass runner, while `wren_trace_ir_optimizing.rs` owns the
 default list and transforms. The recorder runs this list for root and side

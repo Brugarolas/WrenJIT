@@ -7,6 +7,7 @@ use crate::wren_ir::{
     FieldSlot, Function, Inst, InstId, IntBinOp, IntUnaryOp, ModuleId, ModuleSlot, Node, SiteId,
     StaticFieldSlot, StringId, Type, ValueDef, ValueId,
 };
+use crate::wren_ir_escape::ScalarReplacement;
 use crate::wren_ir_optimizer::{repair_effect_chain, FunctionOptimization, Optimize};
 
 /// Interpreter-oriented WIR optimization pipeline.
@@ -61,6 +62,17 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
             if propagated {
                 changed_any |= dce.optimize_function(function);
             }
+        }
+
+        // Partial escape analysis + scalar replacement runs on the cleaned CFG.
+        // Virtualized fields turn into plain SSA values, which exposes new
+        // folding/copy/DCE opportunities, so re-run the cheap cleanups once.
+        let mut sroa = ScalarReplacement::default();
+        if sroa.optimize_function(function) {
+            changed_any = true;
+            simplify.optimize_function(function);
+            copies.optimize_function(function);
+            dce.optimize_function(function);
         }
 
         changed_any
