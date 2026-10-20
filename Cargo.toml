@@ -9,7 +9,24 @@ opt-level = 3
 overflow-checks = false
 
 [dependencies]
-ariadne = "0.6"
-logos = "0.16"
+ariadne = "0.6" # For painting nice error logs
+logos = "0.16" # Create ridiculously fast and easy tokenizers
 
-cranelift = { version = "0.136.3", features = ["jit", "module", "native"] }
+smallvec = "1.16.3" # Fast hash map
+ahash = "0.8.12" # Fast hash map
+hashbrown = "0.17.1" # Fast hash map
+papaya = "0.2.5" # Concurrent hash map
+small-map = "0.1.5" # Small map optimization
+smallbox = "0.8.8" # Small Box<T> optimization
+tinyvec = "1.13.3" # Tiny vector optimization
+tinyvec_macros = "0.1.1" # tinyvec's macros live in a separate crate; needed for helpers/tiny_vec re-export.
+compact_str = "0.10.0" # String drop-in replacement
+parking_lot = "0.12.5" # Concurrency primitives
+trc = "1.2.4" # Alternative to Trc with one non-atomic counter per thread and another general atomic-counter for all threads
+archery = "1.2.1" # Faster Arc
+triomphe = "0.1.14" # Faster Arc
+rclite = "0.4.2" # Optimized Rc for memory usage
+mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually faster
+
+bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator similar to arena allocator
+cranelift = { version = "0.136.3", features = ["jit", "module", "native"] } #JIT

@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use smallvec::SmallVec;
 
 macro_rules! id_newtype {
     ($name:ident, $repr:ty) => {
@@ -59,7 +60,7 @@ id_newtype!(StaticFieldSlot, u16);
 /// A small, canonicalized set of observed/possible runtime classes.
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct ClassSet {
-    classes: Vec<ClassId>,
+    classes: SmallVec<[ClassId; 2]>,
 }
 
 impl ClassSet {
@@ -69,12 +70,12 @@ impl ClassSet {
 
     pub fn singleton(class: ClassId) -> Self {
         Self {
-            classes: vec![class],
+            classes: SmallVec::from_slice(&[class]),
         }
     }
 
     pub fn from_iter(classes: impl IntoIterator<Item = ClassId>) -> Self {
-        let mut classes: Vec<_> = classes.into_iter().collect();
+        let mut classes: SmallVec<[ClassId; 2]> = classes.into_iter().collect();
         classes.sort_unstable();
         classes.dedup();
         Self { classes }
@@ -1087,32 +1088,32 @@ impl Inst {
         )
     }
 
-    pub fn edges(&self) -> Vec<&Edge> {
+    pub fn edges(&self) -> SmallVec<[&Edge; 2]> {
         match self {
-            Inst::Jump { edge } => vec![edge],
+            Inst::Jump { edge } => SmallVec::from_slice(&[edge]),
             Inst::Branch {
                 then_edge,
                 else_edge,
                 ..
-            } => vec![then_edge, else_edge],
+            } => SmallVec::from_slice(&[then_edge, else_edge]),
             Inst::Switch {
                 default_edge,
                 cases,
                 ..
             } => {
-                let mut edges = Vec::with_capacity(cases.len() + 1);
+                let mut edges = SmallVec::<[&Edge; 2]>::with_capacity(cases.len() + 1);
                 edges.push(default_edge);
                 edges.extend(cases.iter().map(|case| &case.edge));
                 edges
             }
-            _ => Vec::new(),
+            _ => SmallVec::new(),
         }
     }
 
-    pub fn operands(&self) -> Vec<ValueId> {
+    pub fn operands(&self) -> SmallVec<[ValueId; 4]> {
         use Inst::*;
 
-        let mut out = Vec::new();
+        let mut out = SmallVec::<[ValueId; 4]>::new();
         match self {
             Jump { edge } => out.extend_from_slice(&edge.args),
             Branch {

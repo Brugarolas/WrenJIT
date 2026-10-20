@@ -33,7 +33,8 @@ use crate::wren_ir::{
 };
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
+use smallvec::SmallVec;
 use std::io;
 
 const MAX_WREN_ARITY: usize = 16;
@@ -913,14 +914,19 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
     fn plan_classes(&mut self, module: ModuleId) {
         let mut declaration_refs = Vec::new();
         collect_class_declarations(&self.ast.statements, &mut declaration_refs);
-        let declarations: Vec<(ClassDecl, bool)> = declaration_refs
+        // The AST is immutable for the entire Lowerer lifetime. Keep stable raw
+        // pointers instead of deep-cloning ClassDecl (including methods/bodies)
+        // merely to work around field-disjoint mutable borrows of `self` below.
+        // No pointer escapes this planning phase.
+        let declarations: SmallVec<[(*const ClassDecl, bool); 8]> = declaration_refs
             .into_iter()
-            .map(|(class, top)| (class.clone(), top))
+            .map(|(class, top)| (class as *const ClassDecl, top))
             .collect();
 
         // First reserve every runtime class id so forward class references can be
         // resolved during the second pass.
-        for (class, top_level) in &declarations {
+        for &(class_ptr, top_level) in &declarations {
+            let class = unsafe { &*class_ptr };
             let id = self.program.add_class(
                 module,
                 &class.name.value,
@@ -929,7 +935,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 0,
                 class.is_foreign,
             );
-            if *top_level {
+            if top_level {
                 self.top_level_classes
                     .insert(class.name.value.clone(), id);
             }
@@ -949,11 +955,12 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
 
         // Field names are lexical to the class and can appear in nested closures
         // inside methods, so gather the complete set before assigning slots.
-        let mut local_instance_fields: HashMap<Span, Vec<String>> = HashMap::new();
-        let mut local_static_fields: HashMap<Span, Vec<String>> = HashMap::new();
-        for (class, _) in &declarations {
-            let mut instance = Vec::new();
-            let mut statics = Vec::new();
+        let mut local_instance_fields: HashMap<Span, SmallVec<[&str; 8]>> = HashMap::new();
+        let mut local_static_fields: HashMap<Span, SmallVec<[&str; 8]>> = HashMap::new();
+        for &(class_ptr, _) in &declarations {
+            let class = unsafe { &*class_ptr };
+            let mut instance = SmallVec::<[&str; 8]>::new();
+            let mut statics = SmallVec::<[&str; 8]>::new();
             for method in &class.methods {
                 if let Some(body) = &method.body {
                     collect_fields_in_body(body, &mut instance, &mut statics);
@@ -971,7 +978,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         // known, so imported/dynamic superclasses are fully supported.
         let mut resolving = HashSet::new();
         let mut resolved = HashSet::new();
-        for (class, _) in &declarations {
+        for &(class_ptr, _) in &declarations {
+            let class = unsafe { &*class_ptr };
             self.resolve_class_layout(
                 class,
                 &local_instance_fields,
@@ -985,8 +993,8 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
     fn resolve_class_layout(
         &mut self,
         class: &ClassDecl,
-        local_instance_fields: &HashMap<Span, Vec<String>>,
-        local_static_fields: &HashMap<Span, Vec<String>>,
+        local_instance_fields: &HashMap<Span, SmallVec<[&str; 8]>>,
+        local_static_fields: &HashMap<Span, SmallVec<[&str; 8]>>,
         resolving: &mut HashSet<Span>,
         resolved: &mut HashSet<Span>,
     ) {
@@ -1011,12 +1019,13 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         // Recurse only to preserve the useful compile-time cycle diagnostic.
         // Slot numbering itself is independent of the superclass layout.
         if let Some(super_id) = static_super {
-            if let Some((super_decl, _)) =
-                find_class_by_id(self.program, super_id, self.ast)
-                    .map(|(decl, top)| (decl.clone(), top))
-            {
+            if let Some((super_decl, _)) = find_class_by_id(self.program, super_id, self.ast) {
+                // `self.ast` is immutable while lowering. Capture the stable node
+                // address before mutably recursing through `self` to avoid cloning
+                // the complete superclass AST subtree.
+                let super_decl = super_decl as *const ClassDecl;
                 self.resolve_class_layout(
-                    &super_decl,
+                    unsafe { &*super_decl },
                     local_instance_fields,
                     local_static_fields,
                     resolving,
@@ -1051,12 +1060,12 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         // once, when CreateClass executes.
         let mut fields = HashMap::new();
         for (index, name) in locals.into_iter().enumerate() {
-            fields.insert(name, FieldSlot(index as u16));
+            fields.insert(name.to_owned(), FieldSlot(index as u16));
         }
 
         let mut static_fields = HashMap::new();
         for (index, name) in statics.into_iter().enumerate() {
-            static_fields.insert(name, StaticFieldSlot(index as u16));
+            static_fields.insert(name.to_owned(), StaticFieldSlot(index as u16));
         }
 
         let id = self.class_plans[&key].id;
@@ -2743,7 +2752,7 @@ fn find_class_by_id<'a>(
         .find(|(class, top)| *top && class.name.value == name)
 }
 
-fn collect_fields_in_body(body: &FunctionBody, instance: &mut Vec<String>, statics: &mut Vec<String>) {
+fn collect_fields_in_body<'a>(body: &'a FunctionBody, instance: &mut SmallVec<[&'a str; 8]>, statics: &mut SmallVec<[&'a str; 8]>) {
     match &body.kind {
         FunctionBodyKind::Expression(expr) => collect_fields_expr(expr, instance, statics),
         FunctionBodyKind::Statements(statements) => {
@@ -2754,7 +2763,7 @@ fn collect_fields_in_body(body: &FunctionBody, instance: &mut Vec<String>, stati
     }
 }
 
-fn collect_fields_stmt(stmt: &Stmt, instance: &mut Vec<String>, statics: &mut Vec<String>) {
+fn collect_fields_stmt<'a>(stmt: &'a Stmt, instance: &mut SmallVec<[&'a str; 8]>, statics: &mut SmallVec<[&'a str; 8]>) {
     match &stmt.kind {
         StmtKind::Variable { initializer, .. } => {
             if let Some(expr) = initializer {
@@ -2795,10 +2804,10 @@ fn collect_fields_stmt(stmt: &Stmt, instance: &mut Vec<String>, statics: &mut Ve
     }
 }
 
-fn collect_fields_expr(expr: &Expr, instance: &mut Vec<String>, statics: &mut Vec<String>) {
+fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>, statics: &mut SmallVec<[&'a str; 8]>) {
     match &expr.kind {
-        ExprKind::Field(name) => instance.push(name.value.clone()),
-        ExprKind::StaticField(name) => statics.push(name.value.clone()),
+        ExprKind::Field(name) => instance.push(name.value.as_str()),
+        ExprKind::StaticField(name) => statics.push(name.value.as_str()),
         ExprKind::InterpolatedString(parts) => {
             for part in parts {
                 if let StringPart::Expression(expr) = part {
@@ -2865,9 +2874,9 @@ fn collect_fields_expr(expr: &Expr, instance: &mut Vec<String>, statics: &mut Ve
     }
 }
 
-fn dedup_preserve_order(values: &mut Vec<String>) {
+fn dedup_preserve_order(values: &mut SmallVec<[&str; 8]>) {
     let mut seen = HashSet::new();
-    values.retain(|value| seen.insert(value.clone()));
+    values.retain(|value| seen.insert(*value));
 }
 
 fn collect_method_keys_in_statements(statements: &[Stmt], out: &mut HashSet<MethodKey>) {

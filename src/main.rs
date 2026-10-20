@@ -31,6 +31,8 @@
 //!   -> interpreter
 //! ```
 
+#![allow(warnings)]
+
 pub mod wren_builtin;
 pub mod wren_bytecode;
 pub mod wren_bytecodecompiler;
@@ -47,8 +49,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use mimalloc::MiMalloc;
+
 use crate::wren_interpreter::{ExecutionResult, Interpreter};
 use crate::wren_ir::Program;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_COMPILE_ERROR: u8 = 1;

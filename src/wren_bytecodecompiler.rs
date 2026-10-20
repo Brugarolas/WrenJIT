@@ -497,7 +497,7 @@ fn mark_non_edge_operands(kind: &Inst) -> Vec<ValueId> {
         Inst::Jump { .. } => Vec::new(),
         Inst::Branch { cond, .. } => vec![*cond],
         Inst::Switch { tag, .. } => vec![*tag],
-        _ => kind.operands(),
+        _ => kind.operands().into_vec(),
     }
 }
 
