@@ -66,6 +66,10 @@ fn run() -> u8 {
         Err(()) => return EXIT_USAGE_ERROR,
     };
 
+    if cfg!(debug_assertions) {
+        eprintln!("Debug build: use `cargo run --release -- <file.wren>` for performance measurements.");
+    }
+
     let source = match fs::read_to_string(&source_path) {
         Ok(source) => source,
         Err(error) => {
@@ -152,7 +156,20 @@ fn run() -> u8 {
     };
     wren_builtin::install_vm_builtins(&mut interpreter, &builtin_manifest);
 
-    match interpreter.run_module(lowered_module.entry) {
+    // Diagnostics useful for comparing the threaded baseline against the tracing
+    // tier without recompiling the VM. They are intentionally opt-in so normal
+    // execution has no environment lookup in the hot path.
+    if env::var_os("WREN_NO_JIT").is_some() {
+        interpreter.set_jit_options(None);
+    }
+
+    let execution = interpreter.run_module(lowered_module.entry);
+
+    if env::var_os("WREN_JIT_STATS").is_some() {
+        eprintln!("WrenJIT stats: {:#?}", interpreter.jit_stats());
+    }
+
+    match execution {
         Ok(ExecutionResult::Returned(_)) => EXIT_SUCCESS,
 
         Ok(ExecutionResult::Suspended(_)) => {

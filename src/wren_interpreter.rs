@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
-use crate::wren_traceir::{FrameSlot, TraceConstant, TraceLocation};
-use crate::wren_tracingjit::{TraceActivation, TraceActivationInputs, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats};
+use crate::wren_traceir::{FrameSlot, TraceConstant, TraceId, TraceLocation};
+use crate::wren_tracingjit::{JitAction, TraceActivation, TraceActivationInputs, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats};
 
 use crate::wren_bytecode::{
     decode_bailout_reason, function_kind_uses_this, instruction_word_len,
@@ -49,6 +49,16 @@ use crate::wren_ir::{
 #[repr(transparent)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Value(u64);
+
+/// Wren bitwise operands are truncated to unsigned 32 bits, not signed i64.
+#[inline]
+pub(crate) fn num_to_u32(number: f64) -> u32 {
+    if number >= 0.0 && number < 4294967296.0 {
+        number as u32
+    } else {
+        number.trunc().rem_euclid(4294967296.0) as u32
+    }
+}
 
 const TAG_BASE: u64 = 0x7ffc_0000_0000_0000;
 const TAG_MASK: u64 = 0x7ffc_0000_0000_0000;
@@ -817,6 +827,14 @@ struct PreparedFunction {
     field_access_ops: Vec<u32>,
     /// Set after CreateClass relocates local slots by the inherited field base.
     field_slots_relocated: bool,
+    /// One byte per prepared loop header: 0 enables entry, 1..254 counts down
+    /// baseline backedges during a temporary cooldown, 255 permanently disables
+    /// an unsupported header. Skipped entries bypass the JIT manager entirely.
+    jit_disabled_headers: Vec<u8>,
+    /// Dense TraceId cached for a compiled loop header. NO_INDEX means the header
+    /// is still cold/uncompiled. This bypasses the loop-state HashMap on every
+    /// subsequent hot backedge once tiering succeeds.
+    jit_trace_headers: Vec<u32>,
     module_slot: u32,
     kind: FunctionKind,
     arity: u8,
@@ -1080,6 +1098,8 @@ impl PreparedProgram {
         let module_slot = *module_by_id.get(&function.module).ok_or_else(|| {
             RuntimeError::new(format!("unknown module {:?} for {:?}", function.module, function.id))
         })?;
+        let jit_disabled_headers = vec![0; ops.len()];
+        let jit_trace_headers = vec![NO_INDEX; ops.len()];
 
         Ok(PreparedFunction {
             handlers,
@@ -1095,6 +1115,8 @@ impl PreparedProgram {
             field_owner: function.field_owner,
             field_access_ops,
             field_slots_relocated: function.field_owner.is_none(),
+            jit_disabled_headers,
+            jit_trace_headers,
             module_slot,
             kind: function.kind,
             arity: function.arity,
@@ -1663,6 +1685,11 @@ impl<'p> Interpreter<'p> {
 
         /// Set to None for an interpreter-only run, or provide tracing thresholds.
     pub fn set_jit_options(&mut self, options: Option<TracingJitOptions>) {
+        // A new tiering policy gets a clean opportunity to observe every loop.
+        for function in &mut self.prepared.functions {
+            function.jit_disabled_headers.fill(0);
+            function.jit_trace_headers.fill(NO_INDEX);
+        }
         self.jit = options.map(TracingJit::new);
     }
 
@@ -1672,6 +1699,10 @@ impl<'p> Interpreter<'p> {
 
     fn invalidate_method_traces(&mut self) {
         if let Some(jit) = &self.jit { self.jit = Some(TracingJit::new(jit.options().clone())); }
+        for function in &mut self.prepared.functions {
+            function.jit_disabled_headers.fill(0);
+            function.jit_trace_headers.fill(NO_INDEX);
+        }
         self.megamorphic_cache.clear();
         for function in &mut self.inline_caches {
             for cache in function { *cache = InlineCacheState::default(); }
@@ -1975,6 +2006,7 @@ impl<'p> Interpreter<'p> {
     #[inline(never)]
     unsafe fn take_backedge(&mut self, op: &PreparedOp, target: u32) {
         let from_index = self.current_frame().pc;
+        let function_index = self.current_frame().function as usize;
         debug_assert!(target < from_index);
 
         let function = self.current_prepared().id;
@@ -1987,14 +2019,67 @@ impl<'p> Interpreter<'p> {
         };
         let from = TraceLocation::new(function, BytecodePc(op.raw_pc));
         let to = TraceLocation::new(function, BytecodePc(target_raw_pc));
+        let cached_trace = self
+            .prepared
+            .functions
+            .get(function_index)
+            .and_then(|function| function.jit_trace_headers.get(target as usize))
+            .copied()
+            .unwrap_or(NO_INDEX);
 
         self.set_pc(target);
 
         // During recording/native runtime helpers the manager is temporarily
         // taken out of the Interpreter, which also prevents recursive tiering.
         let Some(mut jit) = self.jit.take() else { return; };
-        let result = jit.on_backedge(self, from, to);
+        let result = if cached_trace != NO_INDEX {
+            // Once a header owns native code, bypass the loop-state HashMap and
+            // enter its dense TraceId directly. Inner loops may hit this path
+            // hundreds of thousands of times.
+            jit.enter_trace(self, TraceId(cached_trace))
+        } else {
+            jit.on_backedge(self, from, to)
+        };
+
+        // Cold/uncompiled headers need a loop-state lookup to learn whether a
+        // sequence of recording failures finally blacklisted the header.
+        // Cached traces report temporary cooldowns directly.
+        let disable_header = if matches!(&result, Ok(JitAction::Blacklisted)) {
+            true
+        } else if cached_trace != NO_INDEX {
+            false
+        } else {
+            jit.is_blacklisted(to)
+        };
+        let newly_compiled = match &result {
+            Ok(JitAction::Compiled { trace })
+            | Ok(JitAction::EnteredNative { trace })
+            | Ok(JitAction::CoolingDown { trace })
+            | Ok(JitAction::SideExit { trace, .. }) => Some(trace.0),
+            _ => None,
+        };
         self.jit = Some(jit);
+
+        if let Some(function) = self.prepared.functions.get_mut(function_index) {
+            if disable_header {
+                if let Some(disabled) = function.jit_disabled_headers.get_mut(target as usize) {
+                    *disabled = u8::MAX;
+                }
+                if let Some(cached) = function.jit_trace_headers.get_mut(target as usize) {
+                    *cached = NO_INDEX;
+                }
+            } else if cached_trace == NO_INDEX {
+                if let Some(trace) = newly_compiled {
+                    if let Some(cached) = function.jit_trace_headers.get_mut(target as usize) {
+                        *cached = trace;
+                    }
+                }
+            }
+            if matches!(&result, Ok(JitAction::CoolingDown { .. })) {
+                function.jit_disabled_headers[target as usize] = 64;
+            }
+        }
+
         if let Err(error) = result {
             self.fail(RuntimeError::new(error.to_string()));
         }
@@ -2003,7 +2088,25 @@ impl<'p> Interpreter<'p> {
     #[inline(always)]
     unsafe fn branch_to(&mut self, op: &PreparedOp, target: u32) {
         if target < self.current_frame().pc && self.jit.is_some() {
-            self.take_backedge(op, target);
+            // Once a loop has been blacklisted, never enter the tiering manager
+            // from this header again. A byte lookup is substantially cheaper than
+            // taking/moving the JIT manager and probing its loop-state HashMap on
+            // every baseline iteration.
+            let cooldown = self
+                .current_prepared()
+                .jit_disabled_headers
+                .get(target as usize)
+                .copied()
+                .unwrap_or(0);
+            if cooldown != 0 {
+                if cooldown != u8::MAX {
+                    let function = self.current_frame().function as usize;
+                    self.prepared.functions[function].jit_disabled_headers[target as usize] -= 1;
+                }
+                self.set_pc(target);
+            } else {
+                self.take_backedge(op, target);
+            }
         } else {
             self.set_pc(target);
         }
@@ -2426,6 +2529,97 @@ impl Interpreter<'_> {
         Ok(target)
     }
 
+    /// Execute the stock Num primitives directly in the interpreter when the
+    /// embedding host explicitly certifies that the binding has the standard
+    /// Wren numeric semantics. This avoids routing every arithmetic operator
+    /// through Box<dyn Host>, HostContext construction and GC polling when a
+    /// trace is cold, rejected or deliberately left in baseline (notably u32
+    /// bitwise operations).
+    #[inline(always)]
+    fn try_standard_numeric_primitive(
+        &self,
+        op: &PreparedOp,
+        primitive: PrimitiveId,
+        receiver: RegisterWord,
+        args: &[RegisterWord],
+    ) -> Option<Result<Value, RuntimeError>> {
+        let receiver = Value::from_word(receiver);
+        let lhs = receiver.as_num()?;
+
+        let function_index = unsafe { (*self.hot_frame).function as usize };
+        let descriptor = self
+            .program
+            .functions
+            .get(function_index)?
+            .chunk
+            .inline_caches
+            .get(op.x as usize)?;
+        let signature = self.program.metadata.method(descriptor.method)?;
+        let name = self.program.metadata.string(signature.name)?;
+
+        if !self
+            .host
+            .standard_numeric_method(primitive, name, signature.arity)
+        {
+            return None;
+        }
+
+        let argument_value = || -> Result<Value, RuntimeError> {
+            args.first()
+                .copied()
+                .map(Value::from_word)
+                .ok_or_else(|| RuntimeError::new("builtin argument missing"))
+        };
+        let argument_num = || -> Result<f64, RuntimeError> {
+            argument_value()?
+                .as_num()
+                .ok_or_else(|| RuntimeError::new("argument must be a Num"))
+        };
+        let result = match (name, signature.arity) {
+            ("-", 0) => Ok(Value::from_num(-lhs)),
+            ("~", 0) => Ok(Value::from_num((!num_to_u32(lhs)) as f64)),
+
+            ("+", 1) => argument_num().map(|rhs| Value::from_num(lhs + rhs)),
+            ("-", 1) => argument_num().map(|rhs| Value::from_num(lhs - rhs)),
+            ("*", 1) => argument_num().map(|rhs| Value::from_num(lhs * rhs)),
+            ("/", 1) => argument_num().map(|rhs| Value::from_num(lhs / rhs)),
+            ("%", 1) => argument_num().map(|rhs| Value::from_num(lhs % rhs)),
+
+            ("<", 1) => argument_num().map(|rhs| Value::from_bool(lhs < rhs)),
+            ("<=", 1) => argument_num().map(|rhs| Value::from_bool(lhs <= rhs)),
+            (">", 1) => argument_num().map(|rhs| Value::from_bool(lhs > rhs)),
+            (">=", 1) => argument_num().map(|rhs| Value::from_bool(lhs >= rhs)),
+            ("==", 1) => argument_value().map(|rhs| {
+                Value::from_bool(rhs.as_num().is_some_and(|rhs| lhs == rhs))
+            }),
+            ("!=", 1) => argument_value().map(|rhs| {
+                Value::from_bool(!rhs.as_num().is_some_and(|rhs| lhs == rhs))
+            }),
+
+            ("&", 1) | ("|", 1) | ("^", 1) | ("<<", 1) | (">>", 1) => {
+                let left = num_to_u32(lhs);
+                argument_num().map(|rhs| {
+                    let right = num_to_u32(rhs);
+                    Value::from_num(match name {
+                        "&" => (left & right) as f64,
+                        "|" => (left | right) as f64,
+                        "^" => (left ^ right) as f64,
+                        "<<" => left.wrapping_shl(right) as f64,
+                        ">>" => left.wrapping_shr(right) as f64,
+                        _ => unreachable!(),
+                    })
+                })
+            }
+
+            // The host may certify more numeric primitives in the future. Leave
+            // those on the ordinary Host path until this direct implementation is
+            // extended with identical semantics.
+            _ => return None,
+        };
+
+        Some(result)
+    }
+
     fn invoke_target(
         &mut self,
         op: &PreparedOp,
@@ -2442,11 +2636,29 @@ impl Interpreter<'_> {
                 }
             }
             CallTarget::Primitive(primitive) => {
+                // Stock numeric primitives are pure, non-allocating operations.
+                // Keep their baseline path as cheap as an interpreter primitive
+                // instead of paying a dyn Host call for every arithmetic opcode.
+                if let Some(result) =
+                    self.try_standard_numeric_primitive(op, primitive, receiver, args)
+                {
+                    match result {
+                        Ok(result) => unsafe {
+                            self.set_reg(op.a, result.word());
+                            self.advance(op);
+                        },
+                        Err(error) => self.fail_at(op, error.message),
+                    }
+                    return;
+                }
+
                 self.mark_gc_point(op);
                 self.stage_invoke_args(receiver, args);
                 let mut values = [Value::NULL; 17];
                 values[0] = Value::from_word(receiver);
-                for (index, word) in args.iter().copied().enumerate() { values[index + 1] = Value::from_word(word); }
+                for (index, word) in args.iter().copied().enumerate() {
+                    values[index + 1] = Value::from_word(word);
+                }
                 match self.call_host_primitive(primitive, &values[..args.len() + 1]) {
                     Ok(result) => unsafe { self.set_reg(op.a, result.word()); self.advance(op); },
                     Err(error) => self.fail_at(op, error.message),
@@ -3742,7 +3954,11 @@ mod tests {
     use crate::wren_bytecode::{
         Assembler, BytecodeFunction, SafepointEntry, SafepointKind,
     };
-    use crate::wren_ir::{FunctionKind, ModuleInfo};
+    use crate::wren_builtin::{self, BuiltinHost, BuiltinManifest};
+    use crate::wren_bytecodecompiler::compile_program;
+    use crate::wren_front::parse;
+    use crate::wren_ir::{FunctionKind, ModuleInfo, Program};
+    use crate::wren_lowerer::lower_module;
 
     fn simple_program(chunk: crate::wren_bytecode::BytecodeChunk, gprs: u16) -> BytecodeProgram {
         let mut program = BytecodeProgram::new();
@@ -3757,6 +3973,57 @@ mod tests {
         }).unwrap();
         program.rebuild_indexes().unwrap();
         program
+    }
+
+    fn compile_wren_module(source: &str) -> (BytecodeProgram, FuncId, BuiltinManifest) {
+        let parsed = parse("jit_test.wren", source);
+        assert!(!parsed.has_errors(), "parse diagnostics: {:#?}", parsed.diagnostics);
+
+        // Use the exact production pipeline from main.rs. The previous JIT source
+        // tests lowered into an empty Program and then ran with NoHost, so ordinary
+        // Num operators were never backed by the stock primitive manifest. Those
+        // tests therefore did not exercise the same Invoke -> Num specialization
+        // path as real .wren files.
+        let mut hir = Program::new();
+        let manifest = wren_builtin::install_hir_builtins(&mut hir);
+        let lowered = lower_module(
+            &mut hir,
+            "jit_test.wren",
+            source,
+            "jit_test",
+            &parsed.module,
+        );
+        assert!(!lowered.has_errors(), "lowering diagnostics: {:#?}", lowered.diagnostics);
+        let entry = lowered
+            .lowered
+            .as_ref()
+            .expect("module should lower successfully")
+            .entry;
+        let bytecode = compile_program(&hir).expect("bytecode compilation should succeed");
+        (bytecode, entry, manifest)
+    }
+
+    fn source_vm<'a>(
+        program: &'a BytecodeProgram,
+        manifest: &BuiltinManifest,
+    ) -> Interpreter<'a> {
+        let host = Box::new(BuiltinHost::new(manifest.clone()));
+        let mut vm = Interpreter::with_host(program, host).expect("VM should initialize");
+        wren_builtin::install_vm_builtins(&mut vm, manifest);
+        vm
+    }
+
+    fn compile_local_wren(source: &str) -> (BytecodeProgram, FuncId, BuiltinManifest) {
+        // Numeric traces operate on locals. Module variables currently use
+        // runtime opcodes, so putting these fixtures at module scope never
+        // exercises the native numeric tier used by scripts/jit.wren.
+        compile_wren_module(&format!(
+            "class JitTest {{\n  static run() {{\n{source}\n  }}\n}}\nvar result = JitTest.run()\n"
+        ))
+    }
+
+    fn source_result(vm: &Interpreter<'_>) -> f64 {
+        vm.modules.last().unwrap().variables.last().unwrap().as_num().unwrap()
     }
 
     #[test]
@@ -3826,6 +4093,304 @@ mod tests {
         let stats = vm.jit_stats().unwrap();
         assert_eq!(stats.native_entries, 0, "straight-line code must not be mistaken for a hot loop: {stats:?}");
         assert_eq!(stats.recordings_started, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn jit_completes_dynamic_numeric_invoke_loop() {
+        let source = r#"
+            var i = 0
+            while (i < 20000) {
+                i = i + 1
+            }
+        "#;
+        let (program, entry, manifest) = compile_local_wren(source);
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(Some(TracingJitOptions {
+            hot_loop_threshold: 2,
+            native_loop_iteration_budget: 1 << 18,
+            ..Default::default()
+        }));
+
+        let result = vm.run_module(entry);
+        assert!(result.is_ok(), "dynamic numeric loop failed: {result:?}");
+        let stats = vm.jit_stats().unwrap();
+        assert!(stats.recordings_started > 0, "{stats:?}");
+        assert!(stats.native_entries > 0, "{stats:?}");
+        assert_eq!(stats.native_budget_exits, 0, "loop must take its real native exit before the watchdog: {stats:?}");
+        assert_eq!(stats.blacklisted_loops, 0, "correct trace must not be blacklisted: {stats:?}");
+    }
+
+    #[test]
+    fn jit_completes_mixed_int_f64_loop() {
+        let source = r#"
+            var sum = 0.0
+            var i = 0
+            var steps = 20000
+            while (i < steps) {
+                var x = (i + 0.5) / steps
+                sum = sum + 4.0 / (1.0 + x * x)
+                i = i + 1
+            }
+        "#;
+        let (program, entry, manifest) = compile_local_wren(source);
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(Some(TracingJitOptions {
+            hot_loop_threshold: 2,
+            native_loop_iteration_budget: 1 << 18,
+            ..Default::default()
+        }));
+
+        let result = vm.run_module(entry);
+        assert!(result.is_ok(), "mixed Int32/F64 loop failed: {result:?}");
+        let stats = vm.jit_stats().unwrap();
+        assert!(stats.recordings_started > 0, "{stats:?}");
+        assert!(stats.native_entries > 0, "{stats:?}");
+        assert_eq!(stats.native_budget_exits, 0, "mixed numeric loop must take its real native exit before the watchdog: {stats:?}");
+        assert_eq!(stats.blacklisted_loops, 0, "correct mixed numeric trace must not be blacklisted: {stats:?}");
+    }
+
+    #[test]
+    fn jit_does_not_install_finite_prefix_for_outer_nested_loop() {
+        let source = r#"
+            var total = 0
+            var y = 0
+            while (y < 40) {
+                var x = 0
+                while (x < 200) {
+                    total = total + x
+                    x = x + 1
+                }
+                y = y + 1
+            }
+        "#;
+        let (program, entry, manifest) = compile_local_wren(source);
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(Some(TracingJitOptions {
+            hot_loop_threshold: 2,
+            max_failures_before_blacklist: 2,
+            native_loop_iteration_budget: 1 << 18,
+            ..Default::default()
+        }));
+
+        let result = vm.run_module(entry);
+        assert!(result.is_ok(), "nested numeric loop failed: {result:?}");
+        let stats = vm.jit_stats().unwrap();
+        // Only the innermost loop should become a root native loop. The outer
+        // loop necessarily encounters the inner cycle before it can close.
+        assert_eq!(stats.traces_compiled, 1, "outer nested loop must not install a finite-prefix trace: {stats:?}");
+        assert!(stats.recordings_aborted > 0, "outer recording should abort on the nested cycle: {stats:?}");
+        assert!(stats.blacklisted_loops > 0, "repeatedly untraceable outer loop should fall back to baseline: {stats:?}");
+        assert_eq!(stats.trace_cooldowns, 0, "nested-cycle rejection should happen before native thrashing: {stats:?}");
+    }
+
+
+    #[test]
+    fn jit_completes_mandelbrot_like_multi_guard_inner_loop() {
+        // This is deliberately shaped like jit.wren: two outer loops and an
+        // inner loop with a short-circuit condition over several loop-carried
+        // floating-point values. It catches stale LoopPhi/backedge lowering much
+        // more reliably than a single induction-variable loop.
+        let source = r#"
+            var checksum = 0
+            var escaped = 0
+            var y = 0
+            var width = 24
+            var height = 16
+            var maxIter = 120
+
+            while (y < height) {
+                var ci = (y / height) * 2.0 - 1.0
+                var x = 0
+                while (x < width) {
+                    var cr = (x / width) * 3.5 - 2.5
+                    var zr = 0.0
+                    var zi = 0.0
+                    var zr2 = 0.0
+                    var zi2 = 0.0
+                    var i = 0
+
+                    while (i < maxIter && (zr2 + zi2) <= 4.0) {
+                        zi = 2.0 * zr * zi + ci
+                        zr = zr2 - zi2 + cr
+                        zr2 = zr * zr
+                        zi2 = zi * zi
+                        i = i + 1
+                    }
+
+                    if (i < maxIter) { escaped = escaped + 1 }
+                    checksum = checksum + i * (x + 1) * (y + 1)
+                    x = x + 1
+                }
+                y = y + 1
+            }
+        "#;
+
+        let (program, entry, manifest) = compile_local_wren(source);
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(Some(TracingJitOptions {
+            hot_loop_threshold: 2,
+            native_loop_iteration_budget: 4096,
+            ..Default::default()
+        }));
+
+        let result = vm.run_module(entry);
+        assert!(result.is_ok(), "mandelbrot-like loop failed: {result:?}");
+        let stats = vm.jit_stats().unwrap();
+        assert!(stats.native_entries > 0, "inner numeric loop should enter native code: {stats:?}");
+        assert_eq!(
+            stats.native_budget_exits,
+            0,
+            "mandelbrot-like loop must exit through its real guards, not the watchdog: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn jit_budget_yields_preserve_results_and_native_execution() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var i = 0
+            var sum = 0
+            while (i < 20000) {
+                sum = sum + i
+                i = i + 1
+            }
+            return sum
+        "#);
+        let mut baseline = source_vm(&program, &manifest);
+        baseline.set_jit_options(None);
+        baseline.run_module(entry).unwrap();
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(Some(TracingJitOptions {
+            hot_loop_threshold: 2,
+            native_loop_iteration_budget: 128,
+            ..Default::default()
+        }));
+        vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&vm), 199990000.0);
+        assert_eq!(source_result(&vm), source_result(&baseline));
+        let stats = vm.jit_stats().unwrap();
+        assert!(stats.native_budget_exits > 100, "{stats:?}");
+        assert!(stats.native_iterations > 19000, "{stats:?}");
+        assert_eq!(stats.blacklisted_loops, 0, "{stats:?}");
+        assert_eq!(stats.traces_compiled, 1, "{stats:?}");
+    }
+
+    #[test]
+    fn jit_short_inner_loops_can_become_hot_later() {
+        // Start hot, cool down over many short invocations, then become hot
+        // again. A permanent blacklist loses all the work in the last phase.
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var y = 0
+            var total = 0
+            while (y < 150) {
+                var limit = 2
+                if (y < 10 || y >= 100) { limit = 1000 }
+                var i = 0
+                while (i < limit) {
+                    total = total + i
+                    i = i + 1
+                }
+                y = y + 1
+            }
+            return total
+        "#);
+        let mut baseline = source_vm(&program, &manifest);
+        baseline.set_jit_options(None);
+        baseline.run_module(entry).unwrap();
+        let mut vm = source_vm(&program, &manifest);
+        vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&vm), 29970090.0);
+        assert_eq!(source_result(&vm), source_result(&baseline));
+        let stats = vm.jit_stats().unwrap();
+        assert!(stats.trace_cooldowns > 0, "{stats:?}");
+        assert!(stats.native_iterations > 58000, "{stats:?}");
+    }
+
+    #[test]
+    fn jit_does_not_record_enclosing_backedge_as_inner_iteration() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var y = 0
+            var total = 0
+            while (y < 500) {
+                var limit = 2
+                if (y >= 450) { limit = 1000 }
+                var i = 0
+                while (i < limit) {
+                    total = total + i
+                    i = i + 1
+                }
+                y = y + 1
+            }
+            return total
+        "#);
+        let mut vm = source_vm(&program, &manifest);
+        // The first recording starts at i == limit, after a short invocation.
+        vm.set_jit_options(Some(TracingJitOptions {
+            hot_loop_threshold: 2,
+            ..Default::default()
+        }));
+        vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&vm), 24975450.0);
+        let stats = vm.jit_stats().unwrap();
+        assert!(stats.recordings_aborted > 0, "{stats:?}");
+        assert!(stats.native_iterations > 45000, "{stats:?}");
+        assert_eq!(stats.traces_compiled, 1, "{stats:?}");
+    }
+
+    #[test]
+    fn jit_benchmark_checksums_match_original_wren() {
+        let benchmark = include_str!("../scripts/jit.wren");
+        let definitions = benchmark.split("JitBench.integratePi(1000000)").next().unwrap();
+        // Reference values from the bundled original Wren executable.
+        for (expression, expected) in [
+            ("JitBench.integratePi(10000)", 3.1415926544231336),
+            ("JitBench.xorshift(10000)", 695495781.0),
+            ("JitBench.mandelbrot(80, 60, 100)", 196065774.0),
+        ] {
+            let source = format!("{definitions}\nvar result = {expression}\n");
+            let (program, entry, manifest) = compile_wren_module(&source);
+            for enabled in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                if !enabled { vm.set_jit_options(None); }
+                vm.run_module(entry).unwrap();
+                let result = source_result(&vm);
+                assert!((result - expected).abs() < 1e-12,
+                    "{expression}, JIT={enabled}: {result} != {expected}");
+                if enabled && !expression.contains("xorshift") {
+                    assert!(vm.jit_stats().unwrap().native_iterations > 9000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bitwise_primitives_match_wren_unsigned_semantics() {
+        struct HostWithoutNumericFastPath(BuiltinHost);
+        impl Host for HostWithoutNumericFastPath {
+            fn call_primitive(
+                &mut self, context: &mut HostContext<'_>, primitive: PrimitiveId, args: &[Value],
+            ) -> Result<Value, RuntimeError> {
+                self.0.call_primitive(context, primitive, args)
+            }
+        }
+        for (expression, expected) in [
+            ("~0", 4294967295.0),
+            ("1 << 31", 2147483648.0),
+            ("4294967295 >> 1", 2147483647.0),
+            ("2147483648 << 1", 0.0),
+            ("-1 & 255", 255.0),
+            ("3.75 ^ 1", 2.0),
+            ("4294967297 | 0", 1.0),
+        ] {
+            let (program, entry, manifest) = compile_local_wren(&format!("return {expression}"));
+            for fast_path in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                if !fast_path {
+                    vm.host = Box::new(HostWithoutNumericFastPath(BuiltinHost::new(manifest.clone())));
+                }
+                vm.run_module(entry).unwrap();
+                assert_eq!(source_result(&vm), expected, "{expression}, fast_path={fast_path}");
+            }
+        }
     }
 
     #[test]

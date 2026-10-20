@@ -50,15 +50,15 @@ fn program_for(opcode: Opcode) -> BytecodeProgram {
     program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 2, builtin_bindings: vec![] });
     program.metadata.methods.push(MethodSignature { name: StringId(2), kind: MethodKind::Method, arity: 0 });
     for id in 0..2 {
-        program.metadata.classes.push(ClassInfo { id: ClassId(id), module: ModuleId(0), name: StringId(0), superclass: (id == 1).then_some(ClassId(0)), instance_field_count: 1, static_field_count: 1, is_foreign: opcode == AllocForeign });
+        program.metadata.classes.push(ClassInfo { id: ClassId(id), module: ModuleId(0), name: StringId(0), superclass: (id == 1).then_some(ClassId(0)), own_instance_field_count: 1, static_field_count: 1, is_foreign: opcode == AllocForeign });
     }
     program.metadata.foreign_functions.push(ForeignFunctionInfo { id: ForeignFnId(0), module: StringId(0), class: StringId(0), signature: MethodSymbol(0), is_static: false });
     let frame = FrameLayout { general_register_count: 8, parameters: vec![], captures: vec![], return_kind: RegisterKind::Value };
-    program.push_function(BytecodeFunction { id: FuncId(0), module: ModuleId(0), name: StringId(0), kind: FunctionKind::ModuleBody, arity: 0, capture_count: 0, frame: frame.clone(), chunk }).unwrap();
+    program.push_function(BytecodeFunction { id: FuncId(0), module: ModuleId(0), name: StringId(0), kind: FunctionKind::ModuleBody, field_owner: matches!(opcode, LoadField | StoreField).then_some(ClassId(0)), arity: 0, capture_count: 0, frame: frame.clone(), chunk }).unwrap();
     let mut child = Assembler::new();
     child.emit_a(LoadTrue, 0);
     child.emit_a(Return, 0);
-    program.push_function(BytecodeFunction { id: FuncId(1), module: ModuleId(0), name: StringId(0), kind: FunctionKind::Closure, arity: 0, capture_count: 0, frame, chunk: child.finish().unwrap() }).unwrap();
+    program.push_function(BytecodeFunction { id: FuncId(1), module: ModuleId(0), name: StringId(0), kind: FunctionKind::Closure, field_owner: None, arity: 0, capture_count: 0, frame, chunk: child.finish().unwrap() }).unwrap();
     program.rebuild_indexes().unwrap();
     program
 }
@@ -153,7 +153,9 @@ fn all_122_opcodes_execute_in_native_traces_like_the_interpreter() {
         let mut baseline = setup(&program, opcode);
         let mut native = setup(&program, opcode);
         baseline.trace_execute_unfused_step().unwrap();
-        let mut jit = TracingJit::default();
+        let mut options = TracingJitOptions::default();
+        options.no_runtime_calls_in_native_trace = false;
+        let mut jit = TracingJit::new(options);
         jit.execute_one_for_test(&mut native).unwrap_or_else(|e| panic!("{opcode:?}: {e}"));
         assert_eq!(jit.stats().native_entries, 1, "{opcode:?}");
         assert_eq!(state(&native), state(&baseline), "{opcode:?}");

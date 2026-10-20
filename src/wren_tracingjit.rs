@@ -1,7 +1,7 @@
 //! Wren tracing JIT.
 //!
 //! This module connects the register interpreter to the backend-agnostic trace IR
-//! (`wren_traceir.rs`) and lowers optimized traces to B3.
+//! (`wren_traceir.rs`) and lowers optimized traces to Cranelift IR.
 //!
 //! The implementation deliberately separates four concerns:
 //!
@@ -10,7 +10,7 @@
 //!    structures directly.
 //! 2. `TraceRecorder` observes exactly one execution of original (unfused)
 //!    bytecode and builds a linear SSA `Trace`.
-//! 3. `B3TraceCompiler` lowers that trace to native code.  Wren architectural
+//! 3. `CraneliftTraceCompiler` lowers that trace to native code. Wren architectural
 //!    registers remain virtual while native code runs.
 //! 4. `TracingJit` owns hotness, compiled-code lifetime, side-exit accounting and
 //!    future trace-stitching metadata.
@@ -19,7 +19,7 @@
 //!
 //! Native traces receive one pointer, `*mut TraceActivation`.  The structure
 //! contains pointers to the current Wren register banks plus a compact side-exit
-//! result area.  B3 `check` stack-map generators materialize *only* values needed
+//! result area. Cold Cranelift side-exit blocks materialize *only* values needed
 //! by the failing exit into that area, return to Rust, and Rust writes the sparse
 //! snapshot back to the interpreter frame.
 //!
@@ -33,7 +33,7 @@
 //! can keep `sum` and `i` in native registers for the whole native loop.  There is
 //! no per-iteration store back to Wren R-registers.
 //!
-//! Numeric/control-flow operations lower directly to B3. Other bytecodes lower
+//! Numeric/control-flow operations lower directly to Cranelift. Other bytecodes lower
 //! to synchronized runtime calls. Calls which change frames/fibers terminate a
 //! trace AFTER executing the opcode; the manager can compile the continuation.
 //! No architectural register pointer or uncommitted GC root crosses such a call.
@@ -46,17 +46,12 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
-use std::mem::{offset_of, MaybeUninit};
-use std::rc::Rc;
+use std::mem::offset_of;
 
-use b3::air::generate::emit_function_epilogue;
-use b3::jit::compilation::Compilation;
-use b3::jit::reg::Reg as B3Reg;
-use b3::macroassembler::{
-    assembler::abstract_macro_assembler::Address,
-    jit::gpr_info::{ARGUMENT_GPR0, CALL_FRAME_REGISTER, RETURN_VALUE_GPR, T1},
-};
-use b3::{BasicBlockBuilder, Frequency, OptLevel, ValueRep, ValueRepKind};
+use cranelift::codegen::ir::UserFuncName;
+use cranelift::jit::{JITBuilder, JITModule};
+use cranelift::module::{default_libcall_names, FuncId as ClifFuncId, Module};
+use cranelift::prelude::*;
 
 use crate::wren_bytecode::{
     instruction_word_len, ArgReg, BytecodeFunction, BytecodePc, BytecodeProgram,
@@ -154,11 +149,10 @@ pub const TRACE_RESULT_RETURNED: u32 = 2;
 pub const TRACE_RESULT_LINK: u32 = 3;
 pub const TRACE_RESULT_RUNTIME: u32 = 4;
 
-/// Maximum number of *dynamic* values one side exit may materialize.
-///
-/// Snapshots are sparse. A normal loop exit normally uses only a handful of
-/// entries. This is deliberately larger than the Wren GPR count to leave room
-/// for future inlined-frame reconstruction.
+/// Maximum number of distinct dynamic values one side-exit snapshot may
+/// describe. Native exits now commit these values directly to architectural
+/// register banks, so this is a structural verifier limit rather than a large
+/// per-entry TraceActivation buffer.
 pub const MAX_TRACE_EXIT_VALUES: usize = 768;
 
 #[repr(C, align(16))]
@@ -176,9 +170,10 @@ pub struct TraceActivation {
     /// Written only by native side exits.
     pub exit_id: u32,
     pub result_code: u32,
-
-    /// Raw `RegisterWord` representation of dynamic side-exit values.
-    pub exit_values: [MaybeUninit<u64>; MAX_TRACE_EXIT_VALUES],
+    /// Number of complete native loop iterations before the side exit. This is
+    /// used only by the manager's anti-thrashing policy and is not architectural
+    /// VM state.
+    pub native_iterations: u32,
 }
 
 impl TraceActivation {
@@ -192,7 +187,7 @@ impl TraceActivation {
             execute: inputs.execute,
             exit_id: u32::MAX,
             result_code: TRACE_RESULT_CONTINUE,
-            exit_values: [MaybeUninit::uninit(); MAX_TRACE_EXIT_VALUES],
+            native_iterations: 0,
         }
     }
 
@@ -200,6 +195,7 @@ impl TraceActivation {
     pub fn reset_result(&mut self) {
         self.exit_id = u32::MAX;
         self.result_code = TRACE_RESULT_CONTINUE;
+        self.native_iterations = 0;
     }
 }
 
@@ -338,6 +334,24 @@ pub trait TraceRuntime {
 // Configuration / diagnostics
 // =============================================================================
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeOptLevel {
+    None,
+    Speed,
+    SpeedAndSize,
+}
+
+impl NativeOptLevel {
+    #[inline]
+    const fn as_setting(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Speed => "speed",
+            Self::SpeedAndSize => "speed_and_size",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TracingJitOptions {
     /// Number of visits to a loop header before starting a recording.
@@ -348,13 +362,20 @@ pub struct TracingJitOptions {
     pub max_failures_before_blacklist: u16,
     /// Start considering a side exit for a child trace after this many hits.
     pub hot_side_exit_threshold: u32,
+    /// Maximum native loop iterations executed by one trace entry before a
+    /// cooperative side exit. Zero disables the budget. Exhaustion resumes the
+    /// interpreter at the header; the compiled trace remains available.
+    pub native_loop_iteration_budget: u32,
 
     pub optimize_trace_ir: bool,
-    pub b3_opt_level: OptLevel,
-    pub b3_enable_sccp: bool,
-    pub b3_enable_licm: bool,
-    pub b3_dump_ir: bool,
-    pub b3_dump_air: bool,
+    /// Cranelift optimization mode for compiled traces.
+    pub cranelift_opt_level: NativeOptLevel,
+    /// Run Cranelift's verifier before native lowering. Recommended in development.
+    pub cranelift_enable_verifier: bool,
+    /// Print CLIF before native compilation and retain it for `disassembly()`.
+    pub cranelift_dump_ir: bool,
+    /// Ask Cranelift for post-regalloc VCode and retain/print it.
+    pub cranelift_dump_disassembly: bool,
 
     /// Restrict compilation to numeric traces, for diagnostics/comparison.
     pub no_runtime_calls_in_native_trace: bool,
@@ -367,13 +388,15 @@ impl Default for TracingJitOptions {
             max_trace_steps: 4096,
             max_failures_before_blacklist: 8,
             hot_side_exit_threshold: 32,
+            // Periodically return control to the interpreter without discarding
+            // useful native code just because a source loop runs for a long time.
+            native_loop_iteration_budget: 1 << 16,
 
             optimize_trace_ir: true,
-            b3_opt_level: OptLevel::O3,
-            b3_enable_sccp: true,
-            b3_enable_licm: true,
-            b3_dump_ir: false,
-            b3_dump_air: false,
+            cranelift_opt_level: NativeOptLevel::Speed,
+            cranelift_enable_verifier: true,
+            cranelift_dump_ir: false,
+            cranelift_dump_disassembly: false,
 
             // Until an opcode has a real native lowering, do not compile a
             // trace that bounces through Rust for it on every iteration. Such a
@@ -392,6 +415,14 @@ pub struct TracingJitStats {
     pub traces_compiled: u64,
     pub native_entries: u64,
     pub side_exits: u64,
+    pub native_budget_exits: u64,
+    /// Total complete loop iterations executed inside native traces.
+    pub native_iterations: u64,
+    /// Side exits taken before enough native work was done to amortize the
+    /// interpreter -> JIT -> interpreter transition.
+    pub short_native_exits: u64,
+    /// Temporary cooldowns after repeated short native entries.
+    pub trace_cooldowns: u64,
     pub blacklisted_loops: u64,
     pub stitched_exits: u64,
     pub recorded_bytecodes: u64,
@@ -415,7 +446,7 @@ pub enum TracingJitError {
         message: String,
     },
     TraceVerification(Vec<String>),
-    B3Lowering {
+    CraneliftLowering {
         trace: TraceId,
         message: String,
     },
@@ -447,8 +478,8 @@ impl fmt::Display for TracingJitError {
                 }
                 Ok(())
             }
-            Self::B3Lowering { trace, message } => {
-                write!(f, "B3 lowering failed for {trace:?}: {message}")
+            Self::CraneliftLowering { trace, message } => {
+                write!(f, "Cranelift lowering failed for {trace:?}: {message}")
             }
             Self::InvalidSideExit { trace, exit } => {
                 write!(f, "{trace:?} returned invalid side exit {exit}")
@@ -472,6 +503,8 @@ pub enum RecordingAbort {
     FrameChanged,
     LeftFunction,
     PathDidNotClose,
+    EnclosingLoop,
+    NestedCycle(TraceLocation),
     TraceTooLong,
     RepresentationConflict,
     InterpreterStopped,
@@ -487,6 +520,13 @@ impl fmt::Display for RecordingAbort {
             Self::FrameChanged => f.write_str("bytecode step changed frame/fiber"),
             Self::LeftFunction => f.write_str("recorded path left the root function"),
             Self::PathDidNotClose => f.write_str("recorded path did not return to trace head"),
+            Self::EnclosingLoop => f.write_str("recorded path took an enclosing loop backedge"),
+            Self::NestedCycle(location) => write!(
+                f,
+                "recording encountered nested/re-entrant cycle at {:?}:{} before returning to trace head",
+                location.function,
+                location.pc.0,
+            ),
             Self::TraceTooLong => f.write_str("trace exceeded configured instruction limit"),
             Self::RepresentationConflict => {
                 f.write_str("one loop-entry register requires incompatible representations")
@@ -731,6 +771,47 @@ impl<'a> TraceRecorder<'a> {
         )
     }
 
+    /// Recover the raw 0/1 comparison feeding a tagged Boolean produced by
+    /// `tagged_bool`. Branch guards can use that value directly instead of
+    /// re-decoding the NaN-boxed true/false representation.
+    fn raw_recorded_bool(
+        &self,
+        builder: &crate::wren_traceir::TraceBuilder,
+        value: TraceValueId,
+    ) -> Option<TraceValueId> {
+        let trace = builder.trace();
+        let value = trace.canonical_value(value);
+        let node = match &trace.value(value)?.origin {
+            TraceValueOrigin::InstResult { node } => *node,
+            _ => return None,
+        };
+        let TraceInst::Select {
+            condition,
+            if_true,
+            if_false,
+        } = &trace.nodes.get(node)?.kind
+        else {
+            return None;
+        };
+        let condition = *condition;
+        let if_true = *if_true;
+        let if_false = *if_false;
+
+        let is_bool_constant = |id: TraceValueId, expected: bool| {
+            let id = trace.canonical_value(id);
+            matches!(
+                trace.value(id).map(|value| &value.origin),
+                Some(TraceValueOrigin::Constant(TraceConstant::Bool(actual))) if *actual == expected
+            )
+        };
+
+        if is_bool_constant(if_true, true) && is_bool_constant(if_false, false) {
+            Some(trace.canonical_value(condition))
+        } else {
+            None
+        }
+    }
+
     fn num_to_f64_guard(
         &self,
         builder: &mut crate::wren_traceir::TraceBuilder,
@@ -781,8 +862,8 @@ impl<'a> TraceRecorder<'a> {
         let Some(name) = program.metadata.string(signature.name) else {
             return Ok(false);
         };
-        // Wren's host bitwise operators use i64, whereas typed I* bytecodes use
-        // i32. Keep the former in the runtime, including wide shift counts.
+        // Wren bitwise operators use unsigned u32 values. Keep them in baseline
+        // until the trace IR can guard and box that representation exactly.
         if !matches!(name, "+" | "-" | "*" | "/" | "<" | "<=" | ">" | ">=" | "==" | "!=") { return Ok(false); }
 
         let receiver_word = runtime
@@ -862,50 +943,10 @@ impl<'a> TraceRecorder<'a> {
 
         match name {
             "+" | "-" | "*" | "/" => {
-                // For exact small integers, speculate on i32 and guard overflow.
-                // A failed guard/overflow resumes at the original Invoke, which
-                // computes full Wren f64 semantics. Division intentionally stays
-                // f64 because Wren `/` is not integer division.
-                let int_bin = if name != "/" {
-                    match (word_exact_i32(receiver_word), word_exact_i32(rhs_word)) {
-                        (Some(lhs), Some(rhs)) => {
-                            let observed_fits = match name {
-                                "+" => lhs.checked_add(rhs).is_some(),
-                                "-" => lhs.checked_sub(rhs).is_some(),
-                                "*" => lhs.checked_mul(rhs).is_some(),
-                                _ => false,
-                            };
-                            observed_fits.then_some(match name {
-                                "+" => IntBinOp::Add,
-                                "-" => IntBinOp::Sub,
-                                "*" => IntBinOp::Mul,
-                                _ => unreachable!(),
-                            })
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(bin) = int_bin {
-                    let lhs = self.num_to_i32_guard(builder, receiver, resume);
-                    let rhs = self.num_to_i32_guard(builder, rhs, resume);
-                    let overflow = builder.add_side_exit(ExitReason::GuardInteger, resume);
-                    let raw = builder.emit1(
-                        TraceInst::IntBinaryChecked { op: bin, lhs, rhs, exit: overflow },
-                        TraceType::Int32,
-                        TraceRep::Int32,
-                    );
-                    let boxed = builder.emit1(
-                        TraceInst::BoxInt32 { value: raw },
-                        TraceType::Num,
-                        TraceRep::Tagged,
-                    );
-                    self.write_gpr(builder, op.a, boxed);
-                    return Ok(true);
-                }
-
+                // Wren-visible Num is semantically f64. Keep dynamic Invoke
+                // specialization in that representation until the Cranelift tier
+                // is proven correct with mixed Tagged/Int32 loop-carried values.
+                // Typed I* bytecodes still use the integer native lowering below.
                 let lhs = self.num_to_f64_guard(builder, receiver, resume);
                 let rhs = self.num_to_f64_guard(builder, rhs, resume);
                 let bin = match name {
@@ -940,25 +981,16 @@ impl<'a> TraceRecorder<'a> {
                     _ => unreachable!(),
                 };
 
-                let condition = if word_exact_i32(receiver_word).is_some()
-                    && word_exact_i32(rhs_word).is_some()
-                {
-                    let lhs = self.num_to_i32_guard(builder, receiver, resume);
-                    let rhs = self.num_to_i32_guard(builder, rhs, resume);
-                    builder.emit1(
-                        TraceInst::IntCompare { op: cmp, lhs, rhs },
-                        TraceType::Bool,
-                        TraceRep::Bool,
-                    )
-                } else {
-                    let lhs = self.num_to_f64_guard(builder, receiver, resume);
-                    let rhs = self.num_to_f64_guard(builder, rhs, resume);
-                    builder.emit1(
-                        TraceInst::F64Compare { op: cmp, lhs, rhs },
-                        TraceType::Bool,
-                        TraceRep::Bool,
-                    )
-                };
+                // Use the source-language representation for dynamic Num
+                // comparisons. This avoids changing a loop-carried Num between
+                // Int32 and F64 depending on the values observed while recording.
+                let lhs = self.num_to_f64_guard(builder, receiver, resume);
+                let rhs = self.num_to_f64_guard(builder, rhs, resume);
+                let condition = builder.emit1(
+                    TraceInst::F64Compare { op: cmp, lhs, rhs },
+                    TraceType::Bool,
+                    TraceRep::Bool,
+                );
                 let boxed = self.tagged_bool(builder, condition);
                 self.write_gpr(builder, op.a, boxed);
                 Ok(true)
@@ -993,7 +1025,7 @@ impl<'a> TraceRecorder<'a> {
                 Ok(true)
             }
 
-            // `%` is intentionally not emitted yet. B3's public `Mod` lowering
+            // `%` is intentionally not emitted yet. Native floating remainder
             // has target-specific corner semantics; using a runtime helper later
             // is safer than silently changing Wren's floating remainder.
             _ => Ok(false),
@@ -1006,7 +1038,8 @@ impl<'a> TraceRecorder<'a> {
     ) -> Result<ExpectedStep, RecordingAbort> {
         // A speculative lowering may have emitted guards before discovering a
         // representation conflict. Roll back that attempt before using a helper.
-        let checkpoint = builder.clone();
+        let checkpoint = (!self.options.no_runtime_calls_in_native_trace)
+            .then(|| builder.clone());
         let attempt = if matches!(op.opcode, Opcode::Switch | Opcode::OsrPoint | Opcode::ReadBarrier) {
             Err(RecordingAbort::UnsupportedOpcode(op.opcode))
         } else {
@@ -1016,7 +1049,7 @@ impl<'a> TraceRecorder<'a> {
             Ok(step) => Ok(step),
             Err(reason) if self.options.no_runtime_calls_in_native_trace => Err(reason),
             Err(_) => {
-                *builder = checkpoint;
+                *builder = checkpoint.unwrap();
                 builder.set_source(op.location);
                 let terminal = matches!(op.opcode,
                     Opcode::Trap | Opcode::Return | Opcode::Return2 | Opcode::Bailout
@@ -1228,7 +1261,17 @@ impl<'a> TraceRecorder<'a> {
                     alternate,
                 );
 
-                if truthy {
+                if let Some(raw_bool) = self.raw_recorded_bool(builder, condition) {
+                    // Numeric comparisons in Wren are recorded as raw Bool ->
+                    // tagged Bool. Guard the raw comparison result directly. This
+                    // keeps loop-exit control flow independent from boxing/select
+                    // lowering and makes the backedge condition explicit in CLIF.
+                    builder.emit0(TraceInst::GuardSwitch {
+                        tag: raw_bool,
+                        observed: TraceSwitchGuard::Case(if truthy { 1 } else { 0 }),
+                        exit,
+                    });
+                } else if truthy {
                     builder.emit0(TraceInst::GuardTruthy {
                         value: condition,
                         exit,
@@ -1496,9 +1539,8 @@ impl<'a> TraceRecorder<'a> {
             }
 
             IDivS | IRemS => {
-                // Public B3 documents division-by-zero and MIN/-1 as unrestricted
-                // for raw integer Div/Mod. Keep semantics exact by not tracing
-                // these until we lower explicit checks.
+                // Keep division-by-zero and MIN/-1 semantics exact by not tracing
+                // raw integer division/remainder until explicit checks are emitted.
                 Err(RecordingAbort::UnsupportedOpcode(op.opcode))
             }
 
@@ -1821,10 +1863,12 @@ impl<'a> TraceRecorder<'a> {
 
             let final_rep = builder.trace().value(final_value).unwrap().rep;
             if final_rep != rep {
-                // A physical VM register whose representation changes across the
-                // backedge needs an explicit representation bridge. Keep the
-                // first recorder simple and let baseline execute this loop.
-                final_value = builder.emit1(TraceInst::Reinterpret { value: final_value }, ty, rep);
+                // Reinterpret preserves physical bits; it is not a semantic
+                // conversion between Tagged/Int32/F64. Compiling such a backedge
+                // can feed invalid bits into the next native iteration. Until the
+                // trace IR grows an explicit representation bridge, keep this loop
+                // in the baseline interpreter.
+                return Err(RecordingAbort::RepresentationConflict);
             }
 
             let phi = builder.add_loop_phi(slot, initial, ty, rep);
@@ -1899,7 +1943,6 @@ impl<'a> TraceRecorder<'a> {
 
         let mut steps = 0usize;
         let mut runtime_end = false;
-        let mut end_location = None;
         let mut visited = HashSet::new();
 
         loop {
@@ -1916,8 +1959,11 @@ impl<'a> TraceRecorder<'a> {
                 break;
             }
             if !visited.insert(location) {
-                end_location = Some(location);
-                break;
+                // A root loop trace must close back at its own anchor. Reaching
+                // another repeated PC first means we entered a nested/re-entrant
+                // cycle. Installing the finite prefix as the root trace causes
+                // catastrophic enter/side-exit thrashing on nested loops.
+                return Err(RecordOutcome::Abort(RecordingAbort::NestedCycle(location)));
             }
 
             let function = program
@@ -1956,6 +2002,12 @@ impl<'a> TraceRecorder<'a> {
             if step.frame_changed {
                 return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
             }
+            if step.after.pc.0 < self.anchor.pc.0 && step.after.pc.0 < location.pc.0 {
+                // An inner loop can finish on the recording iteration. Walking
+                // through its enclosing loop and back to this header does not
+                // record an iteration of the inner loop.
+                return Err(RecordOutcome::Abort(RecordingAbort::EnclosingLoop));
+            }
             if step.before != location {
                 return Err(RecordOutcome::Fatal(TracingJitError::Record {
                     location,
@@ -1983,16 +2035,18 @@ impl<'a> TraceRecorder<'a> {
             return Err(RecordOutcome::Abort(RecordingAbort::PathDidNotClose));
         }
 
-        let finite_exit = end_location.map(|location| builder.add_side_exit(ExitReason::GuardValue, location.pc));
         if builder.has_runtime_calls() {
             builder.prepare_memory_loop();
-        } else if finite_exit.is_none() {
+        } else {
+            // A successful pure loop recording reaches this point only after the
+            // interpreter returned to the root anchor. Nested cycles abort above.
             self.install_loop_phis(&mut builder).map_err(RecordOutcome::Abort)?;
+            if self.options.native_loop_iteration_budget != 0 {
+                builder.add_native_budget_exit(self.anchor.pc);
+            }
         }
         builder.set_terminator(if runtime_end {
             TraceTerminator::RuntimeReturn
-        } else if let Some(exit) = finite_exit {
-            TraceTerminator::Exit(exit)
         } else {
             TraceTerminator::LoopBack
         });
@@ -2004,7 +2058,10 @@ impl<'a> TraceRecorder<'a> {
         })?;
 
         if self.options.optimize_trace_ir {
-            TraceOptimizer::default().optimize(&mut trace).map_err(|errors| {
+            // Keep the Cranelift tier conservative while its loop lowering is
+            // being stabilized: do not change Tagged loop phis into raw native
+            // block parameters yet.
+            TraceOptimizer::default().optimize_conservative(&mut trace).map_err(|errors| {
                 RecordOutcome::Fatal(TracingJitError::TraceVerification(
                     errors.into_iter().map(|error| error.to_string()).collect(),
                 ))
@@ -2060,7 +2117,7 @@ fn cmp_from_opcode(opcode: Opcode) -> CmpKind {
 // Sparse side-exit plans
 // =============================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum ExitWriteSource {
     Constant(TraceConstant),
     Dynamic(u16),
@@ -2072,7 +2129,7 @@ struct CompiledExitValue {
     target_rep: TraceRep,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct CompiledExitWrite {
     slot: FrameSlot,
     kind: RegisterKind,
@@ -2090,7 +2147,7 @@ struct CompiledExitPlan {
 impl CompiledExitPlan {
     fn from_exit(trace: &Trace, exit: &SideExit) -> Result<Self, TracingJitError> {
         if exit.frames.len() != 1 {
-            return Err(TracingJitError::B3Lowering {
+            return Err(TracingJitError::CraneliftLowering {
                 trace: trace.id,
                 message: format!(
                     "native tier currently supports one existing frame per exit, got {}",
@@ -2104,7 +2161,7 @@ impl CompiledExitPlan {
             frame.disposition,
             FrameDisposition::Existing { depth_from_top: 0 }
         ) {
-            return Err(TracingJitError::B3Lowering {
+            return Err(TracingJitError::CraneliftLowering {
                 trace: trace.id,
                 message: "native tier cannot yet recreate inlined Wren frames".to_owned(),
             });
@@ -2124,7 +2181,7 @@ impl CompiledExitPlan {
                         index
                     } else {
                         if dynamic_values.len() >= MAX_TRACE_EXIT_VALUES {
-                            return Err(TracingJitError::B3Lowering {
+                            return Err(TracingJitError::CraneliftLowering {
                                 trace: trace.id,
                                 message: "side exit exceeds TraceActivation exit buffer".to_owned(),
                             });
@@ -2158,49 +2215,119 @@ impl CompiledExitPlan {
 }
 
 // =============================================================================
-// B3 lowering
+// Cranelift lowering
 // =============================================================================
 
 struct CompiledTrace {
     trace: Trace,
-    compilation: Compilation,
+    function: ClifFuncId,
+    code_ptr: *const u8,
     entry: NativeTraceFn,
     exits: Vec<CompiledExitPlan>,
     exit_hits: Vec<u32>,
+    /// Consecutive entries that did too little work to amortize a transition.
+    /// A long streak requests a temporary cooldown in the interpreter.
+    short_exit_streak: u16,
+    debug_text: Option<String>,
 }
 
 impl CompiledTrace {
+    #[inline]
     fn code_ptr(&self) -> *const u8 {
-        self.compilation.code_ref().start()
+        self.code_ptr
     }
 }
 
-struct B3TraceCompiler<'a> {
+struct CraneliftBackend {
+    module: JITModule,
+}
+
+impl CraneliftBackend {
+    fn new(options: &TracingJitOptions) -> Result<Self, String> {
+        let mut flag_builder = settings::builder();
+        flag_builder
+            .set("opt_level", options.cranelift_opt_level.as_setting())
+            .map_err(|error| format!("invalid Cranelift opt_level: {error}"))?;
+        flag_builder
+            .set(
+                "enable_verifier",
+                if options.cranelift_enable_verifier { "true" } else { "false" },
+            )
+            .map_err(|error| format!("cannot configure Cranelift verifier: {error}"))?;
+        flag_builder
+            .set("enable_alias_analysis", "true")
+            .map_err(|error| format!("cannot enable Cranelift alias analysis: {error}"))?;
+        flag_builder
+            .set("use_colocated_libcalls", "false")
+            .map_err(|error| format!("cannot configure Cranelift libcalls: {error}"))?;
+        flag_builder
+            .set(
+                "is_pic",
+                if cfg!(target_arch = "x86_64") { "true" } else { "false" },
+            )
+            .map_err(|error| format!("cannot configure Cranelift PIC mode: {error}"))?;
+
+        let isa_builder = cranelift::native::builder()
+            .map_err(|error| format!("Cranelift does not support this host: {error}"))?;
+        let isa = isa_builder
+            .finish(settings::Flags::new(flag_builder))
+            .map_err(|error| format!("cannot build Cranelift host ISA: {error}"))?;
+
+        let module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+        if module.target_config().pointer_type() != types::I64 {
+            return Err("WrenJIT's NaN-boxed native tier currently requires a 64-bit host".to_owned());
+        }
+
+        Ok(Self { module })
+    }
+}
+
+struct CraneliftTraceCompiler<'a> {
     trace: &'a Trace,
     options: &'a TracingJitOptions,
     exit_plans: Vec<CompiledExitPlan>,
 }
 
-struct B3LoweringState<'a, 'p> {
-    builder: BasicBlockBuilder<'a>,
+struct CraneliftLoweringState<'a, 'p> {
+    builder: FunctionBuilder<'a>,
     trace: &'p Trace,
-    activation: b3::ValueId,
-    general: b3::ValueId,
-    arguments: b3::ValueId,
-    returns: b3::ValueId,
-    special: b3::ValueId,
-    values: HashMap<TraceValueId, b3::ValueId>,
-    phi_vars: HashMap<TraceValueId, b3::variable::VariableId>,
+    activation: Value,
+    pointer_type: Type,
+    runtime_signature: codegen::ir::SigRef,
+    values: HashMap<TraceValueId, Value>,
     exit_plans: &'p [CompiledExitPlan],
+    /// Current loop budget block parameter. The manager derives completed native
+    /// iterations from it only when a side exit is materialized.
+    native_budget_remaining: Option<Value>,
+    native_budget_initial: u32,
 }
 
-impl<'a> B3TraceCompiler<'a> {
+impl<'a> CraneliftTraceCompiler<'a> {
     fn new(trace: &'a Trace, options: &'a TracingJitOptions) -> Result<Self, TracingJitError> {
         verify_trace(trace).map_err(|errors| {
             TracingJitError::TraceVerification(
                 errors.into_iter().map(|error| error.to_string()).collect(),
             )
         })?;
+
+        // A loop phi whose backedge canonicalizes to itself cannot make
+        // architectural progress. Reject it before native code generation rather
+        // than relying on the watchdog to discover a non-advancing loop at run
+        // time. `install_loop_phis` normally never creates such a phi; this also
+        // protects us from an optimizer accidentally collapsing the update.
+        for phi in &trace.loop_phis {
+            if let Some(backedge) = phi.backedge {
+                if trace.canonical_value(backedge) == trace.canonical_value(phi.value) {
+                    return Err(TracingJitError::CraneliftLowering {
+                        trace: trace.id,
+                        message: format!(
+                            "loop phi {:?} has a self backedge and cannot make progress",
+                            phi.value
+                        ),
+                    });
+                }
+            }
+        }
 
         let mut exit_plans = Vec::with_capacity(trace.exits.len());
         for exit in &trace.exits {
@@ -2214,266 +2341,346 @@ impl<'a> B3TraceCompiler<'a> {
         })
     }
 
-    fn compile(self) -> Result<CompiledTrace, TracingJitError> {
-        let mut options = b3::Options::default();
-        options.opt_level = self.options.b3_opt_level;
-        options.enable_sccp = self.options.b3_enable_sccp;
-        options.use_b3_hoist_loop_invariant_values = self.options.b3_enable_licm;
-        options.dump_b3_at_each_phase = self.options.b3_dump_ir;
-        options.dump_air_at_each_phase = self.options.b3_dump_air;
+    fn compile(self, module: &mut JITModule) -> Result<CompiledTrace, TracingJitError> {
+        let trace_id = self.trace.id;
+        let pointer_type = module.target_config().pointer_type();
 
-        let mut procedure = b3::Procedure::new(options);
-        let entry_block = procedure.add_block(1.0);
-        let loop_block = procedure.add_block(1.0);
+        let mut signature = module.make_signature();
+        signature.params.push(AbiParam::new(pointer_type));
+        signature.returns.push(AbiParam::new(types::I32));
 
-        let mut entry = BasicBlockBuilder::new(&mut procedure, entry_block);
-        let activation = entry.argument(
-            B3Reg::new_gpr(ARGUMENT_GPR0),
-            b3::Type::Int64,
-        );
+        let function = module
+            .declare_anonymous_function(&signature)
+            .map_err(|error| TracingJitError::CraneliftLowering {
+                trace: trace_id,
+                message: format!("cannot declare native trace: {error}"),
+            })?;
 
-        let general = entry.load(
-            b3::Type::Int64,
-            activation,
-            offset_of!(TraceActivation, general) as i32,
-            None,
-            None,
-        );
-        let arguments = entry.load(
-            b3::Type::Int64,
-            activation,
-            offset_of!(TraceActivation, arguments) as i32,
-            None,
-            None,
-        );
-        let returns = entry.load(
-            b3::Type::Int64,
-            activation,
-            offset_of!(TraceActivation, returns) as i32,
-            None,
-            None,
-        );
-        let special = entry.load(
-            b3::Type::Int64,
-            activation,
-            offset_of!(TraceActivation, special) as i32,
-            None,
-            None,
-        );
+        let mut runtime_signature = module.make_signature();
+        runtime_signature.params.push(AbiParam::new(pointer_type));
+        runtime_signature.params.push(AbiParam::new(types::I32));
+        runtime_signature.params.push(AbiParam::new(types::I32));
+        runtime_signature.params.push(AbiParam::new(types::I32));
+        runtime_signature.returns.push(AbiParam::new(types::I32));
 
-        let mut state = B3LoweringState {
-            builder: entry,
-            trace: self.trace,
-            activation,
-            general,
-            arguments,
-            returns,
-            special,
-            values: HashMap::new(),
-            phi_vars: HashMap::new(),
-            exit_plans: &self.exit_plans,
-        };
+        let mut context = module.make_context();
+        context.func.signature = signature;
+        context.func.name = UserFuncName::user(0, function.as_u32());
+        context.set_disasm(self.options.cranelift_dump_disassembly);
 
-        // Entry-slot loads and constants are intentionally emitted before the
-        // native loop. They are invariant unless represented by a LoopPhi.
-        let value_ids: Vec<_> = self.trace.values.iter().map(|value| value.id).collect();
-        for id in value_ids {
-            let origin = self.trace.value(id).unwrap().origin.clone();
-            if matches!(
-                origin,
-                TraceValueOrigin::EntrySlot { .. }
-                    | TraceValueOrigin::GuardedEntry { .. }
-                    | TraceValueOrigin::Constant(_)
-            ) {
-                let _ = state.lower_value(id)?;
-            }
-        }
+        let target_config = module.target_config();
+        let mut function_context = FunctionBuilderContext::new();
 
-        // Each LoopPhi is represented as a B3 variable. Representation-promoted
-        // phis guard/unbox their tagged architectural entry value once here, in
-        // the preheader, instead of repeating box/guard traffic every iteration.
-        for phi in &self.trace.loop_phis {
-            let ty = b3_type(phi.rep);
-            let variable = state.builder.procedure.add_variable(ty);
-            let mut initial = state.lower_value(phi.initial)?;
-            if let Some(exit) = phi.entry_exit {
-                initial = match phi.rep {
-                    TraceRep::F64 => state.guard_numeric(initial, exit)?,
-                    TraceRep::Int32 => state.guard_int32_numeric(initial, exit)?,
-                    _ => {
-                        return Err(TracingJitError::B3Lowering {
-                            trace: self.trace.id,
-                            message: format!("unsupported promoted LoopPhi representation {:?}", phi.rep),
-                        })
-                    }
-                };
-            }
-            state.builder.var_set(variable, initial);
-            state.phi_vars.insert(phi.value, variable);
-        }
+        {
+            let mut builder = FunctionBuilder::new(&mut context.func, &mut function_context);
+            let entry_block = builder.create_block();
+            let loop_block = builder.create_block();
 
-        state.builder.jump(Some(loop_block));
-        state.builder.block = loop_block;
+            builder.append_block_params_for_function_params(entry_block);
+            let native_budget_enabled = self.options.native_loop_iteration_budget != 0
+                && matches!(self.trace.terminator, TraceTerminator::LoopBack);
 
-        for phi in &self.trace.loop_phis {
-            let variable = state.phi_vars[&phi.value];
-            let value = state.builder.var_get(variable);
-            state.values.insert(phi.value, value);
-        }
+            builder.switch_to_block(entry_block);
+            let activation = builder.block_params(entry_block)[0];
+            let runtime_signature = builder.import_signature(runtime_signature);
 
-        for node in &self.trace.nodes {
-            if matches!(node.kind, TraceInst::Nop) {
-                continue;
-            }
-            state.lower_node(node)?;
-        }
+            let mut state = CraneliftLoweringState {
+                builder,
+                trace: self.trace,
+                activation,
+                pointer_type,
+                runtime_signature,
+                values: HashMap::new(),
+                exit_plans: &self.exit_plans,
+                native_budget_remaining: None,
+                native_budget_initial: self.options.native_loop_iteration_budget,
+            };
 
-        match &self.trace.terminator {
-            TraceTerminator::RuntimeReturn => {
-                let result = state.builder.const32(TRACE_RESULT_RUNTIME as i32);
-                state.builder.return_(Some(result));
-            }
-            TraceTerminator::LoopBack => {
-                for phi in &self.trace.loop_phis {
-                    let backedge = phi.backedge.ok_or_else(|| {
-                        TracingJitError::B3Lowering {
-                            trace: self.trace.id,
-                            message: format!("{:?} has no backedge", phi.value),
-                        }
-                    })?;
-                    let value = state.lower_value(backedge)?;
-                    let variable = state.phi_vars[&phi.value];
-                    state.builder.var_set(variable, value);
+            // Entry loads/constants are invariant unless represented by a LoopPhi.
+            let value_ids: Vec<_> = self.trace.values.iter().map(|value| value.id).collect();
+            for id in value_ids {
+                let origin = self.trace.value(id).unwrap().origin.clone();
+                if matches!(
+                    origin,
+                    TraceValueOrigin::EntrySlot { .. }
+                        | TraceValueOrigin::GuardedEntry { .. }
+                        | TraceValueOrigin::Constant(_)
+                ) {
+                    let _ = state.lower_value(id)?;
                 }
-                state.builder.jump(Some(loop_block));
             }
 
-            TraceTerminator::Exit(exit) => {
-                // An unconditional trace exit is represented by a check that is
-                // always true. This keeps all exit materialization in one path.
-                let one = state.builder.const32(1);
-                state.emit_side_exit(*exit, one)?;
-                let zero = state.builder.const32(0);
-                state.builder.return_(Some(zero));
+            // Mirror the old B3 backend exactly: loop-carried values are mutable
+            // frontend variables. Cranelift's frontend SSA builder inserts and
+            // wires the required block parameters itself when `use_var` sees a
+            // value with definitions from the preheader and backedge. This avoids
+            // maintaining a second, hand-written phi/BlockArg implementation in
+            // the tracing tier.
+            let mut phi_vars = Vec::with_capacity(self.trace.loop_phis.len());
+            for phi in &self.trace.loop_phis {
+                let variable = state.builder.declare_var(clif_type(phi.rep));
+                let mut initial = state.lower_value(phi.initial)?;
+                if let Some(exit) = phi.entry_exit {
+                    initial = match phi.rep {
+                        TraceRep::F64 => state.guard_numeric(initial, exit)?,
+                        TraceRep::Int32 => state.guard_int32_numeric(initial, exit)?,
+                        _ => {
+                            return Err(TracingJitError::CraneliftLowering {
+                                trace: trace_id,
+                                message: format!(
+                                    "unsupported promoted LoopPhi representation {:?}",
+                                    phi.rep
+                                ),
+                            });
+                        }
+                    };
+                }
+                state.builder.def_var(variable, initial);
+                phi_vars.push(variable);
             }
 
-            TraceTerminator::Return { .. } => {
-                return Err(TracingJitError::B3Lowering {
-                    trace: self.trace.id,
-                    message: "native Return terminator is not enabled in the first loop tier".to_owned(),
-                });
+            // Treat the watchdog counter as loop-carried state too. Keeping it in
+            // the same SSA mechanism makes it impossible for the explicit block
+            // argument list to get out of sync with the Trace IR phi list.
+            let budget_var = if native_budget_enabled {
+                let variable = state.builder.declare_var(types::I64);
+                let initial = state.builder.ins().iconst(
+                    types::I64,
+                    self.options.native_loop_iteration_budget as i64,
+                );
+                state.builder.def_var(variable, initial);
+                Some(variable)
+            } else {
+                None
+            };
+
+            state.builder.ins().jump(loop_block, &[]);
+            state.builder.switch_to_block(loop_block);
+
+            for (phi, variable) in self.trace.loop_phis.iter().zip(phi_vars.iter().copied()) {
+                let value = state.builder.use_var(variable);
+                state.values.insert(phi.value, value);
+            }
+            state.native_budget_remaining = budget_var.map(|variable| state.builder.use_var(variable));
+
+            for node in &self.trace.nodes {
+                if !matches!(node.kind, TraceInst::Nop) {
+                    state.lower_node(node)?;
+                }
             }
 
-            TraceTerminator::Link { .. } => {
-                return Err(TracingJitError::B3Lowering {
-                    trace: self.trace.id,
-                    message: "direct native trace links are installed after compilation".to_owned(),
-                });
+            match &self.trace.terminator {
+                TraceTerminator::RuntimeReturn => {
+                    let result = state
+                        .builder
+                        .ins()
+                        .iconst(types::I32, TRACE_RESULT_RUNTIME as i64);
+                    state.builder.ins().return_(&[result]);
+                }
+                TraceTerminator::LoopBack => {
+                    // Define every loop-carried variable with the value produced by
+                    // this iteration. `use_var` at the top of `loop_block` then
+                    // observes the appropriate SSA phi on the next iteration.
+                    for (phi, variable) in self.trace.loop_phis.iter().zip(phi_vars.iter().copied()) {
+                        let backedge = phi.backedge.ok_or_else(|| {
+                            TracingJitError::CraneliftLowering {
+                                trace: trace_id,
+                                message: format!("{:?} has no backedge", phi.value),
+                            }
+                        })?;
+                        let value = state.lower_value(backedge)?;
+                        state.builder.def_var(variable, value);
+                    }
+
+                    if let Some(variable) = budget_var {
+                        let budget = state
+                            .native_budget_remaining
+                            .ok_or_else(|| TracingJitError::CraneliftLowering {
+                                trace: trace_id,
+                                message: "native loop budget variable has no current SSA value".to_owned(),
+                            })?;
+                        let next_budget = state.builder.ins().iadd_imm(budget, -1);
+                        state.builder.def_var(variable, next_budget);
+                        let exhausted = state.builder.ins().icmp_imm(
+                            IntCC::Equal,
+                            next_budget,
+                            0,
+                        );
+                        let exhausted = state.bool32(exhausted);
+                        let stop = state.builder.create_block();
+                        state.builder.set_cold_block(stop);
+                        state.builder.ins().brif(
+                            exhausted,
+                            stop,
+                            &[],
+                            loop_block,
+                            &[],
+                        );
+                        state.builder.switch_to_block(stop);
+                        let exit = self.trace.native_budget_exit.ok_or_else(|| {
+                            TracingJitError::CraneliftLowering {
+                                trace: trace_id,
+                                message: "native loop budget enabled without watchdog side exit".to_owned(),
+                            }
+                        })?;
+                        state.native_budget_remaining = Some(next_budget);
+                        state.emit_unconditional_side_exit(exit)?;
+                    } else {
+                        state.builder.ins().jump(loop_block, &[]);
+                    }
+                }
+                TraceTerminator::Exit(exit) => {
+                    state.emit_unconditional_side_exit(*exit)?;
+                }
+                TraceTerminator::Return => {
+                    return Err(TracingJitError::CraneliftLowering {
+                        trace: trace_id,
+                        message: "native Return terminator is not enabled in the first loop tier"
+                            .to_owned(),
+                    });
+                }
+                TraceTerminator::Link => {
+                    return Err(TracingJitError::CraneliftLowering {
+                        trace: trace_id,
+                        message: "direct native trace links are installed after compilation"
+                            .to_owned(),
+                    });
+                }
+                TraceTerminator::Unreachable => {
+                    return Err(TracingJitError::CraneliftLowering {
+                        trace: trace_id,
+                        message: "trace has unreachable terminator".to_owned(),
+                    });
+                }
             }
 
-            TraceTerminator::Unreachable => {
-                return Err(TracingJitError::B3Lowering {
-                    trace: self.trace.id,
-                    message: "trace has unreachable terminator".to_owned(),
-                });
-            }
+            state.builder.seal_all_blocks();
+            state.builder.finalize(target_config);
         }
 
-        // Release the builder's mutable borrow of `procedure` and the borrowed
-        // exit-plan slice before handing the Procedure to B3.
-        drop(state);
+        let clif_text = self
+            .options
+            .cranelift_dump_ir
+            .then(|| context.func.display().to_string());
+        if let Some(text) = &clif_text {
+            eprintln!("{text}");
+        }
 
-        let compilation = b3::compile(procedure);
-        let entry_ptr = compilation.code_ref().start();
-        let entry: NativeTraceFn = unsafe { std::mem::transmute(entry_ptr) };
+        module
+            .define_function(function, &mut context)
+            .map_err(|error| TracingJitError::CraneliftLowering {
+                trace: trace_id,
+                message: format!("native code generation failed: {error}"),
+            })?;
+
+        let disassembly = if self.options.cranelift_dump_disassembly {
+            context
+                .compiled_code()
+                .and_then(|compiled| compiled.vcode.clone())
+        } else {
+            None
+        };
+        if let Some(text) = &disassembly {
+            eprintln!("{text}");
+        }
+
+        module
+            .finalize_definitions()
+            .map_err(|error| TracingJitError::CraneliftLowering {
+                trace: trace_id,
+                message: format!("cannot finalize native trace: {error}"),
+            })?;
+
+        let code_ptr = module.get_finalized_function(function);
+        let entry: NativeTraceFn = unsafe { std::mem::transmute(code_ptr) };
 
         Ok(CompiledTrace {
             trace: self.trace.clone(),
-            compilation,
+            function,
+            code_ptr,
             entry,
             exit_hits: vec![0; self.exit_plans.len()],
             exits: self.exit_plans,
+            short_exit_streak: 0,
+            debug_text: disassembly.or(clif_text),
         })
     }
 }
 
-impl B3LoweringState<'_, '_> {
-    /// B3's generic DToI has no Air lowering in this backend. Emit the machine
-    /// conversion explicitly; callers guard range and integrality separately.
-    fn double_to_int64(&mut self, value: b3::ValueId) -> b3::ValueId {
-        let result = self.builder.patchpoint(b3::Type::Int64);
-        self.builder.procedure.stackmap_append(result, value, ValueRep::new(ValueRepKind::SomeRegister));
-        self.builder.procedure.stackmap_set_generator(result, Rc::new(|jit, params| {
-            jit.truncate_double_to_int64(params[1].get_reg().fpr(), params[0].get_reg().gpr());
-        }));
-        result
+impl CraneliftLoweringState<'_, '_> {
+    #[inline]
+    fn trusted_mem() -> MemFlagsData {
+        MemFlagsData::trusted()
     }
 
-    fn lower_value(&mut self, value: TraceValueId) -> Result<b3::ValueId, TracingJitError> {
+    #[inline]
+    fn plain_mem() -> MemFlagsData {
+        MemFlagsData::new()
+    }
+
+    fn error(&self, message: impl Into<String>) -> TracingJitError {
+        TracingJitError::CraneliftLowering {
+            trace: self.trace.id,
+            message: message.into(),
+        }
+    }
+
+    fn value_rep(&self, value: TraceValueId) -> Result<TraceRep, TracingJitError> {
+        self.trace
+            .value(value)
+            .map(|value| value.rep)
+            .ok_or_else(|| self.error(format!("unknown trace value {value:?}")))
+    }
+
+    fn lower_value(&mut self, value: TraceValueId) -> Result<Value, TracingJitError> {
         let value = self.trace.canonical_value(value);
         if let Some(existing) = self.values.get(&value).copied() {
             return Ok(existing);
         }
 
-        if let Some(variable) = self.phi_vars.get(&value).copied() {
-            let loaded = self.builder.var_get(variable);
-            self.values.insert(value, loaded);
-            return Ok(loaded);
-        }
-
         let (origin, value_rep) = {
-            let trace_value = self.trace.value(value).ok_or_else(|| {
-                TracingJitError::B3Lowering {
-                    trace: self.trace.id,
-                    message: format!("unknown trace value {value:?}"),
-                }
-            })?;
+            let trace_value = self
+                .trace
+                .value(value)
+                .ok_or_else(|| self.error(format!("unknown trace value {value:?}")))?;
             (trace_value.origin.clone(), trace_value.rep)
         };
 
         let lowered = match origin {
             TraceValueOrigin::EntrySlot { frame, slot } => {
                 if frame.0 != 0 {
-                    return Err(TracingJitError::B3Lowering {
-                        trace: self.trace.id,
-                        message: "B3 tier cannot load recreated inlined frames yet".to_owned(),
-                    });
+                    return Err(self.error(
+                        "Cranelift tier cannot load recreated inlined frames yet",
+                    ));
                 }
-                self.load_frame_slot(slot, value_rep)?
+                self.load_frame_slot(slot, value_rep)
             }
-
-            TraceValueOrigin::GuardedEntry { value: source, exit } => {
+            TraceValueOrigin::GuardedEntry {
+                value: source,
+                exit,
+            } => {
                 let tagged = self.lower_value(source)?;
                 match value_rep {
                     TraceRep::F64 => self.guard_numeric(tagged, exit)?,
                     TraceRep::Int32 => self.guard_int32_numeric(tagged, exit)?,
                     _ => {
-                        return Err(TracingJitError::B3Lowering {
-                            trace: self.trace.id,
-                            message: format!("unsupported guarded-entry representation {value_rep:?}"),
-                        })
+                        return Err(self.error(format!(
+                            "unsupported guarded-entry representation {value_rep:?}"
+                        )));
                     }
                 }
             }
-
             TraceValueOrigin::Constant(constant) => self.lower_constant(constant)?,
-
             TraceValueOrigin::InstResult { .. } => {
-                return Err(TracingJitError::B3Lowering {
-                    trace: self.trace.id,
-                    message: format!(
-                        "instruction result {value:?} requested before producer was lowered"
-                    ),
-                });
+                return Err(self.error(format!(
+                    "instruction result {value:?} requested before producer was lowered"
+                )));
             }
-
             TraceValueOrigin::LoopPhi { .. } => {
-                return Err(TracingJitError::B3Lowering {
-                    trace: self.trace.id,
-                    message: format!("loop value {value:?} has no B3 variable"),
-                });
+                return Err(self.error(format!(
+                    "loop value {value:?} has no Cranelift block parameter"
+                )));
             }
-
             TraceValueOrigin::Alias(alias) => return self.lower_value(alias),
         };
 
@@ -2481,321 +2688,406 @@ impl B3LoweringState<'_, '_> {
         Ok(lowered)
     }
 
-    fn base_for_slot(&mut self, slot: FrameSlot) -> (b3::ValueId, i32) {
-        let (bank, offset) = match slot {
-            FrameSlot::General(reg) => (offset_of!(TraceActivation, general), reg.0 as i32 * 8),
-            FrameSlot::Argument(reg) => (offset_of!(TraceActivation, arguments), reg.0 as i32 * 8),
-            FrameSlot::Return(reg) => (offset_of!(TraceActivation, returns), reg.0 as i32 * 8),
-            FrameSlot::Special(reg) => (offset_of!(TraceActivation, special), reg as u8 as i32 * 8),
+    fn base_for_slot(&mut self, slot: FrameSlot) -> (Value, i32) {
+        let (bank_offset, slot_offset) = match slot {
+            FrameSlot::General(reg) => (
+                offset_of!(TraceActivation, general),
+                reg.0 as i32 * std::mem::size_of::<RegisterWord>() as i32,
+            ),
+            FrameSlot::Argument(reg) => (
+                offset_of!(TraceActivation, arguments),
+                reg.0 as i32 * std::mem::size_of::<RegisterWord>() as i32,
+            ),
+            FrameSlot::Return(reg) => (
+                offset_of!(TraceActivation, returns),
+                reg.0 as i32 * std::mem::size_of::<RegisterWord>() as i32,
+            ),
+            FrameSlot::Special(reg) => (
+                offset_of!(TraceActivation, special),
+                reg as u8 as i32 * std::mem::size_of::<RegisterWord>() as i32,
+            ),
         };
-        (self.builder.load(b3::Type::Int64, self.activation, bank as i32, None, None), offset)
-    }
 
-    fn load_frame_slot(
-        &mut self,
-        slot: FrameSlot,
-        rep: TraceRep,
-    ) -> Result<b3::ValueId, TracingJitError> {
-        let (base, offset) = self.base_for_slot(slot);
-        let raw = self.builder.load(
-            b3::Type::Int64,
-            base,
-            offset,
-            None,
-            None,
+        // Runtime helpers may replace the active frame/fiber and refresh these
+        // pointers in TraceActivation. Reload the bank pointer for every access.
+        let base = self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            self.activation,
+            bank_offset as i32,
         );
-
-        Ok(match rep {
-            TraceRep::Tagged | TraceRep::HeapHandle | TraceRep::RawPtr => raw,
-            TraceRep::Int32 | TraceRep::Bool => self.builder.trunc(raw),
-            TraceRep::F64 => self.builder.bitwise_cast(b3::Type::Double, raw),
-        })
+        (base, slot_offset)
     }
 
-    fn store_frame_slot(
-        &mut self,
-        slot: FrameSlot,
-        value: b3::ValueId,
-        rep: TraceRep,
-    ) {
-        let raw = self.normalize_to_word(value, rep);
+    fn load_frame_slot(&mut self, slot: FrameSlot, rep: TraceRep) -> Value {
         let (base, offset) = self.base_for_slot(slot);
-        self.builder.store(raw, base, offset, None, None);
-    }
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, Self::trusted_mem(), base, offset);
 
-    fn lower_constant(
-        &mut self,
-        constant: TraceConstant,
-    ) -> Result<b3::ValueId, TracingJitError> {
-        Ok(match constant {
-            TraceConstant::Null => self.builder.const64(TAG_NULL as i64),
-            TraceConstant::Bool(value) => self
-                .builder
-                .const64(if value { TAG_TRUE } else { TAG_FALSE } as i64),
-            TraceConstant::NumBits(bits) => self.builder.const64(bits as i64),
-            TraceConstant::Int32(value) => self.builder.const32(value),
-            TraceConstant::F64Bits(bits) => {
-                self.builder.const_double(f64::from_bits(bits))
-            }
-            TraceConstant::String(_) | TraceConstant::BuiltinClass(_) => {
-                return Err(TracingJitError::B3Lowering {
-                    trace: self.trace.id,
-                    message: "runtime-owned constant reached native tier".to_owned(),
-                })
-            }
-        })
-    }
-
-    fn normalize_to_word(&mut self, value: b3::ValueId, rep: TraceRep) -> b3::ValueId {
         match rep {
-            TraceRep::Tagged | TraceRep::HeapHandle | TraceRep::RawPtr => value,
-            TraceRep::Int32 | TraceRep::Bool => self.builder.zext32(value),
-            TraceRep::F64 => self.builder.bitwise_cast(b3::Type::Int64, value),
+            TraceRep::Tagged | TraceRep::HeapHandle | TraceRep::RawPtr => raw,
+            TraceRep::Int32 | TraceRep::Bool => self.builder.ins().ireduce(types::I32, raw),
+            TraceRep::F64 => self
+                .builder
+                .ins()
+                .bitcast(types::F64, Self::plain_mem(), raw),
         }
     }
 
-    /// Materialize an optimized native value into the representation expected by
-    /// the baseline VM at a side-exit resume point. This is the cold-path half of
-    /// loop representation promotion.
+    fn store_frame_slot(&mut self, slot: FrameSlot, value: Value, rep: TraceRep) {
+        let raw = self.normalize_to_word(value, rep);
+        self.store_frame_word(slot, raw);
+    }
+
+    #[inline]
+    fn store_frame_word(&mut self, slot: FrameSlot, word: Value) {
+        let (base, offset) = self.base_for_slot(slot);
+        self.builder
+            .ins()
+            .store(Self::trusted_mem(), word, base, offset);
+    }
+
+    fn lower_constant(&mut self, constant: TraceConstant) -> Result<Value, TracingJitError> {
+        Ok(match constant {
+            TraceConstant::Null => self.builder.ins().iconst(types::I64, TAG_NULL as i64),
+            TraceConstant::Bool(value) => self.builder.ins().iconst(
+                types::I64,
+                if value { TAG_TRUE } else { TAG_FALSE } as i64,
+            ),
+            TraceConstant::NumBits(bits) => self.builder.ins().iconst(types::I64, bits as i64),
+            TraceConstant::Int32(value) => {
+                self.builder.ins().iconst(types::I32, value as i64)
+            }
+            TraceConstant::F64Bits(bits) => self
+                .builder
+                .ins()
+                .f64const(Ieee64::with_bits(bits)),
+            TraceConstant::String(_) | TraceConstant::BuiltinClass(_) => {
+                return Err(self.error("runtime-owned constant reached native tier"));
+            }
+        })
+    }
+
+    fn normalize_to_word(&mut self, value: Value, rep: TraceRep) -> Value {
+        match rep {
+            TraceRep::Tagged | TraceRep::HeapHandle | TraceRep::RawPtr => value,
+            TraceRep::Int32 | TraceRep::Bool => self.builder.ins().uextend(types::I64, value),
+            TraceRep::F64 => self
+                .builder
+                .ins()
+                .bitcast(types::I64, Self::plain_mem(), value),
+        }
+    }
+
     fn materialize_exit_word(
         &mut self,
-        value: b3::ValueId,
+        value: Value,
         source_rep: TraceRep,
         target_rep: TraceRep,
-    ) -> Result<b3::ValueId, TracingJitError> {
+    ) -> Result<Value, TracingJitError> {
         if source_rep == target_rep {
             return Ok(self.normalize_to_word(value, source_rep));
         }
 
-        let result = match (source_rep, target_rep) {
+        Ok(match (source_rep, target_rep) {
             (TraceRep::F64, TraceRep::Tagged) => self.box_f64(value),
             (TraceRep::Int32, TraceRep::Tagged) => {
-                let number = self.builder.i2d(value);
-                self.builder.bitwise_cast(b3::Type::Int64, number)
+                let number = self.builder.ins().fcvt_from_sint(types::F64, value);
+                self.builder
+                    .ins()
+                    .bitcast(types::I64, Self::plain_mem(), number)
             }
             (TraceRep::Bool, TraceRep::Tagged) => self.box_bool(value),
             (TraceRep::HeapHandle, TraceRep::Tagged) => {
-                let tag = self.builder.const64(TAG_HEAP as i64);
-                self.builder.binary(b3::Opcode::BitOr, value, tag)
+                let tag = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
+                self.builder.ins().bor(value, tag)
             }
             (TraceRep::Int32, TraceRep::F64) => {
-                let number = self.builder.i2d(value);
-                self.builder.bitwise_cast(b3::Type::Int64, number)
+                let number = self.builder.ins().fcvt_from_sint(types::F64, value);
+                self.builder
+                    .ins()
+                    .bitcast(types::I64, Self::plain_mem(), number)
             }
-            (TraceRep::Bool, TraceRep::Int32) => self.builder.zext32(value),
+            (TraceRep::Bool, TraceRep::Int32) => self.builder.ins().uextend(types::I64, value),
             (TraceRep::Tagged, TraceRep::HeapHandle) => {
-                let payload = self.builder.const64(PAYLOAD_MASK as i64);
-                self.builder.binary(b3::Opcode::BitAnd, value, payload)
+                let payload = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, PAYLOAD_MASK as i64);
+                self.builder.ins().band(value, payload)
             }
             _ => {
-                return Err(TracingJitError::B3Lowering {
-                    trace: self.trace.id,
-                    message: format!(
-                        "cannot materialize side-exit value from {:?} to {:?}",
-                        source_rep, target_rep
-                    ),
-                })
+                return Err(self.error(format!(
+                    "cannot materialize side-exit value from {source_rep:?} to {target_rep:?}"
+                )));
             }
-        };
-        Ok(result)
+        })
     }
 
-    fn binary_compare(
-        &mut self,
-        op: CmpKind,
-        lhs: b3::ValueId,
-        rhs: b3::ValueId,
-    ) -> b3::ValueId {
-        let opcode = match op {
-            CmpKind::Eq => b3::Opcode::Equal,
-            CmpKind::Ne => b3::Opcode::NotEqual,
-            CmpKind::Lt => b3::Opcode::LessThan,
-            CmpKind::Le => b3::Opcode::LessEqual,
-            CmpKind::Gt => b3::Opcode::GreaterThan,
-            CmpKind::Ge => b3::Opcode::GreaterEqual,
-        };
-        self.builder.binary(opcode, lhs, rhs)
-    }
-
-    fn bool_not(&mut self, value: b3::ValueId) -> b3::ValueId {
-        let zero = self.builder.const32(0);
-        self.builder.binary(b3::Opcode::Equal, value, zero)
-    }
-
-    fn bool_and(&mut self, lhs: b3::ValueId, rhs: b3::ValueId) -> b3::ValueId {
-        self.builder.binary(b3::Opcode::BitAnd, lhs, rhs)
-    }
-
-    fn bool_or(&mut self, lhs: b3::ValueId, rhs: b3::ValueId) -> b3::ValueId {
-        self.builder.binary(b3::Opcode::BitOr, lhs, rhs)
-    }
-
-    fn select(
-        &mut self,
-        condition: b3::ValueId,
-        if_true: b3::ValueId,
-        if_false: b3::ValueId,
-        rep: TraceRep,
-    ) -> b3::ValueId {
-        // Branchless select using a 0/-1 mask. This avoids relying on a helper
-        // method for B3 Select and maps well to both x86-64 and AArch64.
-        match rep {
-            TraceRep::Int32 | TraceRep::Bool => {
-                let zero = self.builder.const32(0);
-                let mask = self.builder.binary(b3::Opcode::Sub, zero, condition);
-                let not_mask = {
-                    let all = self.builder.const32(-1);
-                    self.builder.binary(b3::Opcode::BitXor, mask, all)
-                };
-                let a = self.builder.binary(b3::Opcode::BitAnd, if_true, mask);
-                let b = self.builder.binary(b3::Opcode::BitAnd, if_false, not_mask);
-                self.builder.binary(b3::Opcode::BitOr, a, b)
-            }
-
-            TraceRep::Tagged | TraceRep::HeapHandle | TraceRep::RawPtr => {
-                let zero32 = self.builder.const32(0);
-                let mask32 = self.builder.binary(b3::Opcode::Sub, zero32, condition);
-                let mask = self.builder.sext32(mask32);
-                let all = self.builder.const64(-1);
-                let not_mask = self.builder.binary(b3::Opcode::BitXor, mask, all);
-                let a = self.builder.binary(b3::Opcode::BitAnd, if_true, mask);
-                let b = self.builder.binary(b3::Opcode::BitAnd, if_false, not_mask);
-                self.builder.binary(b3::Opcode::BitOr, a, b)
-            }
-
-            TraceRep::F64 => {
-                let a_bits = self.builder.bitwise_cast(b3::Type::Int64, if_true);
-                let b_bits = self.builder.bitwise_cast(b3::Type::Int64, if_false);
-                let selected = self.select(condition, a_bits, b_bits, TraceRep::Tagged);
-                self.builder.bitwise_cast(b3::Type::Double, selected)
-            }
+    #[inline]
+    fn bool32(&mut self, value: Value) -> Value {
+        let ty = self.builder.func.dfg.value_type(value);
+        if ty == types::I32 {
+            value
+        } else {
+            self.builder.ins().uextend(types::I32, value)
         }
     }
 
-    fn tagged_is_num(&mut self, bits: b3::ValueId) -> b3::ValueId {
-        let mask = self.builder.const64(TAG_MASK as i64);
-        let base = self.builder.const64(TAG_BASE as i64);
-        let masked = self.builder.binary(b3::Opcode::BitAnd, bits, mask);
-        let not_tag = self.builder.binary(b3::Opcode::NotEqual, masked, base);
+    fn bool_not(&mut self, value: Value) -> Value {
+        let equal = self.builder.ins().icmp_imm_s(IntCC::Equal, value, 0);
+        self.bool32(equal)
+    }
 
-        let heap_mask = self.builder.const64(TAG_HEAP_MASK as i64);
-        let heap_tag = self.builder.const64(TAG_HEAP as i64);
-        let heap_masked = self.builder.binary(b3::Opcode::BitAnd, bits, heap_mask);
+    fn bool_and(&mut self, lhs: Value, rhs: Value) -> Value {
+        self.builder.ins().band(lhs, rhs)
+    }
+
+    fn bool_or(&mut self, lhs: Value, rhs: Value) -> Value {
+        self.builder.ins().bor(lhs, rhs)
+    }
+
+    fn int_compare(&mut self, op: CmpKind, lhs: Value, rhs: Value) -> Value {
+        let cond = match op {
+            CmpKind::Eq => IntCC::Equal,
+            CmpKind::Ne => IntCC::NotEqual,
+            CmpKind::Lt => IntCC::SignedLessThan,
+            CmpKind::Le => IntCC::SignedLessThanOrEqual,
+            CmpKind::Gt => IntCC::SignedGreaterThan,
+            CmpKind::Ge => IntCC::SignedGreaterThanOrEqual,
+        };
+        let result = self.builder.ins().icmp(cond, lhs, rhs);
+        self.bool32(result)
+    }
+
+    fn f64_compare(&mut self, op: CmpKind, lhs: Value, rhs: Value) -> Value {
+        let cond = match op {
+            CmpKind::Eq => FloatCC::Equal,
+            CmpKind::Ne => FloatCC::NotEqual,
+            CmpKind::Lt => FloatCC::LessThan,
+            CmpKind::Le => FloatCC::LessThanOrEqual,
+            CmpKind::Gt => FloatCC::GreaterThan,
+            CmpKind::Ge => FloatCC::GreaterThanOrEqual,
+        };
+        let result = self.builder.ins().fcmp(cond, lhs, rhs);
+        self.bool32(result)
+    }
+
+    fn tagged_is_num(&mut self, bits: Value) -> Value {
+        let mask = self.builder.ins().iconst(types::I64, TAG_MASK as i64);
+        let base = self.builder.ins().iconst(types::I64, TAG_BASE as i64);
+        let masked = self.builder.ins().band(bits, mask);
+        let not_tag = self
+            .builder
+            .ins()
+            .icmp(IntCC::NotEqual, masked, base);
+        let not_tag = self.bool32(not_tag);
+
+        let heap_mask = self
+            .builder
+            .ins()
+            .iconst(types::I64, TAG_HEAP_MASK as i64);
+        let heap_tag = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
+        let heap_masked = self.builder.ins().band(bits, heap_mask);
         let not_heap = self
             .builder
-            .binary(b3::Opcode::NotEqual, heap_masked, heap_tag);
+            .ins()
+            .icmp(IntCC::NotEqual, heap_masked, heap_tag);
+        let not_heap = self.bool32(not_heap);
 
         self.bool_and(not_tag, not_heap)
     }
 
-    fn tagged_falsey(&mut self, bits: b3::ValueId) -> b3::ValueId {
-        let null = self.builder.const64(TAG_NULL as i64);
-        let false_ = self.builder.const64(TAG_FALSE as i64);
-        let is_null = self.builder.binary(b3::Opcode::Equal, bits, null);
-        let is_false = self.builder.binary(b3::Opcode::Equal, bits, false_);
+    fn tagged_falsey(&mut self, bits: Value) -> Value {
+        let null = self.builder.ins().iconst(types::I64, TAG_NULL as i64);
+        let false_ = self.builder.ins().iconst(types::I64, TAG_FALSE as i64);
+        let is_null = self.builder.ins().icmp(IntCC::Equal, bits, null);
+        let is_false = self.builder.ins().icmp(IntCC::Equal, bits, false_);
+        let is_null = self.bool32(is_null);
+        let is_false = self.bool32(is_false);
         self.bool_or(is_null, is_false)
     }
 
-    fn box_bool(&mut self, condition: b3::ValueId) -> b3::ValueId {
-        // TAG_TRUE == TAG_FALSE + 1, and comparisons produce 0/1 Int32.
-        let bit = self.builder.zext32(condition);
-        let base = self.builder.const64(TAG_FALSE as i64);
-        self.builder.binary(b3::Opcode::Add, base, bit)
+    fn box_bool(&mut self, condition: Value) -> Value {
+        let bit = self.builder.ins().uextend(types::I64, condition);
+        let base = self.builder.ins().iconst(types::I64, TAG_FALSE as i64);
+        self.builder.ins().iadd(base, bit)
     }
 
-    fn box_f64(&mut self, value: b3::ValueId) -> b3::ValueId {
-        // Wren canonicalizes NaNs before putting them in a tagged Value. Do the
-        // same without control flow:
-        //
-        //   mask = -(value != value)
-        //   result = (bits & ~mask) | (CANONICAL_NAN & mask)
-        let is_nan = self
+    fn box_f64(&mut self, value: Value) -> Value {
+        let is_nan = self.builder.ins().fcmp(FloatCC::Unordered, value, value);
+        let bits = self
             .builder
-            .binary(b3::Opcode::NotEqual, value, value);
-        let zero = self.builder.const32(0);
-        let mask32 = self.builder.binary(b3::Opcode::Sub, zero, is_nan);
-        let mask = self.builder.sext32(mask32);
-        let all = self.builder.const64(-1);
-        let not_mask = self.builder.binary(b3::Opcode::BitXor, mask, all);
-
-        let bits = self.builder.bitwise_cast(b3::Type::Int64, value);
-        let canonical = self.builder.const64(CANONICAL_NAN as i64);
-
-        let normal = self.builder.binary(b3::Opcode::BitAnd, bits, not_mask);
-        let nan = self.builder.binary(b3::Opcode::BitAnd, canonical, mask);
-        self.builder.binary(b3::Opcode::BitOr, normal, nan)
+            .ins()
+            .bitcast(types::I64, Self::plain_mem(), value);
+        let canonical = self
+            .builder
+            .ins()
+            .iconst(types::I64, CANONICAL_NAN as i64);
+        self.builder.ins().select(is_nan, canonical, bits)
     }
 
     fn guard_numeric(
         &mut self,
-        tagged: b3::ValueId,
+        tagged: Value,
         exit: SideExitId,
-    ) -> Result<b3::ValueId, TracingJitError> {
+    ) -> Result<Value, TracingJitError> {
         let ok = self.tagged_is_num(tagged);
         let failure = self.bool_not(ok);
         self.emit_side_exit(exit, failure)?;
-        Ok(self.builder.bitwise_cast(b3::Type::Double, tagged))
+        Ok(self
+            .builder
+            .ins()
+            .bitcast(types::F64, Self::plain_mem(), tagged))
     }
 
     fn guard_int32_numeric(
         &mut self,
-        tagged: b3::ValueId,
+        tagged: Value,
         exit: SideExitId,
-    ) -> Result<b3::ValueId, TracingJitError> {
+    ) -> Result<Value, TracingJitError> {
         let number = self.guard_numeric(tagged, exit)?;
-        // Do not speculate -0.0 as i32: converting it to integer and boxing it
-        // back would produce +0.0 and observably change IEEE-754 behavior.
-        let negative_zero = self.builder.const64((-0.0f64).to_bits() as i64);
-        let is_negative_zero = self.builder.binary(b3::Opcode::Equal, tagged, negative_zero);
+
+        let negative_zero = self
+            .builder
+            .ins()
+            .iconst(types::I64, (-0.0f64).to_bits() as i64);
+        let is_negative_zero = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, tagged, negative_zero);
+        let is_negative_zero = self.bool32(is_negative_zero);
         self.emit_side_exit(exit, is_negative_zero)?;
 
-        let min = self.builder.const_double(i32::MIN as f64);
-        let max = self.builder.const_double(i32::MAX as f64);
-        let ge_min = self.builder.binary(b3::Opcode::GreaterEqual, number, min);
-        let le_max = self.builder.binary(b3::Opcode::LessEqual, number, max);
+        let min = self
+            .builder
+            .ins()
+            .f64const(Ieee64::with_bits((i32::MIN as f64).to_bits()));
+        let max = self
+            .builder
+            .ins()
+            .f64const(Ieee64::with_bits((i32::MAX as f64).to_bits()));
+        let ge_min = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::GreaterThanOrEqual, number, min);
+        let le_max = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::LessThanOrEqual, number, max);
+        let ge_min = self.bool32(ge_min);
+        let le_max = self.bool32(le_max);
         let in_range = self.bool_and(ge_min, le_max);
         let failure = self.bool_not(in_range);
         self.emit_side_exit(exit, failure)?;
 
-        let i64_value = self.double_to_int64(number);
-        let back = self.builder.i2d(i64_value);
-        let exact = self.builder.binary(b3::Opcode::Equal, number, back);
+        // This conversion is non-trapping on the surviving path because the
+        // preceding ordered range checks reject NaN and out-of-range values.
+        let i64_value = self.builder.ins().fcvt_to_sint(types::I64, number);
+        let back = self
+            .builder
+            .ins()
+            .fcvt_from_sint(types::F64, i64_value);
+        let exact = self.builder.ins().fcmp(FloatCC::Equal, number, back);
+        let exact = self.bool32(exact);
         let not_exact = self.bool_not(exact);
         self.emit_side_exit(exit, not_exact)?;
-        Ok(self.builder.trunc(i64_value))
+
+        Ok(self.builder.ins().ireduce(types::I32, i64_value))
     }
 
     fn emit_side_exit(
         &mut self,
         exit_id: SideExitId,
-        failure_condition: b3::ValueId,
+        failure_condition: Value,
     ) -> Result<(), TracingJitError> {
         let plan = self
             .exit_plans
             .get(exit_id.0 as usize)
-            .ok_or_else(|| TracingJitError::B3Lowering {
-                trace: self.trace.id,
-                message: format!("unknown side exit {exit_id:?}"),
-            })?
+            .ok_or_else(|| self.error(format!("unknown side exit {exit_id:?}")))?
             .clone();
 
-        let stop = self.builder.procedure.add_block(0.01);
-        let resume = self.builder.procedure.add_block(1.0);
-        self.builder.branch(failure_condition, stop, (resume, Frequency::Normal));
-        self.builder.block = stop;
-        for (index, dynamic) in plan.dynamic_values.iter().enumerate() {
-            let source_rep = self.trace.value(dynamic.value).unwrap().rep;
+        let stop = self.builder.create_block();
+        let resume = self.builder.create_block();
+        self.builder.set_cold_block(stop);
+        let failure_condition = self.bool32(failure_condition);
+        self.builder
+            .ins()
+            .brif(failure_condition, stop, &[], resume, &[]);
+
+        self.builder.switch_to_block(stop);
+        self.materialize_side_exit(&plan)?;
+
+        self.builder.switch_to_block(resume);
+        Ok(())
+    }
+
+    fn emit_unconditional_side_exit(
+        &mut self,
+        exit_id: SideExitId,
+    ) -> Result<(), TracingJitError> {
+        let plan = self
+            .exit_plans
+            .get(exit_id.0 as usize)
+            .ok_or_else(|| self.error(format!("unknown side exit {exit_id:?}")))?
+            .clone();
+        self.materialize_side_exit(&plan)
+    }
+
+    fn materialize_side_exit(&mut self, plan: &CompiledExitPlan) -> Result<(), TracingJitError> {
+        // Preserve a cheap measure of how much useful native work this entry did.
+        // The counter stays in SSA; only cold side exits write it to activation.
+        let completed = if let Some(remaining) = self.native_budget_remaining {
+            let initial = self.builder.ins().iconst(
+                types::I64,
+                self.native_budget_initial as i64,
+            );
+            let completed = self.builder.ins().isub(initial, remaining);
+            self.builder.ins().ireduce(types::I32, completed)
+        } else {
+            self.builder.ins().iconst(types::I32, 0)
+        };
+        self.builder.ins().store(
+            Self::trusted_mem(),
+            completed,
+            self.activation,
+            offset_of!(TraceActivation, native_iterations) as i32,
+        );
+
+        // Dynamic snapshot values are already available in native SSA. Commit
+        // them directly to the architectural register banks on the cold exit path
+        // instead of bouncing through TraceActivation::exit_values and copying them
+        // again in Rust. Runtime-owned constants remain a Rust-side concern.
+        for write in &plan.writes {
+            let ExitWriteSource::Dynamic(index) = write.source else { continue; };
+            let dynamic = plan
+                .dynamic_values
+                .get(index as usize)
+                .copied()
+                .ok_or_else(|| self.error("side-exit dynamic value index out of bounds"))?;
+            let source_rep = self.value_rep(dynamic.value)?;
             let value = self.lower_value(dynamic.value)?;
             let word = self.materialize_exit_word(value, source_rep, dynamic.target_rep)?;
-            self.builder.store(word, self.activation,
-                offset_of!(TraceActivation, exit_values) as i32 + index as i32 * 8, None, None);
+            self.store_frame_word(write.slot, word);
         }
-        let id = self.builder.const32(exit_id.0 as i32);
-        self.builder.store(id, self.activation, offset_of!(TraceActivation, exit_id) as i32, None, None);
-        let result = self.builder.const32(TRACE_RESULT_SIDE_EXIT as i32);
-        self.builder.return_(Some(result));
-        self.builder.block = resume;
 
+        let id = self
+            .builder
+            .ins()
+            .iconst(types::I32, plan.id.0 as i64);
+        self.builder.ins().store(
+            Self::trusted_mem(),
+            id,
+            self.activation,
+            offset_of!(TraceActivation, exit_id) as i32,
+        );
+        let result = self
+            .builder
+            .ins()
+            .iconst(types::I32, TRACE_RESULT_SIDE_EXIT as i64);
+        self.builder.ins().return_(&[result]);
         Ok(())
     }
 
@@ -2805,82 +3097,105 @@ impl B3LoweringState<'_, '_> {
     ) -> Result<(), TracingJitError> {
         use TraceInst::*;
 
-        let trace_id = self.trace.id;
-        let one_result = move |node: &crate::wren_traceir::TraceNode| -> Result<TraceValueId, TracingJitError> {
-            if node.results.len() != 1 {
-                Err(TracingJitError::B3Lowering {
-                    trace: trace_id,
-                    message: format!("{:?} expected one result", node.id),
-                })
-            } else {
+        let one_result = |node: &crate::wren_traceir::TraceNode| -> Result<TraceValueId, TracingJitError> {
+            if node.results.len() == 1 {
                 Ok(node.results[0])
+            } else {
+                Err(TracingJitError::CraneliftLowering {
+                    trace: self.trace.id,
+                    message: format!("trace node {} expected exactly one result", node.id),
+                })
             }
-        };
-
-        let set_result = |this: &mut Self,
-                          result: TraceValueId,
-                          value: b3::ValueId| {
-            this.values.insert(result, value);
         };
 
         match &node.kind {
             Nop => {}
 
-            Runtime { location, next, terminal } => {
-                let callee = self.builder.load(b3::Type::Int64, self.activation,
-                    offset_of!(TraceActivation, execute) as i32, None, None);
-                let function = self.builder.const32(location.function.0 as i32);
-                let pc = self.builder.const32(location.pc.0 as i32);
-                let next = self.builder.const32(next.0 as i32);
-                let status = self.builder.ccall(b3::Type::Int32, callee,
-                    &[self.activation, function, pc, next], b3::Effects::for_call());
-                // Return through the normal B3 epilogue, including callee saves.
-                // Never materialize a pre-call snapshot into a changed frame.
-                let stop = self.builder.procedure.add_block(0.01);
-                let resume = self.builder.procedure.add_block(1.0);
-                if *terminal { self.builder.jump(Some(stop)); }
-                else { self.builder.branch(status, stop, (resume, Frequency::Normal)); }
-                self.builder.block = stop;
-                let result = self.builder.const32(TRACE_RESULT_RUNTIME as i32);
-                self.builder.return_(Some(result));
-                self.builder.block = resume;
+            Runtime {
+                location,
+                next,
+                terminal,
+            } => {
+                let callee = self.builder.ins().load(
+                    self.pointer_type,
+                    Self::trusted_mem(),
+                    self.activation,
+                    offset_of!(TraceActivation, execute) as i32,
+                );
+                let function = self
+                    .builder
+                    .ins()
+                    .iconst(types::I32, location.function.0 as i64);
+                let pc = self
+                    .builder
+                    .ins()
+                    .iconst(types::I32, location.pc.0 as i64);
+                let next = self.builder.ins().iconst(types::I32, next.0 as i64);
+                let call = self.builder.ins().call_indirect(
+                    self.runtime_signature,
+                    callee,
+                    &[self.activation, function, pc, next],
+                );
+                let status = self.builder.inst_results(call)[0];
+
+                let stop = self.builder.create_block();
+                let resume = self.builder.create_block();
+                self.builder.set_cold_block(stop);
+                if *terminal {
+                    self.builder.ins().jump(stop, &[]);
+                } else {
+                    self.builder.ins().brif(status, stop, &[], resume, &[]);
+                }
+
+                self.builder.switch_to_block(stop);
+                let result = self
+                    .builder
+                    .ins()
+                    .iconst(types::I32, TRACE_RESULT_RUNTIME as i64);
+                self.builder.ins().return_(&[result]);
+
+                // Keep a construction block even for terminal runtime steps. It is
+                // unreachable in that case, but lets the trace terminator close the
+                // CLIF function without appending to an already-terminated block.
+                self.builder.switch_to_block(resume);
             }
 
             Copy { value } => {
                 let result = one_result(node)?;
                 let value = self.lower_value(*value)?;
-                set_result(self, result, value);
+                self.values.insert(result, value);
             }
 
             Reinterpret { value } => {
                 let result = one_result(node)?;
-                let source_rep = self.trace.value(*value).unwrap().rep;
-                let target_rep = self.trace.value(result).unwrap().rep;
+                let source_rep = self.value_rep(*value)?;
+                let target_rep = self.value_rep(result)?;
                 let value = self.lower_value(*value)?;
                 let word = self.normalize_to_word(value, source_rep);
                 let value = match target_rep {
-                    TraceRep::Int32 | TraceRep::Bool => self.builder.trunc(word),
-                    TraceRep::F64 => self.builder.bitwise_cast(b3::Type::Double, word),
+                    TraceRep::Int32 | TraceRep::Bool => {
+                        self.builder.ins().ireduce(types::I32, word)
+                    }
+                    TraceRep::F64 => self
+                        .builder
+                        .ins()
+                        .bitcast(types::F64, Self::plain_mem(), word),
                     _ => word,
                 };
-                set_result(self, result, value);
+                self.values.insert(result, value);
             }
 
-            LoadFrameSlot { slot, .. } => {
+            LoadFrameSlot { slot } => {
                 let result = one_result(node)?;
-                let rep = self.trace.value(result).unwrap().rep;
-                let value = self.load_frame_slot(*slot, rep)?;
-                set_result(self, result, value);
+                let rep = self.value_rep(result)?;
+                let value = self.load_frame_slot(*slot, rep);
+                self.values.insert(result, value);
             }
 
-            CommitFrameSlot {
-                slot,
-                value,
-                ..
-            } => {
-                let rep = self.trace.value(*value).unwrap().rep;
-                let lowered = self.lower_value(*value)?;
-                self.store_frame_slot(*slot, lowered, rep);
+            CommitFrameSlot { slot, value } => {
+                let rep = self.value_rep(*value)?;
+                let value = self.lower_value(*value)?;
+                self.store_frame_slot(*slot, value, rep);
             }
 
             GuardTruthy { value, exit } => {
@@ -2898,27 +3213,24 @@ impl B3LoweringState<'_, '_> {
 
             GuardNotNull { value, exit } => {
                 let tagged = self.lower_value(*value)?;
-                let null = self.builder.const64(TAG_NULL as i64);
-                let failure = self.builder.binary(b3::Opcode::Equal, tagged, null);
+                let failure = self.builder.ins().icmp_imm_s(IntCC::Equal, tagged, TAG_NULL as i64);
+                let failure = self.bool32(failure);
                 self.emit_side_exit(*exit, failure)?;
-
                 if let Some(result) = node.results.first().copied() {
-                    set_result(self, result, tagged);
+                    self.values.insert(result, tagged);
                 }
             }
 
             GuardF64 { value, exit } => {
                 let tagged = self.lower_value(*value)?;
                 let raw = self.guard_numeric(tagged, *exit)?;
-                let result = one_result(node)?;
-                set_result(self, result, raw);
+                self.values.insert(one_result(node)?, raw);
             }
 
             GuardInt32 { value, exit } => {
                 let tagged = self.lower_value(*value)?;
-                let i32_value = self.guard_int32_numeric(tagged, *exit)?;
-                let result = one_result(node)?;
-                set_result(self, result, i32_value);
+                let raw = self.guard_int32_numeric(tagged, *exit)?;
+                self.values.insert(one_result(node)?, raw);
             }
 
             GuardBounds {
@@ -2928,21 +3240,30 @@ impl B3LoweringState<'_, '_> {
             } => {
                 let index = self.lower_value(*index)?;
                 let length = self.lower_value(*length)?;
-                let zero = self.builder.const32(0);
-                let negative = self
-                    .builder
-                    .binary(b3::Opcode::LessThan, index, zero);
+                let negative = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, index, 0);
                 let too_large = self
                     .builder
-                    .binary(b3::Opcode::GreaterEqual, index, length);
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, index, length);
+                let negative = self.bool32(negative);
+                let too_large = self.bool32(too_large);
                 let failure = self.bool_or(negative, too_large);
                 self.emit_side_exit(*exit, failure)?;
             }
 
             GuardEq { lhs, rhs, exit } => {
-                let lhs = self.lower_value(*lhs)?;
-                let rhs = self.lower_value(*rhs)?;
-                let equal = self.builder.binary(b3::Opcode::Equal, lhs, rhs);
+                let lhs_value = self.lower_value(*lhs)?;
+                let rhs_value = self.lower_value(*rhs)?;
+                let rep = self.value_rep(*lhs)?;
+                let equal = if rep == TraceRep::F64 {
+                    self.f64_compare(CmpKind::Eq, lhs_value, rhs_value)
+                } else {
+                    let equal = self
+                        .builder
+                        .ins()
+                        .icmp(IntCC::Equal, lhs_value, rhs_value);
+                    self.bool32(equal)
+                };
                 let failure = self.bool_not(equal);
                 self.emit_side_exit(*exit, failure)?;
             }
@@ -2953,46 +3274,31 @@ impl B3LoweringState<'_, '_> {
                 exit,
             } => {
                 let tag_value = self.lower_value(*tag)?;
+                let rep = self.value_rep(*tag)?;
+                if !matches!(rep, TraceRep::Int32 | TraceRep::Bool) {
+                    return Err(self.error("tagged Switch lowering is not enabled"));
+                }
+
                 match observed {
                     TraceSwitchGuard::Case(case) => {
-                        // First tier supports raw Int32 switch tags. Tagged source
-                        // switches are rare in optimized loop bytecode; if this is
-                        // Tagged the types won't match B3 and the verifier/lowerer
-                        // will reject the trace rather than guessing.
-                        let rep = self.trace.value(*tag).unwrap().rep;
-                        let expected = match rep {
-                            TraceRep::Int32 | TraceRep::Bool => {
-                                self.builder.const32(*case as i32)
-                            }
-                            _ => {
-                                return Err(TracingJitError::B3Lowering {
-                                    trace: self.trace.id,
-                                    message: "tagged Switch lowering is not enabled".to_owned(),
-                                })
-                            }
-                        };
-                        let equal = self
-                            .builder
-                            .binary(b3::Opcode::Equal, tag_value, expected);
+                        let equal = self.builder.ins().icmp_imm_s(
+                            IntCC::Equal,
+                            tag_value,
+                            *case,
+                        );
+                        let equal = self.bool32(equal);
                         let failure = self.bool_not(equal);
                         self.emit_side_exit(*exit, failure)?;
                     }
-
                     TraceSwitchGuard::Default { excluded } => {
-                        let rep = self.trace.value(*tag).unwrap().rep;
-                        if !matches!(rep, TraceRep::Int32 | TraceRep::Bool) {
-                            return Err(TracingJitError::B3Lowering {
-                                trace: self.trace.id,
-                                message: "tagged Switch lowering is not enabled".to_owned(),
-                            });
-                        }
-
-                        let mut matches_any = self.builder.const32(0);
+                        let mut matches_any = self.builder.ins().iconst(types::I32, 0);
                         for case in excluded {
-                            let candidate = self.builder.const32(*case as i32);
-                            let equal = self
-                                .builder
-                                .binary(b3::Opcode::Equal, tag_value, candidate);
+                            let equal = self.builder.ins().icmp_imm_s(
+                                IntCC::Equal,
+                                tag_value,
+                                *case,
+                            );
+                            let equal = self.bool32(equal);
                             matches_any = self.bool_or(matches_any, equal);
                         }
                         self.emit_side_exit(*exit, matches_any)?;
@@ -3014,82 +3320,73 @@ impl B3LoweringState<'_, '_> {
                         self.emit_side_exit(*exit, failure)?;
                     }
                     TraceType::Null => {
-                        let expected = self.builder.const64(TAG_NULL as i64);
-                        let ok = self.builder.binary(b3::Opcode::Equal, value, expected);
+                        let ok = self.builder.ins().icmp_imm_s(IntCC::Equal, value, TAG_NULL as i64);
+                        let ok = self.bool32(ok);
                         let failure = self.bool_not(ok);
                         self.emit_side_exit(*exit, failure)?;
                     }
                     TraceType::Bool => {
-                        let false_ = self.builder.const64(TAG_FALSE as i64);
-                        let true_ = self.builder.const64(TAG_TRUE as i64);
-                        let a = self.builder.binary(b3::Opcode::Equal, value, false_);
-                        let b = self.builder.binary(b3::Opcode::Equal, value, true_);
-                        let ok = self.bool_or(a, b);
+                        let false_ = self.builder.ins().icmp_imm_s(IntCC::Equal, value, TAG_FALSE as i64);
+                        let true_ = self.builder.ins().icmp_imm_s(IntCC::Equal, value, TAG_TRUE as i64);
+                        let false_ = self.bool32(false_);
+                        let true_ = self.bool32(true_);
+                        let ok = self.bool_or(false_, true_);
                         let failure = self.bool_not(ok);
                         self.emit_side_exit(*exit, failure)?;
                     }
                     _ => {
-                        return Err(TracingJitError::B3Lowering {
-                            trace: self.trace.id,
-                            message: format!("unsupported native GuardType {expected:?}"),
-                        })
+                        return Err(self.error(format!(
+                            "unsupported native GuardType {expected:?}"
+                        )));
                     }
                 }
 
                 if let Some(result) = node.results.first().copied() {
-                    set_result(self, result, value);
+                    self.values.insert(result, value);
                 }
             }
 
             IntUnary { op, value } => {
                 let value = self.lower_value(*value)?;
                 let result = match op {
-                    IntUnaryOp::Neg => {
-                        let zero = self.builder.const32(0);
-                        self.builder.binary(b3::Opcode::Sub, zero, value)
-                    }
-                    IntUnaryOp::BitNot => {
-                        let all = self.builder.const32(-1);
-                        self.builder.binary(b3::Opcode::BitXor, value, all)
-                    }
+                    IntUnaryOp::Neg => self.builder.ins().ineg(value),
+                    IntUnaryOp::BitNot => self.builder.ins().bnot(value),
                 };
-                set_result(self, one_result(node)?, result);
+                self.values.insert(one_result(node)?, result);
             }
 
             IntBinary { op, lhs, rhs } => {
                 let lhs = self.lower_value(*lhs)?;
                 let mut rhs = self.lower_value(*rhs)?;
-                let opcode = match op {
-                    IntBinOp::Add => b3::Opcode::Add,
-                    IntBinOp::Sub => b3::Opcode::Sub,
-                    IntBinOp::Mul => b3::Opcode::Mul,
-                    IntBinOp::BitAnd => b3::Opcode::BitAnd,
-                    IntBinOp::BitOr => b3::Opcode::BitOr,
-                    IntBinOp::BitXor => b3::Opcode::BitXor,
+                let result = match op {
+                    IntBinOp::Add => self.builder.ins().iadd(lhs, rhs),
+                    IntBinOp::Sub => self.builder.ins().isub(lhs, rhs),
+                    IntBinOp::Mul => self.builder.ins().imul(lhs, rhs),
+                    IntBinOp::BitAnd => self.builder.ins().band(lhs, rhs),
+                    IntBinOp::BitOr => self.builder.ins().bor(lhs, rhs),
+                    IntBinOp::BitXor => self.builder.ins().bxor(lhs, rhs),
                     IntBinOp::Shl => {
-                        let mask = self.builder.const32(31);
-                        rhs = self.builder.binary(b3::Opcode::BitAnd, rhs, mask);
-                        b3::Opcode::Shl
+                        let mask = self.builder.ins().iconst(types::I32, 31);
+                        rhs = self.builder.ins().band(rhs, mask);
+                        self.builder.ins().ishl(lhs, rhs)
                     }
                     IntBinOp::ShrU => {
-                        let mask = self.builder.const32(31);
-                        rhs = self.builder.binary(b3::Opcode::BitAnd, rhs, mask);
-                        b3::Opcode::ZShr
+                        let mask = self.builder.ins().iconst(types::I32, 31);
+                        rhs = self.builder.ins().band(rhs, mask);
+                        self.builder.ins().ushr(lhs, rhs)
                     }
                     IntBinOp::Sar => {
-                        let mask = self.builder.const32(31);
-                        rhs = self.builder.binary(b3::Opcode::BitAnd, rhs, mask);
-                        b3::Opcode::SShr
+                        let mask = self.builder.ins().iconst(types::I32, 31);
+                        rhs = self.builder.ins().band(rhs, mask);
+                        self.builder.ins().sshr(lhs, rhs)
                     }
                     IntBinOp::DivS | IntBinOp::RemS => {
-                        return Err(TracingJitError::B3Lowering {
-                            trace: self.trace.id,
-                            message: "unchecked integer division/remainder disabled".to_owned(),
-                        })
+                        return Err(self.error(
+                            "unchecked integer division/remainder disabled",
+                        ));
                     }
                 };
-                let value = self.builder.binary(opcode, lhs, rhs);
-                set_result(self, one_result(node)?, value);
+                self.values.insert(one_result(node)?, result);
             }
 
             IntBinaryChecked {
@@ -3098,89 +3395,105 @@ impl B3LoweringState<'_, '_> {
                 rhs,
                 exit,
             } => {
-                let lhs32 = self.lower_value(*lhs)?;
-                let rhs32 = self.lower_value(*rhs)?;
-
-                match op {
-                    IntBinOp::Add | IntBinOp::Sub | IntBinOp::Mul => {
-                        let lhs64 = self.builder.sext32(lhs32);
-                        let rhs64 = self.builder.sext32(rhs32);
-                        let opcode = match op {
-                            IntBinOp::Add => b3::Opcode::Add,
-                            IntBinOp::Sub => b3::Opcode::Sub,
-                            IntBinOp::Mul => b3::Opcode::Mul,
-                            _ => unreachable!(),
-                        };
-                        let wide = self.builder.binary(opcode, lhs64, rhs64);
-                        let narrow = self.builder.trunc(wide);
-                        let roundtrip = self.builder.sext32(narrow);
-                        let overflow = self
-                            .builder
-                            .binary(b3::Opcode::NotEqual, wide, roundtrip);
+                let lhs = self.lower_value(*lhs)?;
+                let rhs = self.lower_value(*rhs)?;
+                let result = match op {
+                    IntBinOp::Add => {
+                        let (result, overflow) = self.builder.ins().sadd_overflow(lhs, rhs);
                         self.emit_side_exit(*exit, overflow)?;
-                        set_result(self, one_result(node)?, narrow);
+                        result
+                    }
+                    IntBinOp::Sub => {
+                        let (result, overflow) = self.builder.ins().ssub_overflow(lhs, rhs);
+                        self.emit_side_exit(*exit, overflow)?;
+                        result
+                    }
+                    IntBinOp::Mul => {
+                        let (result, overflow) = self.builder.ins().smul_overflow(lhs, rhs);
+                        self.emit_side_exit(*exit, overflow)?;
+                        result
+                    }
+                    IntBinOp::DivS | IntBinOp::RemS => {
+                        let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, rhs, 0);
+                        let zero = self.bool32(zero);
+                        self.emit_side_exit(*exit, zero)?;
+
+                        let is_min = self.builder.ins().icmp_imm_s(
+                            IntCC::Equal,
+                            lhs,
+                            i32::MIN as i64,
+                        );
+                        let is_minus_one = self.builder.ins().icmp_imm_s(IntCC::Equal, rhs, -1);
+                        let is_min = self.bool32(is_min);
+                        let is_minus_one = self.bool32(is_minus_one);
+                        let overflow = self.bool_and(is_min, is_minus_one);
+                        self.emit_side_exit(*exit, overflow)?;
+
+                        if matches!(op, IntBinOp::DivS) {
+                            self.builder.ins().sdiv(lhs, rhs)
+                        } else {
+                            self.builder.ins().srem(lhs, rhs)
+                        }
                     }
                     _ => {
-                        return Err(TracingJitError::B3Lowering {
-                            trace: self.trace.id,
-                            message: format!(
-                                "checked {:?} is not implemented by first B3 tier",
-                                op
-                            ),
-                        })
+                        return Err(self.error(format!(
+                            "checked {op:?} is not meaningful for this integer operation"
+                        )));
                     }
-                }
+                };
+                self.values.insert(one_result(node)?, result);
             }
 
             F64Unary { op, value } => {
                 let value = self.lower_value(*value)?;
                 let result = match op {
-                    F64UnaryOp::Neg => {
-                        let minus_one = self.builder.const_double(-1.0);
-                        self.builder.binary(b3::Opcode::Mul, value, minus_one)
-                    }
+                    F64UnaryOp::Neg => self.builder.ins().fneg(value),
                 };
-                set_result(self, one_result(node)?, result);
+                self.values.insert(one_result(node)?, result);
             }
 
             F64Binary { op, lhs, rhs } => {
                 let lhs = self.lower_value(*lhs)?;
                 let rhs = self.lower_value(*rhs)?;
-                let opcode = match op {
-                    F64BinOp::Add => b3::Opcode::Add,
-                    F64BinOp::Sub => b3::Opcode::Sub,
-                    F64BinOp::Mul => b3::Opcode::Mul,
-                    F64BinOp::Div => b3::Opcode::Div,
+                let result = match op {
+                    F64BinOp::Add => self.builder.ins().fadd(lhs, rhs),
+                    F64BinOp::Sub => self.builder.ins().fsub(lhs, rhs),
+                    F64BinOp::Mul => self.builder.ins().fmul(lhs, rhs),
+                    F64BinOp::Div => self.builder.ins().fdiv(lhs, rhs),
                     F64BinOp::Rem => {
-                        return Err(TracingJitError::B3Lowering {
-                            trace: self.trace.id,
-                            message: "floating remainder helper is not enabled".to_owned(),
-                        })
+                        return Err(self.error("floating remainder helper is not enabled"));
                     }
                 };
-                let result = self.builder.binary(opcode, lhs, rhs);
-                set_result(self, one_result(node)?, result);
+                self.values.insert(one_result(node)?, result);
             }
 
-            IntCompare { op, lhs, rhs } | F64Compare { op, lhs, rhs } => {
+            IntCompare { op, lhs, rhs } => {
                 let lhs = self.lower_value(*lhs)?;
                 let rhs = self.lower_value(*rhs)?;
-                let result = self.binary_compare(*op, lhs, rhs);
-                set_result(self, one_result(node)?, result);
+                let result = self.int_compare(*op, lhs, rhs);
+                self.values.insert(one_result(node)?, result);
+            }
+
+            F64Compare { op, lhs, rhs } => {
+                let lhs = self.lower_value(*lhs)?;
+                let rhs = self.lower_value(*rhs)?;
+                let result = self.f64_compare(*op, lhs, rhs);
+                self.values.insert(one_result(node)?, result);
             }
 
             RefEq { lhs, rhs } => {
                 let lhs = self.lower_value(*lhs)?;
                 let rhs = self.lower_value(*rhs)?;
-                let result = self.builder.binary(b3::Opcode::Equal, lhs, rhs);
-                set_result(self, one_result(node)?, result);
+                let result = self.builder.ins().icmp(IntCC::Equal, lhs, rhs);
+                let result = self.bool32(result);
+                self.values.insert(one_result(node)?, result);
             }
 
             IsNull { value } => {
                 let value = self.lower_value(*value)?;
-                let null = self.builder.const64(TAG_NULL as i64);
-                let result = self.builder.binary(b3::Opcode::Equal, value, null);
-                set_result(self, one_result(node)?, result);
+                let result = self.builder.ins().icmp_imm_s(IntCC::Equal, value, TAG_NULL as i64);
+                let result = self.bool32(result);
+                self.values.insert(one_result(node)?, result);
             }
 
             Select {
@@ -3189,74 +3502,112 @@ impl B3LoweringState<'_, '_> {
                 if_false,
             } => {
                 let condition = self.lower_value(*condition)?;
-                let t = self.lower_value(*if_true)?;
-                let f = self.lower_value(*if_false)?;
-                let result_id = one_result(node)?;
-                let rep = self.trace.value(result_id).unwrap().rep;
-                let result = self.select(condition, t, f, rep);
-                set_result(self, result_id, result);
+                let if_true = self.lower_value(*if_true)?;
+                let if_false = self.lower_value(*if_false)?;
+                let result = self.builder.ins().select(condition, if_true, if_false);
+                self.values.insert(one_result(node)?, result);
             }
 
             BoxInt32 { value } => {
                 let value = self.lower_value(*value)?;
-                let double = self.builder.i2d(value);
-                let tagged = self.builder.bitwise_cast(b3::Type::Int64, double);
-                set_result(self, one_result(node)?, tagged);
+                let number = self.builder.ins().fcvt_from_sint(types::F64, value);
+                let tagged = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I64, Self::plain_mem(), number);
+                self.values.insert(one_result(node)?, tagged);
             }
 
             BoxF64 { value } => {
                 let value = self.lower_value(*value)?;
                 let tagged = self.box_f64(value);
-                set_result(self, one_result(node)?, tagged);
+                self.values.insert(one_result(node)?, tagged);
             }
 
             Int32ToF64 { value } => {
                 let value = self.lower_value(*value)?;
-                let double = self.builder.i2d(value);
-                set_result(self, one_result(node)?, double);
+                let number = self.builder.ins().fcvt_from_sint(types::F64, value);
+                self.values.insert(one_result(node)?, number);
             }
 
             F64ToInt32 { value, exit } => {
                 let number = self.lower_value(*value)?;
-                let min = self.builder.const_double(i32::MIN as f64);
-                let max = self.builder.const_double(i32::MAX as f64);
-                let ge = self.builder.binary(b3::Opcode::GreaterEqual, number, min);
-                let le = self.builder.binary(b3::Opcode::LessEqual, number, max);
+
+                let bits = self
+                    .builder
+                    .ins()
+                    .bitcast(types::I64, Self::plain_mem(), number);
+                let negative_zero = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, (-0.0f64).to_bits() as i64);
+                let is_negative_zero = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::Equal, bits, negative_zero);
+                let is_negative_zero = self.bool32(is_negative_zero);
+                self.emit_side_exit(*exit, is_negative_zero)?;
+
+                let min = self
+                    .builder
+                    .ins()
+                    .f64const(Ieee64::with_bits((i32::MIN as f64).to_bits()));
+                let max = self
+                    .builder
+                    .ins()
+                    .f64const(Ieee64::with_bits((i32::MAX as f64).to_bits()));
+                let ge = self
+                    .builder
+                    .ins()
+                    .fcmp(FloatCC::GreaterThanOrEqual, number, min);
+                let le = self
+                    .builder
+                    .ins()
+                    .fcmp(FloatCC::LessThanOrEqual, number, max);
+                let ge = self.bool32(ge);
+                let le = self.bool32(le);
                 let in_range = self.bool_and(ge, le);
                 let fail = self.bool_not(in_range);
                 self.emit_side_exit(*exit, fail)?;
 
-                let wide = self.double_to_int64(number);
-                let back = self.builder.i2d(wide);
-                let exact = self.builder.binary(b3::Opcode::Equal, number, back);
+                let wide = self.builder.ins().fcvt_to_sint(types::I64, number);
+                let back = self
+                    .builder
+                    .ins()
+                    .fcvt_from_sint(types::F64, wide);
+                let exact = self.builder.ins().fcmp(FloatCC::Equal, number, back);
+                let exact = self.bool32(exact);
                 let not_exact = self.bool_not(exact);
                 self.emit_side_exit(*exit, not_exact)?;
 
-                let result = self.builder.trunc(wide);
-                set_result(self, one_result(node)?, result);
+                let result = self.builder.ins().ireduce(types::I32, wide);
+                self.values.insert(one_result(node)?, result);
             }
 
             TaggedToHeapHandle { value, exit } => {
                 let tagged = self.lower_value(*value)?;
-                let mask = self.builder.const64(TAG_HEAP_MASK as i64);
-                let expected = self.builder.const64(TAG_HEAP as i64);
-                let masked = self.builder.binary(b3::Opcode::BitAnd, tagged, mask);
-                let is_heap = self
+                let mask = self
                     .builder
-                    .binary(b3::Opcode::Equal, masked, expected);
+                    .ins()
+                    .iconst(types::I64, TAG_HEAP_MASK as i64);
+                let expected = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
+                let masked = self.builder.ins().band(tagged, mask);
+                let is_heap = self.builder.ins().icmp(IntCC::Equal, masked, expected);
+                let is_heap = self.bool32(is_heap);
                 let fail = self.bool_not(is_heap);
                 self.emit_side_exit(*exit, fail)?;
 
-                let payload = self.builder.const64(PAYLOAD_MASK as i64);
-                let handle = self
+                let payload = self
                     .builder
-                    .binary(b3::Opcode::BitAnd, tagged, payload);
-                set_result(self, one_result(node)?, handle);
+                    .ins()
+                    .iconst(types::I64, PAYLOAD_MASK as i64);
+                let handle = self.builder.ins().band(tagged, payload);
+                self.values.insert(one_result(node)?, handle);
             }
 
             ReadBarrier { value } => {
                 let value = self.lower_value(*value)?;
-                set_result(self, one_result(node)?, value);
+                self.values.insert(one_result(node)?, value);
             }
         }
 
@@ -3264,11 +3615,11 @@ impl B3LoweringState<'_, '_> {
     }
 }
 
-fn b3_type(rep: TraceRep) -> b3::Type {
+fn clif_type(rep: TraceRep) -> Type {
     match rep {
-        TraceRep::Tagged | TraceRep::HeapHandle | TraceRep::RawPtr => b3::Type::Int64,
-        TraceRep::Int32 | TraceRep::Bool => b3::Type::Int32,
-        TraceRep::F64 => b3::Type::Double,
+        TraceRep::Tagged | TraceRep::HeapHandle | TraceRep::RawPtr => types::I64,
+        TraceRep::Int32 | TraceRep::Bool => types::I32,
+        TraceRep::F64 => types::F64,
     }
 }
 
@@ -3284,6 +3635,7 @@ struct LoopKey {
 #[derive(Clone, Debug, Default)]
 struct LoopState {
     hotness: u32,
+    retry_after: u32,
     failures: u16,
     trace: Option<TraceId>,
     blacklisted: bool,
@@ -3307,12 +3659,16 @@ pub enum JitAction {
         target: TraceLocation,
     },
     Blacklisted,
+    CoolingDown {
+        trace: TraceId,
+    },
 }
 
 pub struct TracingJit {
     options: TracingJitOptions,
+    backend: Option<CraneliftBackend>,
     loops: HashMap<LoopKey, LoopState>,
-    traces: HashMap<TraceId, CompiledTrace>,
+    traces: Vec<Option<CompiledTrace>>,
     next_trace_id: u32,
     stats: TracingJitStats,
 }
@@ -3321,6 +3677,11 @@ impl Default for TracingJit {
     fn default() -> Self {
         Self::new(TracingJitOptions::default())
     }
+}
+
+#[inline]
+fn jit_events_enabled() -> bool {
+    std::env::var_os("WREN_JIT_EVENTS").is_some()
 }
 
 impl TracingJit {
@@ -3345,8 +3706,8 @@ impl TracingJit {
             },
         }
         let trace = builder.finish().map_err(TracingJitError::TraceVerification)?;
-        let compiled = B3TraceCompiler::new(&trace, &self.options)?.compile()?;
-        self.traces.insert(TraceId(0), compiled);
+        let compiled = self.compile_trace(&trace)?;
+        self.insert_compiled(TraceId(0), compiled);
         self.enter_compiled(runtime, TraceId(0))?;
         Ok(())
     }
@@ -3354,8 +3715,9 @@ impl TracingJit {
     pub fn new(options: TracingJitOptions) -> Self {
         Self {
             options,
+            backend: None,
             loops: HashMap::new(),
-            traces: HashMap::new(),
+            traces: Vec::new(),
             next_trace_id: 0,
             stats: TracingJitStats::default(),
         }
@@ -3369,14 +3731,47 @@ impl TracingJit {
         &self.stats
     }
 
+    #[inline]
+    fn compiled(&self, id: TraceId) -> Option<&CompiledTrace> {
+        self.traces.get(id.0 as usize).and_then(Option::as_ref)
+    }
+
+    #[inline]
+    fn compiled_mut(&mut self, id: TraceId) -> Option<&mut CompiledTrace> {
+        self.traces.get_mut(id.0 as usize).and_then(Option::as_mut)
+    }
+
+    fn insert_compiled(&mut self, id: TraceId, compiled: CompiledTrace) {
+        let index = id.0 as usize;
+        if self.traces.len() <= index {
+            self.traces.resize_with(index + 1, || None);
+        }
+        self.traces[index] = Some(compiled);
+    }
+
+    fn compile_trace(&mut self, trace: &Trace) -> Result<CompiledTrace, TracingJitError> {
+        let options = self.options.clone();
+        if self.backend.is_none() {
+            let backend = CraneliftBackend::new(&options).map_err(|message| {
+                TracingJitError::CraneliftLowering {
+                    trace: trace.id,
+                    message,
+                }
+            })?;
+            self.backend = Some(backend);
+        }
+
+        let compiler = CraneliftTraceCompiler::new(trace, &options)?;
+        compiler.compile(&mut self.backend.as_mut().unwrap().module)
+    }
+
     pub fn trace(&self, id: TraceId) -> Option<&Trace> {
-        self.traces.get(&id).map(|compiled| &compiled.trace)
+        self.compiled(id).map(|compiled| &compiled.trace)
     }
 
     pub fn disassembly(&self, id: TraceId) -> Option<String> {
-        self.traces
-            .get(&id)
-            .map(|compiled| compiled.compilation.disassembly())
+        self.compiled(id)
+            .and_then(|compiled| compiled.debug_text.clone())
     }
 
     /// Called when baseline execution arrives at a known loop header.
@@ -3403,7 +3798,7 @@ impl TracingJit {
         }
 
         state.hotness = state.hotness.saturating_add(1);
-        if state.hotness < self.options.hot_loop_threshold {
+        if state.hotness < self.options.hot_loop_threshold.max(state.retry_after) {
             return Ok(JitAction::Interpreted);
         }
 
@@ -3417,7 +3812,22 @@ impl TracingJit {
             Err(RecordOutcome::Abort(reason)) => {
                 self.stats.last_abort = Some(reason.to_string());
                 self.stats.recordings_aborted += 1;
+                if jit_events_enabled() {
+                    eprintln!(
+                        "[wren-jit] record abort {:?}:{}: {}",
+                        location.function, location.pc.0, reason
+                    );
+                }
                 let state = self.loops.get_mut(&key).unwrap();
+                if matches!(reason, RecordingAbort::EnclosingLoop) {
+                    // This path may be short only for the current invocation
+                    // (e.g. Mandelbrot's early pixels). Retry less often, but do
+                    // not permanently disable a loop that can become hot later.
+                    state.retry_after = self.options.hot_loop_threshold.max(state.retry_after)
+                        .max(1).saturating_mul(2).min(4096);
+                    state.hotness = 0;
+                    return Ok(JitAction::RecordingAborted { reason: reason.to_string() });
+                }
                 state.failures = state.failures.saturating_add(1);
                 // Back off instead of trying to record every iteration.
                 state.hotness = self.options.hot_loop_threshold / 2;
@@ -3440,12 +3850,16 @@ impl TracingJit {
         self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
         self.stats.eliminated_trace_copies += trace.stats.eliminated_copies as u64;
 
-        let compiled = match B3TraceCompiler::new(&trace, &self.options)
-            .and_then(B3TraceCompiler::compile)
-        {
+        let compiled = match self.compile_trace(&trace) {
             Ok(compiled) => compiled,
             Err(error) => {
                 self.stats.last_abort = Some(error.to_string());
+                if jit_events_enabled() {
+                    eprintln!(
+                        "[wren-jit] compile abort {:?}:{}: {}",
+                        location.function, location.pc.0, error
+                    );
+                }
                 // A trace-tier lowering failure is not a language/runtime error.
                 // Baseline execution remains authoritative, so back off and let
                 // the interpreter continue.
@@ -3464,7 +3878,19 @@ impl TracingJit {
 
         self.stats.traces_compiled += 1;
         self.loops.get_mut(&key).unwrap().trace = Some(trace_id);
-        self.traces.insert(trace_id, compiled);
+        self.insert_compiled(trace_id, compiled);
+        if jit_events_enabled() {
+            eprintln!(
+                "[wren-jit] compiled {:?} at {:?}:{} (bytecodes={}, nodes={}, exits={}, phis={})",
+                trace_id,
+                location.function,
+                location.pc.0,
+                trace.stats.recorded_bytecodes,
+                trace.nodes.len(),
+                trace.exits.len(),
+                trace.loop_phis.len(),
+            );
+        }
 
         // Recording one iteration ended at the same root header.
         if runtime.trace_current_location() == location {
@@ -3472,6 +3898,18 @@ impl TracingJit {
         } else {
             Ok(JitAction::Compiled { trace: trace_id })
         }
+    }
+
+    /// Enter an already compiled trace by dense TraceId. The interpreter caches
+    /// this ID beside the prepared loop header, bypassing the loop-state HashMap
+    /// after tiering has succeeded.
+    #[inline]
+    pub(crate) fn enter_trace<R: TraceRuntime>(
+        &mut self,
+        runtime: &mut R,
+        trace: TraceId,
+    ) -> Result<JitAction, TracingJitError> {
+        self.enter_compiled(runtime, trace)
     }
 
     /// Convenience hook for a baseline backward jump.
@@ -3516,21 +3954,17 @@ impl TracingJit {
 
         let mut activation = TraceActivation::new(inputs);
 
-        // Keep the Compilation object alive in `self.traces` for the entire call.
-        let (entry, result) = {
-            let compiled = self
-                .traces
-                .get(&trace_id)
-                .ok_or_else(|| TracingJitError::B3Lowering {
-                    trace: trace_id,
-                    message: "compiled trace disappeared".to_owned(),
-                })?;
-            let entry = compiled.entry;
-            self.stats.native_entries += 1;
-            let result = unsafe { entry(&mut activation) };
-            (entry, result)
-        };
-        let _ = entry;
+        // Keep the owning JITModule alive in `self.backend` for the entire call.
+        // Trace IDs are dense and index a Vec, so a hot entry does not hash.
+        let entry = self
+            .compiled(trace_id)
+            .ok_or_else(|| TracingJitError::CraneliftLowering {
+                trace: trace_id,
+                message: "compiled trace disappeared".to_owned(),
+            })?
+            .entry;
+        self.stats.native_entries = self.stats.native_entries.saturating_add(1);
+        let result = unsafe { entry(&mut activation) };
 
         match result {
             TRACE_RESULT_SIDE_EXIT => {
@@ -3556,12 +3990,24 @@ impl TracingJit {
         trace_id: TraceId,
         activation: &TraceActivation,
     ) -> Result<JitAction, TracingJitError> {
-        let exit_index = activation.exit_id as usize;
+        const MIN_PROFITABLE_NATIVE_ITERATIONS: u32 = 8;
 
-        let (plan, target) = {
+        let exit_index = activation.exit_id as usize;
+        let cooldown_threshold = self
+            .options
+            .hot_side_exit_threshold
+            .max(1)
+            .min(u16::MAX as u32) as u16;
+        let budget_tracking = self.options.native_loop_iteration_budget != 0;
+
+        // Update mutable exit accounting first, but do not clone the exit plan.
+        // The old implementation cloned two Vecs on every side exit. A nested
+        // numeric loop such as Mandelbrot can exit hundreds of thousands of times,
+        // turning a cold-path metadata operation into allocator traffic on the hot
+        // path. Keep only Copy metadata here and borrow the plan below.
+        let (plan_id, target, watchdog_anchor, cooldown) = {
             let compiled = self
-                .traces
-                .get_mut(&trace_id)
+                .compiled_mut(trace_id)
                 .ok_or_else(|| TracingJitError::InvalidSideExit {
                     trace: trace_id,
                     exit: activation.exit_id,
@@ -3570,57 +4016,112 @@ impl TracingJit {
             let plan = compiled
                 .exits
                 .get(exit_index)
-                .cloned()
                 .ok_or_else(|| TracingJitError::InvalidSideExit {
                     trace: trace_id,
                     exit: activation.exit_id,
                 })?;
+            let plan_id = plan.id;
+            let target = plan.target;
 
             if let Some(hit) = compiled.exit_hits.get_mut(exit_index) {
                 *hit = hit.saturating_add(1);
             }
 
-            let target = plan.target;
-            (plan, target)
+            let watchdog_anchor = (compiled.trace.native_budget_exit == Some(plan_id))
+                .then_some(compiled.trace.anchor.location);
+
+            // Native entry has a fixed transition cost. Repeatedly entering a trace
+            // for only a handful of iterations is slower than baseline even when the
+            // generated machine code is good. This matters for inner Mandelbrot
+            // loops, which may be entered once per pixel and escape very quickly.
+            let unprofitable_exit = budget_tracking
+                && watchdog_anchor.is_none()
+                && matches!(target, ExitTarget::Interpreter(_))
+                && activation.native_iterations < MIN_PROFITABLE_NATIVE_ITERATIONS;
+            if unprofitable_exit {
+                compiled.short_exit_streak = compiled.short_exit_streak.saturating_add(1);
+            } else {
+                compiled.short_exit_streak = 0;
+            }
+            let cooldown = compiled.short_exit_streak >= cooldown_threshold;
+            if cooldown {
+                compiled.short_exit_streak = 0;
+            }
+
+            (plan_id, target, watchdog_anchor, cooldown)
         };
 
-        for write in &plan.writes {
-            let value = match write.source {
-                ExitWriteSource::Constant(constant) => runtime
+        self.stats.native_iterations = self
+            .stats
+            .native_iterations
+            .saturating_add(activation.native_iterations as u64);
+        if budget_tracking
+            && activation.native_iterations < MIN_PROFITABLE_NATIVE_ITERATIONS
+            && watchdog_anchor.is_none()
+        {
+            self.stats.short_native_exits = self.stats.short_native_exits.saturating_add(1);
+        }
+
+        // Borrow the plan in place. No Vec clone, no heap allocation, no temporary
+        // ownership transfer on the side-exit path.
+        {
+            let compiled = self
+                .compiled(trace_id)
+                .ok_or_else(|| TracingJitError::InvalidSideExit {
+                    trace: trace_id,
+                    exit: activation.exit_id,
+                })?;
+            let plan = compiled
+                .exits
+                .get(exit_index)
+                .ok_or_else(|| TracingJitError::InvalidSideExit {
+                    trace: trace_id,
+                    exit: activation.exit_id,
+                })?;
+
+            for write in &plan.writes {
+                let ExitWriteSource::Constant(constant) = write.source else {
+                    // Dynamic values were committed directly by the native cold
+                    // exit block. Avoid a second copy through Rust.
+                    continue;
+                };
+                let value = runtime
                     .trace_materialize_constant(constant)
-                    .map_err(runtime_error)?,
+                    .map_err(runtime_error)?;
+                runtime
+                    .trace_write_slot(write.slot, value)
+                    .map_err(runtime_error)?;
+            }
+        }
 
-                ExitWriteSource::Dynamic(index) => {
-                    let raw = unsafe { activation.exit_values[index as usize].assume_init() };
-                    RegisterWord(raw)
-                }
-            };
-
-            runtime
-                .trace_write_slot(write.slot, value)
-                .map_err(runtime_error)?;
+        if watchdog_anchor.is_some() {
+            self.stats.native_budget_exits = self.stats.native_budget_exits.saturating_add(1);
+        }
+        if cooldown {
+            self.stats.trace_cooldowns = self.stats.trace_cooldowns.saturating_add(1);
         }
 
         match target {
             ExitTarget::Interpreter(location) => {
                 runtime.trace_set_location(location).map_err(runtime_error)?;
 
-                Ok(JitAction::SideExit {
-                    trace: trace_id,
-                    exit: plan.id,
-                    target: location,
-                })
+                if cooldown {
+                    Ok(JitAction::CoolingDown { trace: trace_id })
+                } else {
+                    Ok(JitAction::SideExit {
+                        trace: trace_id,
+                        exit: plan_id,
+                        target: location,
+                    })
+                }
             }
 
             ExitTarget::Trace(child) => {
-                // Manager-level stitching: until direct machine-code patching is
-                // installed, chain without returning to the interpreter dispatch
-                // loop. The child trace still uses the same architectural frame.
-                self.stats.stitched_exits += 1;
+                self.stats.stitched_exits = self.stats.stitched_exits.saturating_add(1);
                 self.enter_compiled(runtime, child)
             }
 
-            ExitTarget::Return => Err(TracingJitError::B3Lowering {
+            ExitTarget::Return => Err(TracingJitError::CraneliftLowering {
                 trace: trace_id,
                 message: "side-exit Return target is not enabled".to_owned(),
             }),
@@ -3630,7 +4131,7 @@ impl TracingJit {
     /// Link a side exit to an already compiled child trace.
     ///
     /// This performs dispatch-free manager-level stitching immediately. A future
-    /// B3 late-link patch can turn the same metadata relation into a direct
+    /// Cranelift late-link trampoline can turn the same metadata relation into a direct
     /// machine-code jump without changing Trace IR.
     pub fn stitch(
         &mut self,
@@ -3638,20 +4139,26 @@ impl TracingJit {
         exit: SideExitId,
         child: TraceId,
     ) -> Result<(), TracingJitError> {
-        if !self.traces.contains_key(&child) {
-            return Err(TracingJitError::B3Lowering {
+        if self.compiled(child).is_none() {
+            return Err(TracingJitError::CraneliftLowering {
                 trace: parent,
                 message: format!("cannot stitch to unknown child {child:?}"),
             });
         }
 
         let parent_trace = self
-            .traces
-            .get_mut(&parent)
-            .ok_or_else(|| TracingJitError::B3Lowering {
+            .compiled_mut(parent)
+            .ok_or_else(|| TracingJitError::CraneliftLowering {
                 trace: parent,
                 message: "unknown parent trace".to_owned(),
             })?;
+
+        if parent_trace.trace.native_budget_exit == Some(exit) {
+            return Err(TracingJitError::CraneliftLowering {
+                trace: parent,
+                message: "native watchdog exits cannot be stitched to child traces".to_owned(),
+            });
+        }
 
         let plan = parent_trace
             .exits
@@ -3671,8 +4178,7 @@ impl TracingJit {
     }
 
     pub fn exit_hits(&self, trace: TraceId, exit: SideExitId) -> Option<u32> {
-        self.traces
-            .get(&trace)?
+        self.compiled(trace)?
             .exit_hits
             .get(exit.0 as usize)
             .copied()
@@ -3683,6 +4189,12 @@ impl TracingJit {
         trace: TraceId,
         exit: SideExitId,
     ) -> bool {
+        if self
+            .compiled(trace)
+            .is_some_and(|compiled| compiled.trace.native_budget_exit == Some(exit))
+        {
+            return false;
+        }
         self.exit_hits(trace, exit)
             .is_some_and(|hits| hits >= self.options.hot_side_exit_threshold)
     }
@@ -3738,4 +4250,42 @@ mod tests {
     fn activation_exit_buffer_is_large_enough_for_vm_register_file() {
         assert!(MAX_TRACE_EXIT_VALUES > 256 + 16 + 2 + 12);
     }
+
+    #[test]
+    fn trace_activation_stays_small() {
+        // Side exits commit dynamic values directly to architectural register
+        // banks. Reintroducing a large per-entry scratch buffer here would make
+        // short/nested loops pathologically expensive again.
+        assert!(std::mem::size_of::<TraceActivation>() <= 128);
+    }
+
+    #[test]
+    fn loop_phi_representation_conflict_aborts_recording() {
+        let options = TracingJitOptions::default();
+        let anchor = TraceLocation::new(FuncId(0), BytecodePc(10));
+        let recorder = TraceRecorder::new(&options, TraceId(0), anchor);
+        let mut builder = crate::wren_traceir::TraceBuilder::new(
+            TraceId(0),
+            TraceAnchor { kind: TraceKind::Loop, location: anchor },
+        );
+        let slot = FrameSlot::General(Reg(0));
+        let _initial = builder.read_slot(slot, TraceType::Num, TraceRep::Tagged);
+        let raw = builder.constant(TraceConstant::Int32(1));
+        builder.write_slot(slot, raw);
+
+        let result = recorder.install_loop_phis(&mut builder);
+        assert!(matches!(result, Err(RecordingAbort::RepresentationConflict)));
+    }
+
+    #[test]
+    fn default_native_loop_budget_is_finite_and_can_be_disabled() {
+        let default = TracingJitOptions::default();
+        assert!(default.native_loop_iteration_budget > 0);
+        let disabled = TracingJitOptions {
+            native_loop_iteration_budget: 0,
+            ..default
+        };
+        assert_eq!(disabled.native_loop_iteration_budget, 0);
+    }
+
 }

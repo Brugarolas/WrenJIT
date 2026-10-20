@@ -179,7 +179,11 @@ pub struct TraceStats {
 #[derive(Clone, Debug)]
 pub struct Trace {
     pub id: TraceId, pub anchor: TraceAnchor, pub values: Vec<TraceValue>, pub nodes: Vec<TraceNode>,
-    pub exits: Vec<SideExit>, pub loop_phis: Vec<LoopPhi>, pub terminator: TraceTerminator, pub stats: TraceStats,
+    pub exits: Vec<SideExit>, pub loop_phis: Vec<LoopPhi>,
+    /// Synthetic side exit used by the native-loop execution budget. It resumes
+    /// at the trace anchor with the end-of-iteration architectural state.
+    pub native_budget_exit: Option<SideExitId>,
+    pub terminator: TraceTerminator, pub stats: TraceStats,
 }
 impl Trace {
     pub fn value(&self, v: TraceValueId) -> Option<&TraceValue> { self.values.get(v.0 as usize) }
@@ -203,7 +207,7 @@ pub struct TraceBuilder {
 impl TraceBuilder {
     pub fn new(id: TraceId, anchor: TraceAnchor) -> Self {
         Self { source: anchor.location, trace: Trace { id, anchor, values: vec![], nodes: vec![], exits: vec![],
-            loop_phis: vec![], terminator: TraceTerminator::Unreachable, stats: TraceStats::default() },
+            loop_phis: vec![], native_budget_exit: None, terminator: TraceTerminator::Unreachable, stats: TraceStats::default() },
             slots: HashMap::new(), dirty: vec![], memory_epoch: false }
     }
     pub fn trace(&self) -> &Trace { &self.trace }
@@ -253,6 +257,39 @@ impl TraceBuilder {
         self.trace.exits.push(SideExit { id, target: ExitTarget::Interpreter(TraceLocation::new(self.source.function, pc)),
             frames: vec![FrameSnapshot { disposition: FrameDisposition::Existing { depth_from_top: 0 }, writes }], linked_trace: None }); id
     }
+    /// Install a watchdog exit at the logical loop header. The snapshot is taken
+    /// after recording the iteration, so it contains exactly the values that a
+    /// normal interpreter backedge would expose at the next header execution.
+    pub fn add_native_budget_exit(&mut self, pc: BytecodePc) -> SideExitId {
+        let writes = self.dirty.iter().map(|slot| {
+            let value = self.slots[slot];
+            let rep = self.trace.value(value).unwrap().rep;
+            let kind = match rep {
+                TraceRep::Int32 | TraceRep::Bool => RegisterKind::Int32,
+                TraceRep::F64 => RegisterKind::F64,
+                _ => RegisterKind::Value,
+            };
+            SnapshotWrite {
+                slot: *slot,
+                kind,
+                target_rep: rep,
+                value: SnapshotValue::Value(value),
+            }
+        }).collect();
+
+        let id = SideExitId(self.trace.exits.len() as u32);
+        self.trace.exits.push(SideExit {
+            id,
+            target: ExitTarget::Interpreter(TraceLocation::new(self.source.function, pc)),
+            frames: vec![FrameSnapshot {
+                disposition: FrameDisposition::Existing { depth_from_top: 0 },
+                writes,
+            }],
+            linked_trace: None,
+        });
+        self.trace.native_budget_exit = Some(id);
+        id
+    }
     pub fn add_loop_phi(&mut self, slot: FrameSlot, initial: TraceValueId, ty: TraceType, rep: TraceRep) -> TraceValueId {
         let value = self.value(ty, rep, TraceValueOrigin::LoopPhi { slot });
         self.trace.loop_phis.push(LoopPhi { value, initial, backedge: None, rep, entry_exit: None }); value
@@ -285,7 +322,7 @@ impl TraceBuilder {
     }
     /// Loops containing runtime calls reload entry registers on every iteration.
     /// This also prevents a value collected or changed by a helper from becoming
-    /// a loop invariant in B3.
+    /// a native-loop invariant in the JIT backend.
     pub fn prepare_memory_loop(&mut self) {
         self.commit();
         let mut prefix = vec![];
@@ -392,6 +429,12 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
             check_exit(exit, &available, &mut errors);
         }
     }
+    if let Some(id) = t.native_budget_exit {
+        check_exit(id, &available, &mut errors);
+        if !matches!(t.terminator, TraceTerminator::LoopBack) {
+            errors.push("native budget exit is only valid for loop-back traces".into());
+        }
+    }
     match t.terminator {
         TraceTerminator::Exit(id) => check_exit(id, &available, &mut errors),
         TraceTerminator::Unreachable => errors.push("missing terminator".into()),
@@ -400,7 +443,7 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
     if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
-/// Wren-specific trace canonicalization performed before the generic B3 pipeline.
+/// Wren-specific trace canonicalization performed before native Cranelift lowering.
 ///
 /// The highest-value transformation is representation promotion for loop-carried
 /// Wren numbers:
@@ -422,7 +465,27 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
 pub struct TraceOptimizer;
 
 impl TraceOptimizer {
+    /// Full optimizer, including loop-carried representation promotion.
+    /// Retained for backends that have validated raw F64/Int32 loop phis.
     pub fn optimize(&self, trace: &mut Trace) -> Result<(), Vec<String>> {
+        self.optimize_impl(trace, true)
+    }
+
+    /// Conservative optimizer used by the Cranelift stabilization tier.
+    ///
+    /// Loop-carried values remain in their architectural representation across
+    /// the backedge. Arithmetic still unboxes to native F64/Int32 inside the
+    /// iteration, but the loop block itself does not change a Tagged register
+    /// into a raw native block parameter.
+    pub fn optimize_conservative(&self, trace: &mut Trace) -> Result<(), Vec<String>> {
+        self.optimize_impl(trace, false)
+    }
+
+    fn optimize_impl(
+        &self,
+        trace: &mut Trace,
+        promote_loop_representations: bool,
+    ) -> Result<(), Vec<String>> {
         verify_trace(trace)?;
 
         // Runtime calls are synchronization boundaries. Representation promotion
@@ -432,7 +495,9 @@ impl TraceOptimizer {
         self.cancel_box_guard_pairs(trace);
         if !has_runtime {
             self.hoist_invariant_numeric_guards(trace);
-            self.promote_loop_representations(trace);
+            if promote_loop_representations {
+                self.promote_loop_representations(trace);
+            }
             self.cancel_box_guard_pairs(trace);
         }
         self.remove_trivial_copies(trace);
@@ -783,8 +848,8 @@ impl TraceOptimizer {
     }
 
     fn canonicalize_references(&self, trace: &mut Trace) {
-        // Snapshot references are particularly important because the B3 slow-path
-        // generator lowers them out-of-line after the main loop is built.
+        // Snapshot references are particularly important because Cranelift side-exit
+        // blocks materialize them out-of-line from the hot loop.
         let aliases: Vec<_> = (0..trace.values.len())
             .map(|index| {
                 let id = TraceValueId(index as u32);
@@ -904,4 +969,117 @@ mod optimizer_tests {
         assert_eq!(trace.canonical_value(trace.loop_phis[0].backedge.unwrap()), next);
         assert!(trace.stats.promoted_i32_loop_phis >= 1);
     }
+
+    #[test]
+    fn native_budget_exit_snapshots_end_of_iteration_state() {
+        let anchor = TraceLocation::new(FuncId(0), BytecodePc(30));
+        let mut builder = TraceBuilder::new(
+            TraceId(2),
+            TraceAnchor { kind: TraceKind::Loop, location: anchor },
+        );
+        let slot = FrameSlot::General(Reg(2));
+        let initial = builder.read_slot(slot, TraceType::Num, TraceRep::Tagged);
+        let one = builder.constant(TraceConstant::NumBits(1.0f64.to_bits()));
+        builder.write_slot(slot, one);
+        let phi = builder.add_loop_phi(slot, initial, TraceType::Num, TraceRep::Tagged);
+        builder.set_loop_backedge(phi, one).unwrap();
+        let exit = builder.add_native_budget_exit(anchor.pc);
+        builder.set_terminator(TraceTerminator::LoopBack);
+
+        let trace = builder.finish().unwrap();
+        assert_eq!(trace.native_budget_exit, Some(exit));
+        let write = trace.exits[exit.0 as usize].frames[0]
+            .writes
+            .iter()
+            .find(|write| write.slot == slot)
+            .expect("watchdog exit must reconstruct the dirty loop slot");
+        assert_eq!(write.value, SnapshotValue::Value(one));
+        assert_eq!(write.target_rep, TraceRep::Tagged);
+    }
+
+
+    #[test]
+    fn numeric_phi_promotion_keeps_watchdog_snapshot_deoptimizable() {
+        let anchor = TraceLocation::new(FuncId(0), BytecodePc(40));
+        let mut builder = TraceBuilder::new(
+            TraceId(3),
+            TraceAnchor { kind: TraceKind::Loop, location: anchor },
+        );
+        let slot = FrameSlot::General(Reg(3));
+        let initial = builder.read_slot(slot, TraceType::Num, TraceRep::Tagged);
+        let phi = builder.add_loop_phi(slot, initial, TraceType::Num, TraceRep::Tagged);
+        let guard_exit = builder.add_side_exit(ExitReason::GuardNumber, anchor.pc);
+        let raw = builder.emit1(
+            TraceInst::GuardF64 { value: phi, exit: guard_exit },
+            TraceType::F64,
+            TraceRep::F64,
+        );
+        let one = builder.constant(TraceConstant::F64Bits(1.0f64.to_bits()));
+        let next = builder.emit1(
+            TraceInst::F64Binary { op: F64BinOp::Add, lhs: raw, rhs: one },
+            TraceType::F64,
+            TraceRep::F64,
+        );
+        let boxed = builder.emit1(
+            TraceInst::BoxF64 { value: next },
+            TraceType::Num,
+            TraceRep::Tagged,
+        );
+        builder.write_slot(slot, boxed);
+        builder.set_loop_backedge(phi, boxed).unwrap();
+        let budget_exit = builder.add_native_budget_exit(anchor.pc);
+        builder.set_terminator(TraceTerminator::LoopBack);
+
+        let mut trace = builder.finish().unwrap();
+        TraceOptimizer::default().optimize(&mut trace).unwrap();
+
+        let write = trace.exits[budget_exit.0 as usize].frames[0]
+            .writes
+            .iter()
+            .find(|write| write.slot == slot)
+            .expect("watchdog snapshot must keep the promoted loop value");
+        assert_eq!(write.value, SnapshotValue::Value(next));
+        assert_eq!(write.target_rep, TraceRep::Tagged);
+    }
+
+    #[test]
+    fn conservative_optimizer_keeps_tagged_loop_phi() {
+        let anchor = TraceLocation::new(FuncId(0), BytecodePc(50));
+        let mut builder = TraceBuilder::new(
+            TraceId(4),
+            TraceAnchor { kind: TraceKind::Loop, location: anchor },
+        );
+        let slot = FrameSlot::General(Reg(4));
+        let initial = builder.read_slot(slot, TraceType::Num, TraceRep::Tagged);
+        let phi = builder.add_loop_phi(slot, initial, TraceType::Num, TraceRep::Tagged);
+        let guard_exit = builder.add_side_exit(ExitReason::GuardNumber, anchor.pc);
+        let raw = builder.emit1(
+            TraceInst::GuardF64 { value: phi, exit: guard_exit },
+            TraceType::F64,
+            TraceRep::F64,
+        );
+        let one = builder.constant(TraceConstant::F64Bits(1.0f64.to_bits()));
+        let next = builder.emit1(
+            TraceInst::F64Binary { op: F64BinOp::Add, lhs: raw, rhs: one },
+            TraceType::F64,
+            TraceRep::F64,
+        );
+        let boxed = builder.emit1(
+            TraceInst::BoxF64 { value: next },
+            TraceType::Num,
+            TraceRep::Tagged,
+        );
+        builder.write_slot(slot, boxed);
+        builder.set_loop_backedge(phi, boxed).unwrap();
+        builder.set_terminator(TraceTerminator::LoopBack);
+
+        let mut trace = builder.finish().unwrap();
+        TraceOptimizer::default().optimize_conservative(&mut trace).unwrap();
+
+        assert_eq!(trace.loop_phis[0].rep, TraceRep::Tagged);
+        assert!(trace.loop_phis[0].entry_exit.is_none());
+        assert_eq!(trace.value(phi).unwrap().rep, TraceRep::Tagged);
+        assert_eq!(trace.stats.promoted_f64_loop_phis, 0);
+    }
+
 }

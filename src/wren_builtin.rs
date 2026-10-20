@@ -5,7 +5,7 @@
 //! owns the method/primitive manifest and the native implementations.
 
 use crate::wren_interpreter::{
-    BuiltinClass, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
+    num_to_u32, BuiltinClass, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
 use crate::wren_ir::{BuiltinId, MethodKind, MethodSymbol, PrimitiveId, Program};
 
@@ -428,12 +428,19 @@ impl Host for BuiltinHost {
                 | (Some(NumSub), "-", 1)
                 | (Some(NumMul), "*", 1)
                 | (Some(NumDiv), "/", 1)
+                | (Some(NumMod), "%", 1)
                 | (Some(NumLt), "<", 1)
                 | (Some(NumLe), "<=", 1)
                 | (Some(NumGt), ">", 1)
                 | (Some(NumGe), ">=", 1)
                 | (Some(NumEq), "==", 1)
                 | (Some(NumNe), "!=", 1)
+                | (Some(NumBitNot), "~", 0)
+                | (Some(NumBitAnd), "&", 1)
+                | (Some(NumBitOr), "|", 1)
+                | (Some(NumBitXor), "^", 1)
+                | (Some(NumShl), "<<", 1)
+                | (Some(NumShr), ">>", 1)
         )
     }
 
@@ -473,6 +480,11 @@ fn integer(value: Value, what: &str) -> Result<i64, RuntimeError> {
         return Err(RuntimeError::new(format!("{what} must be an integer")));
     }
     Ok(n as i64)
+}
+
+#[inline]
+fn bitwise_operand(value: Value, what: &str) -> Result<u32, RuntimeError> {
+    Ok(num_to_u32(num(value, what)?))
 }
 
 fn normalized_index(index: i64, len: usize) -> Result<usize, RuntimeError> {
@@ -516,12 +528,12 @@ fn execute_primitive(
         NumEq => Ok(Value::from_bool(argument(args, 0)?.as_num().is_some_and(|rhs| num(this, "receiver").unwrap() == rhs))),
         NumNe => Ok(Value::from_bool(!argument(args, 0)?.as_num().is_some_and(|rhs| num(this, "receiver").unwrap() == rhs))),
         NumNeg => Ok(Value::from_num(-num(this, "receiver")?)),
-        NumBitNot => Ok(Value::from_num((!integer(this, "receiver")?) as f64)),
-        NumBitAnd => Ok(Value::from_num((integer(this, "receiver")? & integer(argument(args, 0)?, "argument")?) as f64)),
-        NumBitOr => Ok(Value::from_num((integer(this, "receiver")? | integer(argument(args, 0)?, "argument")?) as f64)),
-        NumBitXor => Ok(Value::from_num((integer(this, "receiver")? ^ integer(argument(args, 0)?, "argument")?) as f64)),
-        NumShl => Ok(Value::from_num(integer(this, "receiver")?.wrapping_shl(integer(argument(args, 0)?, "argument")? as u32) as f64)),
-        NumShr => Ok(Value::from_num(integer(this, "receiver")?.wrapping_shr(integer(argument(args, 0)?, "argument")? as u32) as f64)),
+        NumBitNot => Ok(Value::from_num((!bitwise_operand(this, "receiver")?) as f64)),
+        NumBitAnd => Ok(Value::from_num((bitwise_operand(this, "receiver")? & bitwise_operand(argument(args, 0)?, "argument")?) as f64)),
+        NumBitOr => Ok(Value::from_num((bitwise_operand(this, "receiver")? | bitwise_operand(argument(args, 0)?, "argument")?) as f64)),
+        NumBitXor => Ok(Value::from_num((bitwise_operand(this, "receiver")? ^ bitwise_operand(argument(args, 0)?, "argument")?) as f64)),
+        NumShl => Ok(Value::from_num(bitwise_operand(this, "receiver")?.wrapping_shl(bitwise_operand(argument(args, 0)?, "argument")?) as f64)),
+        NumShr => Ok(Value::from_num(bitwise_operand(this, "receiver")?.wrapping_shr(bitwise_operand(argument(args, 0)?, "argument")?) as f64)),
         NumAbs => Ok(Value::from_num(num(this, "receiver")?.abs())),
         NumFloor => Ok(Value::from_num(num(this, "receiver")?.floor())),
         NumCeil => Ok(Value::from_num(num(this, "receiver")?.ceil())),
