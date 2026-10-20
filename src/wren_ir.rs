@@ -21,7 +21,7 @@
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::fmt;
 use smallvec::SmallVec;
 

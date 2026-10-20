@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
-use crate::wren_traceir::{FrameSlot, TraceConstant, TraceId, TraceLocation};
-use crate::wren_tracingjit::{JitAction, TraceActivation, TraceActivationInputs, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats};
+use crate::wren_trace_ir::{FrameSlot, TraceConstant, TraceId, TraceLocation};
+use crate::wren_tracing_jit::{JitAction, TraceActivation, TraceActivationInputs, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats};
 
 use crate::wren_bytecode::{
     decode_bailout_reason, function_kind_uses_this, instruction_word_len,
@@ -5079,7 +5079,7 @@ mod tests {
         vm.set_jit_options(Some(TracingJitOptions { hot_loop_threshold: 2, ..Default::default() }));
         for iteration in 0..3 {
             let ExecutionResult::Returned(value) = vm.run_function(FuncId(0), &[]).unwrap() else { panic!() };
-            assert_eq!(value.as_num(), Some(100.0), "iteration {iteration}: {:?}\n{:#?}", vm.jit_stats(), vm.jit.as_ref().unwrap().trace(crate::wren_traceir::TraceId(0)));
+            assert_eq!(value.as_num(), Some(100.0), "iteration {iteration}: {:?}\n{:#?}", vm.jit_stats(), vm.jit.as_ref().unwrap().trace(crate::wren_trace_ir::TraceId(0)));
         }
         let stats = vm.jit_stats().unwrap();
         assert!(stats.native_entries > 0, "{stats:?}");

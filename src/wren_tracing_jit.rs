@@ -1,7 +1,7 @@
 //! Wren tracing JIT.
 //!
 //! This module connects the register interpreter to the backend-agnostic trace IR
-//! (`wren_traceir.rs`) and lowers optimized traces to Cranelift IR.
+//! (`wren_trace_ir.rs`) and lowers optimized traces to Cranelift IR.
 //!
 //! The implementation deliberately separates four concerns:
 //!
@@ -61,7 +61,7 @@ use crate::wren_bytecode::{
 use crate::wren_ir::{
     CmpKind, Constant, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, MethodKind,
 };
-use crate::wren_traceir::{
+use crate::wren_trace_ir::{
     verify_trace, ExitReason, ExitTarget, FrameDisposition, FrameSlot,
     SnapshotValue, SideExit, SideExitId, Trace, TraceAnchor, TraceClass,
     TraceConstant, TraceId, TraceInst, TraceKind, TraceLocation, TraceOptimizer,
@@ -714,7 +714,7 @@ impl<'a> TraceRecorder<'a> {
 
     fn read_gpr(
         &self,
-        builder: &mut crate::wren_traceir::TraceBuilder,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
         reg: u8,
         ty: TraceType,
         rep: TraceRep,
@@ -724,7 +724,7 @@ impl<'a> TraceRecorder<'a> {
 
     fn read_slot(
         &self,
-        builder: &mut crate::wren_traceir::TraceBuilder,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
         slot: FrameSlot,
         ty: TraceType,
         rep: TraceRep,
@@ -774,7 +774,7 @@ impl<'a> TraceRecorder<'a> {
 
     fn write_gpr(
         &self,
-        builder: &mut crate::wren_traceir::TraceBuilder,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
         reg: u8,
         value: TraceValueId,
     ) {
@@ -783,7 +783,7 @@ impl<'a> TraceRecorder<'a> {
 
     fn tagged_bool(
         &self,
-        builder: &mut crate::wren_traceir::TraceBuilder,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
         condition: TraceValueId,
     ) -> TraceValueId {
         let t = builder.constant(TraceConstant::Bool(true));
@@ -804,7 +804,7 @@ impl<'a> TraceRecorder<'a> {
     /// re-decoding the NaN-boxed true/false representation.
     fn raw_recorded_bool(
         &self,
-        builder: &crate::wren_traceir::TraceBuilder,
+        builder: &crate::wren_trace_ir::TraceBuilder,
         value: TraceValueId,
     ) -> Option<TraceValueId> {
         let trace = builder.trace();
@@ -842,7 +842,7 @@ impl<'a> TraceRecorder<'a> {
 
     fn num_to_f64_guard(
         &self,
-        builder: &mut crate::wren_traceir::TraceBuilder,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
         value: TraceValueId,
         resume: BytecodePc,
     ) -> TraceValueId {
@@ -856,7 +856,7 @@ impl<'a> TraceRecorder<'a> {
 
     fn num_to_i32_guard(
         &self,
-        builder: &mut crate::wren_traceir::TraceBuilder,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
         value: TraceValueId,
         resume: BytecodePc,
     ) -> TraceValueId {
@@ -870,7 +870,7 @@ impl<'a> TraceRecorder<'a> {
 
     fn num_to_u32_guard(
         &self,
-        builder: &mut crate::wren_traceir::TraceBuilder,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
         value: TraceValueId,
         resume: BytecodePc,
     ) -> TraceValueId {
@@ -888,7 +888,7 @@ impl<'a> TraceRecorder<'a> {
         program: &BytecodeProgram,
         function: &BytecodeFunction,
         op: &RecordedOp,
-        builder: &mut crate::wren_traceir::TraceBuilder,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
     ) -> Result<bool, RecordingAbort> {
         if op.opcode != Opcode::Invoke {
             return Ok(false);
@@ -1077,7 +1077,7 @@ impl<'a> TraceRecorder<'a> {
 
     fn translate_op<R: TraceRuntime>(
         &self, runtime: &R, program: &BytecodeProgram, function: &BytecodeFunction,
-        op: &RecordedOp, builder: &mut crate::wren_traceir::TraceBuilder,
+        op: &RecordedOp, builder: &mut crate::wren_trace_ir::TraceBuilder,
     ) -> Result<ExpectedStep, RecordingAbort> {
         // A speculative lowering may have emitted guards before discovering a
         // representation conflict. Roll back that attempt before using a helper.
@@ -1113,7 +1113,7 @@ impl<'a> TraceRecorder<'a> {
         program: &BytecodeProgram,
         function: &BytecodeFunction,
         op: &RecordedOp,
-        builder: &mut crate::wren_traceir::TraceBuilder,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
     ) -> Result<ExpectedStep, RecordingAbort> {
         use Opcode::*;
 
@@ -1877,7 +1877,7 @@ impl<'a> TraceRecorder<'a> {
 
     fn install_loop_phis(
         &self,
-        builder: &mut crate::wren_traceir::TraceBuilder,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
     ) -> Result<(), RecordingAbort> {
         builder.ensure_loop_entries();
         // Collect root-frame entry values first. We must not mutate the vector
@@ -1927,7 +1927,7 @@ impl<'a> TraceRecorder<'a> {
                 for exit in &mut trace.exits {
                     for frame in &mut exit.frames {
                         if !frame.writes.iter().any(|write| write.slot == slot) {
-                            frame.writes.push(crate::wren_traceir::SnapshotWrite {
+                            frame.writes.push(crate::wren_trace_ir::SnapshotWrite {
                                 slot,
                                 kind: RegisterKind::Value,
                                 target_rep: rep,
@@ -1999,7 +1999,7 @@ impl<'a> TraceRecorder<'a> {
             return Err(RecordOutcome::Abort(RecordingAbort::LeftFunction));
         }
 
-        let mut builder = crate::wren_traceir::TraceBuilder::new(
+        let mut builder = crate::wren_trace_ir::TraceBuilder::new(
             self.trace_id,
             TraceAnchor {
                 kind,
@@ -3539,11 +3539,11 @@ impl CraneliftLoweringState<'_, '_> {
 
     fn lower_node(
         &mut self,
-        node: &crate::wren_traceir::TraceNode,
+        node: &crate::wren_trace_ir::TraceNode,
     ) -> Result<(), TracingJitError> {
         use TraceInst::*;
 
-        let one_result = |node: &crate::wren_traceir::TraceNode| -> Result<TraceValueId, TracingJitError> {
+        let one_result = |node: &crate::wren_trace_ir::TraceNode| -> Result<TraceValueId, TracingJitError> {
             if node.results.len() == 1 {
                 Ok(node.results[0])
             } else {
@@ -4173,7 +4173,7 @@ impl TracingJit {
         let function = program.function(location.function).unwrap();
         let op = decode_at(program, location)?;
         let recorder = TraceRecorder::new(&self.options, TraceId(0), location);
-        let mut builder = crate::wren_traceir::TraceBuilder::new(TraceId(0), TraceAnchor { kind: TraceKind::Loop, location });
+        let mut builder = crate::wren_trace_ir::TraceBuilder::new(TraceId(0), TraceAnchor { kind: TraceKind::Loop, location });
         let expected = recorder.translate_op(runtime, program, function, &op, &mut builder)
             .map_err(|reason| TracingJitError::Record { location, message: reason.to_string() })?;
         match expected {
@@ -5033,7 +5033,7 @@ mod tests {
         let options = TracingJitOptions::default();
         let anchor = TraceLocation::new(FuncId(0), BytecodePc(10));
         let recorder = TraceRecorder::new(&options, TraceId(0), anchor);
-        let mut builder = crate::wren_traceir::TraceBuilder::new(
+        let mut builder = crate::wren_trace_ir::TraceBuilder::new(
             TraceId(0),
             TraceAnchor { kind: TraceKind::Loop, location: anchor },
         );

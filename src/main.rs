@@ -40,8 +40,8 @@ pub mod wren_front;
 pub mod wren_interpreter;
 pub mod wren_ir;
 pub mod wren_lowerer;
-pub mod wren_traceir;
-pub mod wren_tracingjit;
+pub mod wren_trace_ir;
+pub mod wren_tracing_jit;
 
 use std::env;
 use std::ffi::OsStr;
