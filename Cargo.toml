@@ -29,4 +29,5 @@ rclite = "0.4.2" # Optimized Rc for memory usage
 mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually faster
 
 bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator similar to arena allocator
-cranelift = { version = "0.136.3", features = ["jit", "module", "native"] } #JIT
+cranelift = { version = "0.137.0", features = ["jit", "module", "native"] } #JIT
+mmtk = { version = "0.33.0", path = "crates/mmtk/" }

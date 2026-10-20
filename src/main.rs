@@ -11,6 +11,7 @@
 //! ├── wren_ir.rs
 //! ├── wren_bytecode.rs
 //! ├── wren_bytecodecompiler.rs
+//! ├── wren_gc.rs
 //! └── wren_interpreter.rs
 //! ```
 //!
@@ -37,6 +38,7 @@ pub mod wren_builtin;
 pub mod wren_bytecode;
 pub mod wren_bytecodecompiler;
 pub mod wren_front;
+pub mod wren_gc;
 pub mod wren_interpreter;
 pub mod wren_ir;
 pub mod wren_lowerer;
@@ -174,6 +176,9 @@ fn run() -> u8 {
 
     if env::var_os("WREN_JIT_STATS").is_some() {
         eprintln!("WrenJIT stats: {:#?}", interpreter.jit_stats());
+    }
+    if env::var_os("WREN_GC_STATS").is_some() {
+        eprintln!("WrenGC stats: {:#?}", interpreter.gc_statistics());
     }
 
     match execution {

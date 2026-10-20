@@ -2762,6 +2762,16 @@ impl FunctionEmitter<'_> {
 
                 let after = self.assembler.pc();
                 if before != after {
+                    // Backedges and native exits may rendezvous here without an
+                    // allocating opcode. No extra instruction enters the hot loop.
+                    if self.assembler.chunk.safepoints.last().is_none_or(|entry| entry.pc != before) {
+                        let references = self.live_reference_map(self.instruction_position(inst_id));
+                        self.assembler.add_safepoint(
+                            before,
+                            SafepointKind::ExplicitPoll,
+                            references,
+                        );
+                    }
                     if let Some(live) = live {
                         // Side exits resume at original bytecode instruction boundaries.
                         // Keep all physical GPR liveness separate from GC reference maps.

@@ -117,7 +117,7 @@ fn setup<'p>(program: &'p BytecodeProgram, opcode: Opcode) -> Interpreter<'p> {
             regs[2] = if opcode == StringConcat { regs[1] } else { i32_word(0) };
         },
         CallClosure | MakeFiber | FiberCall | FiberTry | FiberTransfer | FiberTransferError => {
-            let closure = vm.heap.alloc(HeapObject::Closure { function_index: 1, captures: Box::new([]) });
+            let closure = vm.heap.alloc(HeapObject::Closure { function_index: 1, captures: Box::new([]), reference_indices: Box::new([]) });
             regs[1] = if matches!(opcode, CallClosure | MakeFiber) { closure.word() }
                 else { vm.allocate_fiber(closure).unwrap().word() };
             regs[2] = Value::NULL.word();
@@ -127,24 +127,67 @@ fn setup<'p>(program: &'p BytecodeProgram, opcode: Opcode) -> Interpreter<'p> {
     for (i, word) in regs.into_iter().enumerate() { vm.trace_write_slot(FrameSlot::General(Reg(i as u8)), word).unwrap(); }
     vm.current_banks_mut().arguments[1] = Value::TRUE.word();
     vm.current_banks_mut().returns[1] = Value::FALSE.word();
+    // These fixtures step frames without run_function's root provider. Keep
+    // their comparison heap alive while the other VM initializes or collects.
+    for value in vm.heap.allocations.clone() {
+        vm.add_root(value);
+    }
     vm
 }
 
-/// Heap handles are deterministic in these fixtures. Include contents as well
-/// as registers so stores, binding, allocation and profile effects are checked.
+/// Canonicalize process-wide handles by VM-local allocation order.
 fn state(vm: &mut Interpreter<'_>) -> String {
     // Commit the cached PC before comparing the saved frame state.
     vm.flush_hot_pc();
-    let fibers: Vec<_> = vm.fibers.iter().map(|f| f.as_ref().map(|f| (
-        format!("{:?}", f.status), f.registers.clone(), f.frames.iter().enumerate().map(|(depth, frame)| {
+    let word = |word: RegisterWord| {
+        let value = Value::from_word(word);
+        if value.is_heap() {
+            let index = vm.heap.allocations.iter().position(|&v| v == value)
+                .expect("fixture reference must belong to this VM");
+            Value::from_heap(index as u32).word()
+        } else {
+            word
+        }
+    };
+    let value = |value: Value| Value::from_word(word(value.word()));
+    let values = |items: &[Value]| items.iter().copied().map(value).collect::<Vec<_>>();
+    let fibers: Vec<_> = vm.fibers.iter().map(|f| f.as_ref().map(|f| {
+        let f = unsafe { f.get() };
+        (
+        format!("{:?}", f.status), f.registers.iter().copied().map(word).collect::<Vec<_>>(), f.frames.iter().enumerate().map(|(depth, frame)| {
             let banks = &f.banks[depth];
-            (frame.function, frame.pc, banks.arguments, banks.returns, banks.special)
-        }).collect::<Vec<_>>(), f.last_value, f.error,
-    ))).collect();
-    let heap: Vec<_> = vm.heap.slots.iter().map(|slot| format!("{:?}", slot.as_ref().map(|slot| &slot.object))).collect();
-    let modules: Vec<_> = vm.modules.iter().map(|m| (&m.variables, m.initialized, m.initializing)).collect();
-    let classes: Vec<_> = vm.classes.iter().map(|c| (&c.static_fields, &c.instance_methods, &c.static_methods)).collect();
-    format!("{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", vm.run_state, vm.result, vm.error, fibers, heap, modules, classes, vm.profile_counters, vm.trace_current_location())
+            (frame.function, frame.pc, banks.arguments.map(word), banks.returns.map(word), banks.special.map(word))
+        }).collect::<Vec<_>>(), value(f.last_value), value(f.error),
+    )})).collect();
+    let heap: Vec<_> = vm.heap.allocations.iter().map(|&v| {
+        match vm.heap.get(v) {
+            Some(HeapObject::List(items)) => format!("List({:?})", values(items)),
+            Some(HeapObject::Map(map)) => {
+                let mut entries: Vec<_> = map.entries.iter().map(|(key, &v)| {
+                    let key = match key {
+                        MapKey::Object(handle) => format!("{:?}", value(Value::from_heap(*handle))),
+                        key => format!("{key:?}"),
+                    };
+                    (key, format!("{:?}", value(v)))
+                }).collect();
+                entries.sort();
+                format!("Map({entries:?})")
+            }
+            Some(HeapObject::Cell(w)) => format!("Cell({:?})", word(*w)),
+            Some(HeapObject::Closure { function_index, captures, reference_indices }) => {
+                let captures: Vec<_> = captures.iter().enumerate().map(|(i, &w)| {
+                    if reference_indices.contains(&(i as u16)) { word(w) } else { w }
+                }).collect();
+                format!("Closure({function_index}, {captures:?}, {reference_indices:?})")
+            }
+            Some(HeapObject::Instance { class_slot, fields }) => format!("Instance({class_slot}, {:?})", values(fields)),
+            Some(HeapObject::FiberObject { fiber, .. }) => format!("Fiber({fiber})"),
+            object => format!("{object:?}"),
+        }
+    }).collect();
+    let modules: Vec<_> = vm.modules.iter().map(|m| (values(&m.variables), m.initialized, m.initializing)).collect();
+    let classes: Vec<_> = vm.classes.iter().map(|c| (values(&c.static_fields), &c.instance_methods, &c.static_methods)).collect();
+    format!("{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", vm.run_state, value(vm.result), vm.error, fibers, heap, modules, classes, vm.profile_counters, vm.trace_current_location())
 }
 
 #[test]

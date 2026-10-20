@@ -1281,6 +1281,223 @@ impl Inst {
         }
         out
     }
+
+    /// Visits every data SSA operand in-place.
+    ///
+    /// This is the mutation counterpart to `operands()` and is intentionally
+    /// centralized here so optimizer passes do not need to duplicate the full
+    /// instruction-shape match every time they perform RAUW/copy propagation.
+    pub fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut ValueId)) {
+        use Inst::*;
+
+        match self {
+            Jump { edge } => {
+                for value in &mut edge.args {
+                    f(value);
+                }
+            }
+            Branch {
+                cond,
+                then_edge,
+                else_edge,
+            } => {
+                f(cond);
+                for value in &mut then_edge.args {
+                    f(value);
+                }
+                for value in &mut else_edge.args {
+                    f(value);
+                }
+            }
+            Switch {
+                tag,
+                default_edge,
+                cases,
+            } => {
+                f(tag);
+                for value in &mut default_edge.args {
+                    f(value);
+                }
+                for case in cases {
+                    for value in &mut case.edge.args {
+                        f(value);
+                    }
+                }
+            }
+            Return(value) => f(value),
+            Unreachable | Safepoint | OSRPoint | Const(_) | FiberSuspend | AllocMap => {}
+            Move(value) => f(value),
+            GuardType { value, .. }
+            | GuardClass { value, .. }
+            | GuardNotNull { value, .. }
+            | GuardInt32 { value, .. }
+            | GuardF64 { value, .. }
+            | IntUnary { value, .. }
+            | F64Unary { value, .. }
+            | NumToInt32 { value }
+            | NumToF64 { value }
+            | Int32ToNum { value }
+            | F64ToNum { value }
+            | FiberYield { value }
+            | ReadBarrier { object: value } => f(value),
+            GuardBounds { index, length, .. } => {
+                f(index);
+                f(length);
+            }
+            Bailout { .. } => {}
+            Invoke {
+                receiver, args, ..
+            }
+            | InvokeSuper {
+                receiver, args, ..
+            } => {
+                f(receiver);
+                for value in args {
+                    f(value);
+                }
+            }
+            CallDirect { args, .. }
+            | CallPrimitive { args, .. }
+            | CallForeign { args, .. } => {
+                for value in args {
+                    f(value);
+                }
+            }
+            CallClosure { closure, args, .. } => {
+                f(closure);
+                for value in args {
+                    f(value);
+                }
+            }
+            CreateClass { superclass, .. } => {
+                if let Some(superclass) = superclass {
+                    f(superclass);
+                }
+            }
+            BindMethod { class, .. } | BindForeignMethod { class, .. } => f(class),
+            AllocInstance { .. } => {}
+            AllocForeign { size, .. } => f(size),
+            LoadField { object, .. } => f(object),
+            StoreField { object, value, .. } => {
+                f(object);
+                f(value);
+            }
+            LoadStaticField { class, .. } => f(class),
+            StoreStaticField { class, value, .. } => {
+                f(class);
+                f(value);
+            }
+            IsInstance { value, class } => {
+                f(value);
+                f(class);
+            }
+            ImportModule { .. } => {}
+            ImportVariable { module, .. } => f(module),
+            LoadModuleVar { .. } => {}
+            StoreModuleVar { value, .. } => f(value),
+            AllocCell { initial } => f(initial),
+            LoadCell { cell } => f(cell),
+            StoreCell { cell, value } => {
+                f(cell);
+                f(value);
+            }
+            MakeClosure { captures, .. } => {
+                for value in captures {
+                    f(value);
+                }
+            }
+            AllocList { capacity } => {
+                if let Some(capacity) = capacity {
+                    f(capacity);
+                }
+            }
+            ListLen { list } => f(list),
+            ListGet { list, index } | ListRemoveAt { list, index } => {
+                f(list);
+                f(index);
+            }
+            ListSet { list, index, value } | ListInsert { list, index, value } => {
+                f(list);
+                f(index);
+                f(value);
+            }
+            ListAppend { list, value } => {
+                f(list);
+                f(value);
+            }
+            MapLen { map } => f(map),
+            MapGet { map, key } | MapRemove { map, key } => {
+                f(map);
+                f(key);
+            }
+            MapSet { map, key, value } => {
+                f(map);
+                f(key);
+                f(value);
+            }
+            StringLen { string } => f(string),
+            StringConcat { left, right }
+            | IntBin { left, right, .. }
+            | F64Bin { left, right, .. }
+            | CmpInt { left, right, .. }
+            | CmpF64 { left, right, .. }
+            | RefEq { left, right } => {
+                f(left);
+                f(right);
+            }
+            StringSlice {
+                string,
+                start,
+                count,
+            } => {
+                f(string);
+                f(start);
+                f(count);
+            }
+            StringCodePointAt { string, index } => {
+                f(string);
+                f(index);
+            }
+            MakeRange { from, to, .. } => {
+                f(from);
+                f(to);
+            }
+            MakeFiber { closure } => f(closure),
+            FiberCall { fiber, argument }
+            | FiberTry { fiber, argument }
+            | FiberTransfer { fiber, argument } => {
+                f(fiber);
+                f(argument);
+            }
+            FiberTransferError { fiber, error } => {
+                f(fiber);
+                f(error);
+            }
+            FiberAbort { error } => f(error),
+            WriteBarrier { object, value } => {
+                f(object);
+                f(value);
+            }
+        }
+    }
+
+    /// Replaces all occurrences of one SSA data operand in this instruction.
+    #[inline]
+    pub fn replace_operand(&mut self, from: ValueId, to: ValueId) -> usize {
+        if from == to {
+            return 0;
+        }
+
+        let mut replaced = 0usize;
+        self.for_each_operand_mut(|operand| {
+            if *operand == from {
+                *operand = to;
+                replaced += 1;
+            }
+        });
+        replaced
+    }
+
 }
 
 #[derive(Clone, Debug)]
@@ -2318,11 +2535,13 @@ pub fn verify_function(function: &Function) -> Result<(), Vec<VerifyError>> {
         }
     }
 
-    for (index, owner) in owner.into_iter().enumerate() {
-        if owner.is_none() {
-            errors.push(VerifyError::InstructionNotInBlock(InstId(index as u32)));
-        }
-    }
+    // `nodes`, `values`, and `effects` are append-only optimizer arenas.
+    // A node not listed by any block is a detached/dead node left behind by an
+    // optimization. Live instruction order and liveness are defined exclusively
+    // by `Block::insts`. Duplicate live ownership is still rejected above.
+    //
+    // Keeping stable IDs avoids global renumbering after every DCE/peephole edit.
+    let _ = owner;
 
     for value in &function.values {
         let valid = match value.def {

@@ -20,7 +20,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use crate::wren_gc::{
+    Collector as GcCollector, Config as GcConfig, Descriptor as GcDescriptor, Mutator as GcMutator,
+    Object as GcObject, RootProvider as GcRootProvider, RootRegistration as GcRootRegistration,
+    RootVisitor as GcRootVisitor, Slot as GcSlot, TraceLayout as GcTraceLayout,
+    RAW_CODEC as GC_RAW_CODEC,
+};
 use crate::wren_trace_ir::{FrameSlot, TraceConstant, TraceId, TraceLocation};
 use crate::wren_tracing_jit::{JitAction, TraceActivation, TraceActivationInputs, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats};
 
@@ -76,20 +83,15 @@ impl Value {
     pub const TRUE: Self = Self(TAG_TRUE);
 
     #[inline(always)]
-    pub const fn raw_bits(self) -> u64 {
-        self.0
-    }
+    pub const fn raw_bits(self) -> u64 { self.0 }
 
     /// Construct a Value from raw NaN-box bits.
     ///
     /// # Safety
-    ///
-    /// Heap-tagged values must reference a live heap handle owned by the same
-    /// interpreter. Prefer values obtained from the VM/HostContext.
+    /// Heap-tagged values must reference a live Wren heap handle owned by the
+    /// same interpreter. Prefer values obtained from the VM/HostContext.
     #[inline(always)]
-    pub const unsafe fn from_raw_bits_unchecked(bits: u64) -> Self {
-        Self(bits)
-    }
+    pub const unsafe fn from_raw_bits_unchecked(bits: u64) -> Self { Self(bits) }
 
     #[inline(always)]
     pub const fn from_bool(value: bool) -> Self {
@@ -98,82 +100,50 @@ impl Value {
 
     #[inline(always)]
     pub fn from_num(value: f64) -> Self {
-        let bits = if value.is_nan() {
-            CANONICAL_NAN
-        } else {
-            value.to_bits()
-        };
+        let bits = if value.is_nan() { CANONICAL_NAN } else { value.to_bits() };
         Self(bits)
     }
 
     #[inline(always)]
-    pub const fn from_heap(handle: u32) -> Self {
-        Self(TAG_HEAP | handle as u64)
-    }
+    pub const fn from_heap(handle: u32) -> Self { Self(TAG_HEAP | handle as u64) }
 
     #[inline(always)]
-    pub const fn is_null(self) -> bool {
-        self.0 == TAG_NULL
-    }
+    pub const fn is_null(self) -> bool { self.0 == TAG_NULL }
 
     #[inline(always)]
-    pub const fn is_bool(self) -> bool {
-        self.0 == TAG_FALSE || self.0 == TAG_TRUE
-    }
+    pub const fn is_bool(self) -> bool { self.0 == TAG_FALSE || self.0 == TAG_TRUE }
 
     #[inline(always)]
     pub const fn as_bool(self) -> Option<bool> {
-        if self.0 == TAG_FALSE {
-            Some(false)
-        } else if self.0 == TAG_TRUE {
-            Some(true)
-        } else {
-            None
-        }
+        if self.0 == TAG_FALSE { Some(false) }
+        else if self.0 == TAG_TRUE { Some(true) }
+        else { None }
     }
 
     #[inline(always)]
-    pub const fn is_heap(self) -> bool {
-        (self.0 & TAG_HEAP_MASK) == TAG_HEAP
-    }
+    pub const fn is_heap(self) -> bool { (self.0 & TAG_HEAP_MASK) == TAG_HEAP }
 
     #[inline(always)]
     pub const fn heap_handle(self) -> Option<u32> {
-        if self.is_heap() {
-            Some((self.0 & PAYLOAD_MASK) as u32)
-        } else {
-            None
-        }
+        if self.is_heap() { Some((self.0 & PAYLOAD_MASK) as u32) } else { None }
     }
 
     #[inline(always)]
-    pub const fn is_num(self) -> bool {
-        (self.0 & TAG_MASK) != TAG_BASE && !self.is_heap()
-    }
+    pub const fn is_num(self) -> bool { (self.0 & TAG_MASK) != TAG_BASE && !self.is_heap() }
 
     #[inline(always)]
     pub fn as_num(self) -> Option<f64> {
-        if self.is_num() {
-            Some(f64::from_bits(self.0))
-        } else {
-            None
-        }
+        if self.is_num() { Some(f64::from_bits(self.0)) } else { None }
     }
 
     #[inline(always)]
-    pub const fn is_falsey(self) -> bool {
-        self.0 == TAG_FALSE || self.0 == TAG_NULL
-    }
+    pub const fn is_falsey(self) -> bool { self.0 == TAG_FALSE || self.0 == TAG_NULL }
 
     #[inline(always)]
-    pub const fn word(self) -> RegisterWord {
-        RegisterWord(self.0)
-    }
+    pub const fn word(self) -> RegisterWord { RegisterWord(self.0) }
 
     #[inline(always)]
-    pub const fn from_word(word: RegisterWord) -> Self {
-        Self(word.0)
-    }
+    pub const fn from_word(word: RegisterWord) -> Self { Self(word.0) }
 }
 
 impl fmt::Debug for Value {
@@ -285,6 +255,7 @@ enum HeapObject {
     Closure {
         function_index: u32,
         captures: Box<[RegisterWord]>,
+        reference_indices: Box<[u16]>,
     },
     ClassObject {
         class_slot: u32,
@@ -302,36 +273,590 @@ enum HeapObject {
     },
     FiberObject {
         fiber: u32,
+        state: Arc<FiberCell>,
+        trace_metadata: Arc<FiberTraceMetadata>,
     },
     ModuleObject {
         module_slot: u32,
     },
 }
 
-#[derive(Debug)]
-struct HeapSlot {
-    marked: bool,
+// -----------------------------------------------------------------------------
+// Stable Wren handles over moving MMTk objects
+// -----------------------------------------------------------------------------
+//
+// Wren Values intentionally keep the existing compact u32 heap handle.  The
+// handle indexes a process-wide stable atomic cell containing the *current*
+// MMTk object address.  GC roots and object edges expose that cell to MMTk, so a
+// nursery/defrag move updates one canonical address instead of rewriting every
+// NaN-boxed Value in the VM.  This preserves the fast interpreter/JIT ABI while
+// still allowing StickyImmix to move objects.
+
+const HANDLE_CHUNK_BITS: u32 = 10;
+const HANDLE_CHUNK_SIZE: usize = 1usize << HANDLE_CHUNK_BITS;
+const HANDLE_CHUNK_MASK: u32 = (HANDLE_CHUNK_SIZE as u32) - 1;
+const MAX_HANDLE_CHUNKS: usize = 1 << 14; // 16,777,216 simultaneous handle IDs.
+const FREE_HANDLE_NONE: u32 = 0;
+
+struct HandleEntry {
+    address: AtomicUsize,
+    /// Intrusive Treiber free-list link encoded as handle+1; zero is None.
+    next_free: AtomicU32,
+}
+
+impl HandleEntry {
+    fn new() -> Self {
+        Self {
+            address: AtomicUsize::new(0),
+            next_free: AtomicU32::new(FREE_HANDLE_NONE),
+        }
+    }
+}
+
+struct HandleTable {
+    chunks: Box<[AtomicPtr<HandleEntry>]>,
+    install_lock: StdMutex<()>,
+    next: AtomicU32,
+    free_head: AtomicU32,
+    live: AtomicUsize,
+}
+
+impl HandleTable {
+    fn new() -> Self {
+        Self {
+            chunks: (0..MAX_HANDLE_CHUNKS)
+                .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            install_lock: StdMutex::new(()),
+            next: AtomicU32::new(0),
+            free_head: AtomicU32::new(FREE_HANDLE_NONE),
+            live: AtomicUsize::new(0),
+        }
+    }
+
+    #[cold]
+    fn install_chunk(&self, chunk_index: usize) -> *mut HandleEntry {
+        let _guard = self.install_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.chunks[chunk_index].load(Ordering::Acquire);
+        if !current.is_null() {
+            return current;
+        }
+        let chunk = (0..HANDLE_CHUNK_SIZE)
+            .map(|_| HandleEntry::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let slice = Box::leak(chunk);
+        let pointer = slice.as_mut_ptr();
+        self.chunks[chunk_index].store(pointer, Ordering::Release);
+        pointer
+    }
+
+    #[inline(always)]
+    fn entry(&self, handle: u32) -> &'static HandleEntry {
+        let chunk_index = (handle >> HANDLE_CHUNK_BITS) as usize;
+        assert!(chunk_index < MAX_HANDLE_CHUNKS, "Wren heap handle space exhausted");
+        let mut chunk = self.chunks[chunk_index].load(Ordering::Acquire);
+        if chunk.is_null() {
+            chunk = self.install_chunk(chunk_index);
+        }
+        unsafe { &*chunk.add((handle & HANDLE_CHUNK_MASK) as usize) }
+    }
+
+    #[inline(always)]
+    fn existing_entry(&self, handle: u32) -> Option<&'static HandleEntry> {
+        let chunk_index = (handle >> HANDLE_CHUNK_BITS) as usize;
+        if chunk_index >= MAX_HANDLE_CHUNKS {
+            return None;
+        }
+        let chunk = self.chunks[chunk_index].load(Ordering::Acquire);
+        if chunk.is_null() {
+            return None;
+        }
+        Some(unsafe { &*chunk.add((handle & HANDLE_CHUNK_MASK) as usize) })
+    }
+
+    fn allocate_handle(&self) -> u32 {
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            if head == FREE_HANDLE_NONE {
+                let handle = self.next.fetch_add(1, Ordering::Relaxed);
+                let max = (MAX_HANDLE_CHUNKS * HANDLE_CHUNK_SIZE) as u32;
+                assert!(handle < max, "Wren heap handle space exhausted");
+                let entry = self.entry(handle);
+                debug_assert_eq!(entry.address.load(Ordering::Relaxed), 0);
+                return handle;
+            }
+            let handle = head - 1;
+            let entry = self.entry(handle);
+            let next = entry.next_free.load(Ordering::Relaxed);
+            if self
+                .free_head
+                .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                entry.next_free.store(FREE_HANDLE_NONE, Ordering::Relaxed);
+                debug_assert_eq!(entry.address.load(Ordering::Relaxed), 0);
+                return handle;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn publish(&self, handle: u32, object: GcObject) {
+        self.entry(handle)
+            .address
+            .store(object.address(), Ordering::Relaxed);
+        self.live.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    fn resolve(&self, handle: u32) -> Option<GcObject> {
+        let address = self
+            .existing_entry(handle)?
+            .address
+            .load(Ordering::Relaxed);
+        (address != 0).then(|| unsafe { GcObject::from_address(address) })
+    }
+
+    fn release(&self, handle: u32) {
+        let entry = self.entry(handle);
+        entry.address.store(0, Ordering::Relaxed);
+        self.live.fetch_sub(1, Ordering::Relaxed);
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            entry.next_free.store(head, Ordering::Relaxed);
+            if self
+                .free_head
+                .compare_exchange_weak(head, handle + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn gc_slot(&self, handle: u32) -> Option<GcSlot> {
+        let entry = self.existing_entry(handle)?;
+        if entry.address.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some(unsafe { GcSlot::from_ptr(&entry.address, &GC_RAW_CODEC) })
+    }
+}
+
+static HANDLE_TABLE: OnceLock<HandleTable> = OnceLock::new();
+
+#[inline(always)]
+fn handles() -> &'static HandleTable {
+    HANDLE_TABLE.get_or_init(HandleTable::new)
+}
+
+#[repr(C)]
+struct ManagedObject {
+    handle: u32,
     receiver_class: Option<ReceiverClass>,
     object: HeapObject,
 }
 
-#[derive(Debug)]
+#[inline(always)]
+unsafe fn managed_object(object: GcObject) -> &'static ManagedObject {
+    unsafe { &*object.payload().cast::<ManagedObject>() }
+}
+
+#[inline(always)]
+unsafe fn managed_object_mut(object: GcObject) -> &'static mut ManagedObject {
+    unsafe { &mut *object.payload().cast::<ManagedObject>() }
+}
+
+#[inline(always)]
+fn visit_handle(handle: u32, visitor: &mut dyn FnMut(GcSlot)) {
+    if let Some(slot) = handles().gc_slot(handle) {
+        visitor(slot);
+    }
+}
+
+#[inline(always)]
+fn visit_value(value: Value, visitor: &mut dyn FnMut(GcSlot)) {
+    if let Some(handle) = value.heap_handle() {
+        visit_handle(handle, visitor);
+    }
+}
+
+#[inline(always)]
+fn visit_word(word: RegisterWord, visitor: &mut dyn FnMut(GcSlot)) {
+    visit_value(Value::from_word(word), visitor);
+}
+
+unsafe fn trace_list(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::List(values) = &managed.object {
+        for &value in values {
+            visit_value(value, visitor);
+        }
+    }
+}
+
+unsafe fn trace_map(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::Map(map) = &managed.object {
+        for (key, &value) in &map.entries {
+            if let MapKey::Object(handle) = key {
+                visit_handle(*handle, visitor);
+            }
+            visit_value(value, visitor);
+        }
+    }
+}
+
+unsafe fn trace_cell(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::Cell(value) = &managed.object {
+        // Captured mutable Wren locals are semantic Values (the lowerer creates
+        // cells as Type::Top), so a heap-tagged word here is always a real edge.
+        visit_word(*value, visitor);
+    }
+}
+
+unsafe fn trace_closure(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::Closure {
+        captures,
+        reference_indices,
+        ..
+    } = &managed.object
+    {
+        for &index in reference_indices.iter() {
+            if let Some(&word) = captures.get(index as usize) {
+                visit_word(word, visitor);
+            }
+        }
+    }
+}
+
+unsafe fn trace_instance(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    if let HeapObject::Instance { fields, .. } = &managed.object {
+        for &value in fields.iter() {
+            visit_value(value, visitor);
+        }
+    }
+}
+
+unsafe fn trace_fiber(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    let HeapObject::FiberObject { state, trace_metadata, .. } = &managed.object else {
+        return;
+    };
+    // SAFETY: MMTk calls custom tracing only after the owning mutator has
+    // stopped. FiberCell is stable Arc storage and cannot be mutated concurrently.
+    let state = unsafe { state.get() };
+
+    if let Some(value) = state.starter {
+        visit_value(value, visitor);
+    }
+    visit_value(state.last_value, visitor);
+    visit_value(state.error, visitor);
+    if let Some(link) = state.link {
+        visit_value(link.caller_object, visitor);
+    }
+
+    for (depth, frame) in state.frames.iter().enumerate() {
+        if frame.root_map == NO_INDEX {
+            continue;
+        }
+        let Some(maps) = trace_metadata.gc_maps.get(frame.function as usize) else {
+            continue;
+        };
+        let Some(map) = maps.get(frame.root_map as usize) else {
+            continue;
+        };
+        let Some(banks) = state.banks.get(depth) else {
+            continue;
+        };
+        for reg in 0..frame.reg_count as usize {
+            if map.general_is_reference(Reg(reg as u8)) {
+                if let Some(&word) = state.registers.get(frame.reg_base + reg) {
+                    visit_word(word, visitor);
+                }
+            }
+        }
+        for index in 0..ARGUMENT_REGISTER_COUNT {
+            if (map.arguments & (1u16 << index)) != 0 {
+                visit_word(banks.arguments[index], visitor);
+            }
+        }
+        for index in 0..RETURN_REGISTER_COUNT {
+            if (map.returns & (1u8 << index)) != 0 {
+                visit_word(banks.returns[index], visitor);
+            }
+        }
+        for index in 0..SPECIAL_REGISTER_COUNT {
+            if (map.special & (1u16 << index)) != 0 {
+                visit_word(banks.special[index], visitor);
+            }
+        }
+    }
+}
+
+unsafe fn cleanup_managed_object(object: GcObject) {
+    let managed = unsafe { managed_object_mut(object) };
+    handles().release(managed.handle);
+    unsafe { std::ptr::drop_in_place(managed) };
+}
+
+macro_rules! gc_descriptor {
+    ($name:ident, $label:literal, $trace:expr) => {
+        static $name: GcDescriptor = GcDescriptor {
+            name: $label,
+            trace: $trace,
+            cleanup: Some(cleanup_managed_object),
+            finalizer: None,
+        };
+    };
+}
+
+gc_descriptor!(GC_STRING, "Wren.String", GcTraceLayout::Leaf);
+gc_descriptor!(GC_RANGE, "Wren.Range", GcTraceLayout::Leaf);
+gc_descriptor!(GC_CLASS, "Wren.Class", GcTraceLayout::Leaf);
+gc_descriptor!(GC_BUILTIN_CLASS, "Wren.BuiltinClass", GcTraceLayout::Leaf);
+gc_descriptor!(GC_FOREIGN, "Wren.Foreign", GcTraceLayout::Leaf);
+gc_descriptor!(GC_MODULE, "Wren.Module", GcTraceLayout::Leaf);
+gc_descriptor!(GC_LIST, "Wren.List", GcTraceLayout::Custom(trace_list));
+gc_descriptor!(GC_MAP, "Wren.Map", GcTraceLayout::Custom(trace_map));
+gc_descriptor!(GC_CELL, "Wren.Cell", GcTraceLayout::Custom(trace_cell));
+gc_descriptor!(GC_CLOSURE, "Wren.Closure", GcTraceLayout::Custom(trace_closure));
+gc_descriptor!(GC_INSTANCE, "Wren.Instance", GcTraceLayout::Custom(trace_instance));
+gc_descriptor!(GC_FIBER, "Wren.Fiber", GcTraceLayout::Custom(trace_fiber));
+
+#[inline(always)]
+fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
+    match object {
+        HeapObject::String(_) => &GC_STRING,
+        HeapObject::List(_) => &GC_LIST,
+        HeapObject::Map(_) => &GC_MAP,
+        HeapObject::Range { .. } => &GC_RANGE,
+        HeapObject::Cell(_) => &GC_CELL,
+        HeapObject::Closure { .. } => &GC_CLOSURE,
+        HeapObject::ClassObject { .. } => &GC_CLASS,
+        HeapObject::BuiltinClass { .. } => &GC_BUILTIN_CLASS,
+        HeapObject::Instance { .. } => &GC_INSTANCE,
+        HeapObject::Foreign { .. } => &GC_FOREIGN,
+        HeapObject::FiberObject { .. } => &GC_FIBER,
+        HeapObject::ModuleObject { .. } => &GC_MODULE,
+    }
+}
+
+#[inline]
+fn external_bytes_for(object: &HeapObject) -> usize {
+    match object {
+        HeapObject::String(bytes) => bytes.len(),
+        HeapObject::List(values) => values.capacity() * std::mem::size_of::<Value>(),
+        HeapObject::Map(map) => map.entries.capacity() * std::mem::size_of::<(MapKey, Value)>(),
+        HeapObject::Closure { captures, reference_indices, .. } => {
+            captures.len() * std::mem::size_of::<RegisterWord>()
+                + reference_indices.len() * std::mem::size_of::<u16>()
+        },
+        HeapObject::Instance { fields, .. } => fields.len() * std::mem::size_of::<Value>(),
+        HeapObject::Foreign { bytes, .. } => bytes.capacity(),
+        HeapObject::FiberObject { state, .. } => {
+            // SAFETY: this is queried by the owning mutator before publication or
+            // while it has exclusive VM access. GC workers never call this helper.
+            fiber_state_external_bytes(unsafe { state.get() })
+        }
+        _ => 0,
+    }
+}
+
+#[inline]
+fn fiber_state_external_bytes(state: &FiberState) -> usize {
+    std::mem::size_of::<FiberState>()
+        + state.frames.capacity() * std::mem::size_of::<Frame>()
+        + state.banks.capacity() * std::mem::size_of::<FrameBanks>()
+        + state.registers.capacity() * std::mem::size_of::<RegisterWord>()
+}
+
+/// Per-mutator scratch roots used while constructing a managed object.
+///
+/// MMTk may collect at the beginning of an allocation. References already copied
+/// into the Rust-side HeapObject being constructed are therefore not necessarily
+/// visible in the VM stack map anymore. This stable provider protects exactly
+/// those handles for the duration of the allocation without allocating a new
+/// RootFrame/Arc on the hot path. The mutator writes the Vec only while Running;
+/// MMTk reads it only after the stop-the-world rendezvous.
+struct AllocationRootBuffer {
+    handles: std::cell::UnsafeCell<Vec<u32>>,
+}
+
+impl AllocationRootBuffer {
+    fn new() -> Self {
+        Self { handles: std::cell::UnsafeCell::new(Vec::with_capacity(32)) }
+    }
+
+    #[inline]
+    fn prepare(&self, object: &HeapObject) {
+        // SAFETY: only the owning mutator writes this buffer while Running. Root
+        // providers are visited only after all Running mutators have parked.
+        let roots = unsafe { &mut *self.handles.get() };
+        roots.clear();
+        collect_heap_object_handles(object, roots);
+    }
+
+    #[inline]
+    fn clear(&self) {
+        // SAFETY: same ownership protocol as prepare().
+        unsafe { &mut *self.handles.get() }.clear();
+    }
+}
+
+unsafe impl Send for AllocationRootBuffer {}
+unsafe impl Sync for AllocationRootBuffer {}
+
+unsafe impl GcRootProvider for AllocationRootBuffer {
+    fn visit(&self, visitor: &mut GcRootVisitor<'_>) {
+        // SAFETY: collection only calls providers after the owning mutator has
+        // parked, so the Vec cannot be concurrently mutated here.
+        let roots = unsafe { &*self.handles.get() };
+        for &handle in roots {
+            if let Some(slot) = handles().gc_slot(handle) {
+                visitor.slot(slot);
+            }
+        }
+    }
+}
+
+#[inline]
+fn push_value_handle(value: Value, roots: &mut Vec<u32>) {
+    if let Some(handle) = value.heap_handle() {
+        roots.push(handle);
+    }
+}
+
+fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
+    match object {
+        HeapObject::List(values) => {
+            for &value in values { push_value_handle(value, roots); }
+        }
+        HeapObject::Map(map) => {
+            for (key, &value) in &map.entries {
+                if let MapKey::Object(handle) = key { roots.push(*handle); }
+                push_value_handle(value, roots);
+            }
+        }
+        HeapObject::Cell(word) => push_value_handle(Value::from_word(*word), roots),
+        HeapObject::Closure {
+            captures,
+            reference_indices,
+            ..
+        } => {
+            for &index in reference_indices.iter() {
+                if let Some(&word) = captures.get(index as usize) {
+                    push_value_handle(Value::from_word(word), roots);
+                }
+            }
+        }
+        HeapObject::Instance { fields, .. } => {
+            for &value in fields.iter() { push_value_handle(value, roots); }
+        }
+        HeapObject::FiberObject { state, trace_metadata, .. } => {
+            // SAFETY: allocation happens on the owning mutator before the object
+            // is published; the Arc-backed state is stable and exclusively owned
+            // by this thread at this point.
+            let state = unsafe { state.get() };
+            if let Some(value) = state.starter { push_value_handle(value, roots); }
+            push_value_handle(state.last_value, roots);
+            push_value_handle(state.error, roots);
+            if let Some(link) = state.link { push_value_handle(link.caller_object, roots); }
+            for (depth, frame) in state.frames.iter().enumerate() {
+                if frame.root_map == NO_INDEX { continue; }
+                let Some(maps) = trace_metadata.gc_maps.get(frame.function as usize) else { continue; };
+                let Some(map) = maps.get(frame.root_map as usize) else { continue; };
+                let Some(banks) = state.banks.get(depth) else { continue; };
+                for reg in 0..frame.reg_count as usize {
+                    if map.general_is_reference(Reg(reg as u8)) {
+                        if let Some(&word) = state.registers.get(frame.reg_base + reg) {
+                            push_value_handle(Value::from_word(word), roots);
+                        }
+                    }
+                }
+                for index in 0..ARGUMENT_REGISTER_COUNT {
+                    if (map.arguments & (1u16 << index)) != 0 {
+                        push_value_handle(Value::from_word(banks.arguments[index]), roots);
+                    }
+                }
+                for index in 0..RETURN_REGISTER_COUNT {
+                    if (map.returns & (1u8 << index)) != 0 {
+                        push_value_handle(Value::from_word(banks.returns[index]), roots);
+                    }
+                }
+                for index in 0..SPECIAL_REGISTER_COUNT {
+                    if (map.special & (1u16 << index)) != 0 {
+                        push_value_handle(Value::from_word(banks.special[index]), roots);
+                    }
+                }
+            }
+        }
+        HeapObject::String(_)
+        | HeapObject::Range { .. }
+        | HeapObject::ClassObject { .. }
+        | HeapObject::BuiltinClass { .. }
+        | HeapObject::Foreign { .. }
+        | HeapObject::ModuleObject { .. } => {}
+    }
+}
+
 struct Heap {
-    slots: Vec<Option<HeapSlot>>,
-    free: Vec<u32>,
-    live: usize,
-    allocations_since_gc: usize,
-    next_gc: usize,
+    collector: &'static GcCollector,
+    mutator: GcMutator,
+    allocation_roots: Arc<AllocationRootBuffer>,
+    _allocation_root_registration: GcRootRegistration,
+    /// Current fiber stack object. It is re-logged after every safepoint so all
+    /// register/bank writes until the next safepoint are covered by StickyImmix's
+    /// object remembered set without putting a barrier in every register store.
+    stack_owner: Value,
+    #[cfg(test)]
+    allocations: Vec<Value>,
+}
+
+fn wren_gc_config() -> GcConfig {
+    fn setting(name: &str, default: usize) -> usize {
+        match std::env::var(name) {
+            Ok(value) => value.parse().unwrap_or_else(|_| {
+                panic!("{name} must be a non-negative integer, got {value:?}")
+            }),
+            Err(std::env::VarError::NotPresent) => default,
+            Err(error) => panic!("invalid {name}: {error}"),
+        }
+    }
+    fn megabytes(name: &str, default: usize) -> usize {
+        setting(name, default >> 20).checked_mul(1 << 20)
+            .unwrap_or_else(|| panic!("{name} overflows the address space"))
+    }
+    let mut config = GcConfig::default();
+    config.heap_bytes = megabytes("WREN_GC_HEAP_MB", config.heap_bytes);
+    config.workers = setting("WREN_GC_WORKERS", config.workers);
+    config.external_gc_threshold = megabytes("WREN_GC_EXTERNAL_MB", config.external_gc_threshold);
+    assert!(config.heap_bytes >= 8 << 20, "WREN_GC_HEAP_MB must be at least 8");
+    assert!(config.workers > 0, "WREN_GC_WORKERS must be at least 1");
+    config
 }
 
 impl Default for Heap {
     fn default() -> Self {
+        let collector = GcCollector::initialize(wren_gc_config());
+        let mut mutator = collector.attach();
+        let allocation_roots = Arc::new(AllocationRootBuffer::new());
+        let provider: Arc<dyn GcRootProvider> = allocation_roots.clone();
+        let allocation_root_registration = mutator.register_roots(provider);
         Self {
-            slots: Vec::new(),
-            free: Vec::new(),
-            live: 0,
-            allocations_since_gc: 0,
-            next_gc: 4096,
+            collector,
+            mutator,
+            allocation_roots,
+            _allocation_root_registration: allocation_root_registration,
+            stack_owner: Value::NULL,
+            #[cfg(test)]
+            allocations: Vec::new(),
         }
     }
 }
@@ -339,74 +864,195 @@ impl Default for Heap {
 impl Heap {
     #[inline]
     fn alloc(&mut self, object: HeapObject) -> Value {
-        let handle = if let Some(handle) = self.free.pop() {
-            let receiver_class = heap_object_receiver_class(&object);
-            self.slots[handle as usize] = Some(HeapSlot {
-                marked: false,
-                receiver_class,
-                object,
-            });
-            handle
-        } else {
-            let handle = self.slots.len() as u32;
-            let receiver_class = heap_object_receiver_class(&object);
-            self.slots.push(Some(HeapSlot {
-                marked: false,
-                receiver_class,
-                object,
-            }));
-            handle
+        // Protect references which currently live only in the Rust-side object
+        // being constructed. Mutator::allocate() may rendezvous for GC before it
+        // returns the new MMTk object.
+        self.allocation_roots.prepare(&object);
+        let handle = handles().allocate_handle();
+        let receiver_class = heap_object_receiver_class(&object);
+        let descriptor = descriptor_for(&object);
+        let external = external_bytes_for(&object);
+        let gc_object = unsafe {
+            self.mutator
+                .allocate(descriptor, std::mem::size_of::<ManagedObject>())
         };
-        self.live += 1;
-        self.allocations_since_gc += 1;
-        Value::from_heap(handle)
+        unsafe {
+            std::ptr::write(
+                gc_object.payload().cast::<ManagedObject>(),
+                ManagedObject {
+                    handle,
+                    receiver_class,
+                    object,
+                },
+            );
+        }
+        handles().publish(handle, gc_object);
+        self.allocation_roots.clear();
+        if external != 0 {
+            unsafe { self.mutator.set_external_bytes(gc_object, external) };
+        }
+        // Allocation can itself trigger a collection. Re-log the active fiber
+        // before the interpreter performs any subsequent register writes.
+        self.remember_stack_owner();
+        let value = Value::from_heap(handle);
+        #[cfg(test)]
+        self.allocations.push(value);
+        value
+    }
+
+    #[inline(always)]
+    fn object(&self, value: Value) -> Option<GcObject> {
+        handles().resolve(value.heap_handle()?)
     }
 
     #[inline(always)]
     fn get(&self, value: Value) -> Option<&HeapObject> {
-        let handle = value.heap_handle()? as usize;
-        // Heap-tagged Values are VM-owned handles. Safe constructors never expose
-        // a freed/out-of-range handle, so the Vec bounds check is redundant on
-        // every object access. `from_raw_bits_unchecked` documents this invariant
-        // for embedders that deliberately bypass the safe Value API.
-        unsafe {
-            self.slots
-                .get_unchecked(handle)
-                .as_ref()
-                .map(|slot| &slot.object)
-        }
+        let object = self.object(value)?;
+        Some(unsafe { &managed_object(object).object })
     }
 
     #[inline(always)]
     fn get_mut(&mut self, value: Value) -> Option<&mut HeapObject> {
-        let handle = value.heap_handle()? as usize;
-        unsafe {
-            self.slots
-                .get_unchecked_mut(handle)
-                .as_mut()
-                .map(|slot| &mut slot.object)
-        }
+        let object = self.object(value)?;
+        Some(unsafe { &mut managed_object_mut(object).object })
     }
 
     #[inline(always)]
     fn receiver_class(&self, value: Value) -> Option<ReceiverClass> {
-        let handle = value.heap_handle()? as usize;
-        unsafe {
-            self.slots
-                .get_unchecked(handle)
-                .as_ref()
-                .and_then(|slot| slot.receiver_class)
+        let object = self.object(value)?;
+        unsafe { managed_object(object).receiver_class }
+    }
+
+    #[inline]
+    fn remember_if_reference(&mut self, owner: Value, value: Value) {
+        if !value.is_heap() {
+            return;
+        }
+        if let Some(owner) = self.object(owner) {
+            unsafe { self.mutator.probable_write(owner) };
         }
     }
 
+    #[inline]
+    fn remember_owner(&mut self, owner: Value) {
+        if let Some(owner) = self.object(owner) {
+            unsafe { self.mutator.probable_write(owner) };
+        }
+    }
+
+    #[inline]
+    fn set_external_bytes(&mut self, owner: Value, bytes: usize) {
+        if let Some(owner) = self.object(owner) {
+            unsafe { self.mutator.set_external_bytes(owner, bytes) };
+        }
+    }
+
+    #[inline]
+    fn set_stack_owner(&mut self, owner: Value) {
+        self.stack_owner = owner;
+        self.remember_stack_owner();
+    }
+
+    #[inline]
+    fn clear_stack_owner(&mut self) {
+        self.stack_owner = Value::NULL;
+    }
+
+    #[inline]
+    fn remember_stack_owner(&mut self) {
+        if self.stack_owner.is_heap() {
+            self.remember_owner(self.stack_owner);
+        }
+    }
+
+    #[inline]
+    fn safepoint(&mut self) {
+        self.mutator.safepoint();
+        self.remember_stack_owner();
+    }
+
+    fn collect_full(&mut self) {
+        self.mutator.collect_full();
+        self.remember_stack_owner();
+    }
+
+    fn register_roots(&mut self, provider: Arc<dyn GcRootProvider>) -> GcRootRegistration {
+        self.mutator.register_roots(provider)
+    }
+
     #[inline(always)]
-    fn should_collect(&self) -> bool {
-        self.allocations_since_gc >= self.next_gc
+    fn collection_count(&self) -> u64 {
+        self.collector.collection_count()
+    }
+
+}
+
+#[derive(Default)]
+struct HandleRootSet {
+    handles: StdMutex<Vec<u32>>,
+}
+
+impl HandleRootSet {
+    fn push(&self, value: Value) {
+        if let Some(handle) = value.heap_handle() {
+            self.handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(handle);
+        }
+    }
+
+    fn replace(&self, handles: Vec<u32>) {
+        *self
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = handles;
+    }
+}
+
+unsafe impl GcRootProvider for HandleRootSet {
+    fn visit(&self, visitor: &mut GcRootVisitor<'_>) {
+        let roots = self
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for &handle in roots.iter() {
+            if let Some(slot) = handles().gc_slot(handle) {
+                visitor.slot(slot);
+            }
+        }
+    }
+}
+
+struct SingleHandleRoot {
+    handle: u32,
+}
+
+unsafe impl GcRootProvider for SingleHandleRoot {
+    fn visit(&self, visitor: &mut GcRootVisitor<'_>) {
+        if let Some(slot) = handles().gc_slot(self.handle) {
+            visitor.slot(slot);
+        }
+    }
+}
+
+/// RAII root for embedding/native code that keeps a Wren Value across another
+/// managed allocation. Dropping the guard immediately removes the root.
+pub struct HostRoot {
+    value: Value,
+    _registration: Option<GcRootRegistration>,
+}
+
+impl HostRoot {
+    #[inline(always)]
+    pub const fn value(&self) -> Value {
+        self.value
     }
 }
 
 // =============================================================================
 // Public host interface
+
 // =============================================================================
 
 /// Mutable runtime view exposed only on slow native/foreign paths.
@@ -415,6 +1061,16 @@ pub struct HostContext<'a> {
 }
 
 impl HostContext<'_> {
+    /// Keep `value` alive across subsequent HostContext allocations. Scalars are
+    /// returned in a zero-cost guard with no collector registration.
+    pub fn root(&mut self, value: Value) -> HostRoot {
+        let registration = value.heap_handle().map(|handle| {
+            let provider: Arc<dyn GcRootProvider> = Arc::new(SingleHandleRoot { handle });
+            self.heap.register_roots(provider)
+        });
+        HostRoot { value, _registration: registration }
+    }
+
     pub fn string_bytes(&self, value: Value) -> Option<&[u8]> {
         match self.heap.get(value) {
             Some(HeapObject::String(string)) => Some(string.as_ref()),
@@ -471,6 +1127,7 @@ impl HostContext<'_> {
     }
 
     pub fn list_set(&mut self, value: Value, index: usize, item: Value) -> Result<Value, RuntimeError> {
+        self.heap.remember_if_reference(value, item);
         match self.heap.get_mut(value) {
             Some(HeapObject::List(list)) => {
                 let slot = list.get_mut(index).ok_or_else(|| RuntimeError::new("list index out of bounds"))?;
@@ -482,18 +1139,36 @@ impl HostContext<'_> {
     }
 
     pub fn list_push(&mut self, value: Value, item: Value) -> Result<Value, RuntimeError> {
-        match self.heap.get_mut(value) {
-            Some(HeapObject::List(list)) => { list.push(item); Ok(item) }
-            _ => Err(RuntimeError::new("receiver is not a List")),
+        self.heap.remember_if_reference(value, item);
+        let resized = match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) => {
+                let old = list.capacity();
+                list.push(item);
+                (list.capacity() != old).then_some(list.capacity())
+            }
+            _ => return Err(RuntimeError::new("receiver is not a List")),
+        };
+        if let Some(capacity) = resized {
+            self.heap.set_external_bytes(value, capacity * std::mem::size_of::<Value>());
         }
+        Ok(item)
     }
 
     pub fn list_insert(&mut self, value: Value, index: usize, item: Value) -> Result<Value, RuntimeError> {
-        match self.heap.get_mut(value) {
-            Some(HeapObject::List(list)) if index <= list.len() => { list.insert(index, item); Ok(item) }
-            Some(HeapObject::List(_)) => Err(RuntimeError::new("list index out of bounds")),
-            _ => Err(RuntimeError::new("receiver is not a List")),
+        self.heap.remember_if_reference(value, item);
+        let resized = match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) if index <= list.len() => {
+                let old = list.capacity();
+                list.insert(index, item);
+                (list.capacity() != old).then_some(list.capacity())
+            }
+            Some(HeapObject::List(_)) => return Err(RuntimeError::new("list index out of bounds")),
+            _ => return Err(RuntimeError::new("receiver is not a List")),
+        };
+        if let Some(capacity) = resized {
+            self.heap.set_external_bytes(value, capacity * std::mem::size_of::<Value>());
         }
+        Ok(item)
     }
 
     pub fn list_remove_at(&mut self, value: Value, index: usize) -> Result<Value, RuntimeError> {
@@ -540,11 +1215,24 @@ impl HostContext<'_> {
     }
 
     pub fn map_set(&mut self, value: Value, key: Value, item: Value) -> Result<Value, RuntimeError> {
-        let key = self.map_key(key)?;
-        match self.heap.get_mut(value) {
-            Some(HeapObject::Map(map)) => { map.entries.insert(key, item); Ok(item) }
-            _ => Err(RuntimeError::new("receiver is not a Map")),
+        let encoded_key = self.map_key(key)?;
+        self.heap.remember_if_reference(value, key);
+        self.heap.remember_if_reference(value, item);
+        let resized = match self.heap.get_mut(value) {
+            Some(HeapObject::Map(map)) => {
+                let old = map.entries.capacity();
+                map.entries.insert(encoded_key, item);
+                (map.entries.capacity() != old).then_some(map.entries.capacity())
+            }
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        };
+        if let Some(capacity) = resized {
+            self.heap.set_external_bytes(
+                value,
+                capacity * std::mem::size_of::<(MapKey, Value)>(),
+            );
         }
+        Ok(item)
     }
 
     pub fn map_remove(&mut self, value: Value, key: Value) -> Result<Value, RuntimeError> {
@@ -632,7 +1320,7 @@ impl HostContext<'_> {
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
             Some(HeapObject::Instance { class_slot, .. }) => format!("<instance class#{class_slot}>"),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign class#{class_slot}>"),
-            Some(HeapObject::FiberObject { fiber }) => format!("<fiber#{fiber}>"),
+            Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber#{fiber}>"),
             Some(HeapObject::ModuleObject { module_slot }) => format!("<module#{module_slot}>"),
             Some(HeapObject::Cell(_)) => "<cell>".to_owned(),
             None => "<dead object>".to_owned(),
@@ -865,6 +1553,9 @@ struct PreparedFunction {
     arity: u8,
     return_kind: RegisterKind,
     capture_count: u16,
+    /// Capture indices whose physical register words contain tagged Wren Values.
+    /// The Box keeps this table at a stable address for moving GC object tracing.
+    capture_reference_indices: Box<[u16]>,
 }
 
 struct PreparedProgram {
@@ -1191,6 +1882,15 @@ impl PreparedProgram {
             matches!(temp.opcode, Opcode::MoveFromRet | Opcode::MoveToRet)
         }) || gc_maps.iter().any(|map| map.returns != 0) || deopt_uses_return;
 
+        let capture_reference_indices = function
+            .frame
+            .captures
+            .iter()
+            .filter(|binding| binding.kind == RegisterKind::Value)
+            .map(|binding| binding.capture_index)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         Ok(PreparedFunction {
             handlers,
             ops,
@@ -1219,6 +1919,7 @@ impl PreparedProgram {
             arity: function.arity,
             return_kind: function.frame.return_kind,
             capture_count: function.capture_count,
+            capture_reference_indices,
         })
     }
 }
@@ -1335,10 +2036,11 @@ fn install_superinstructions(
             }
         }
 
-        // The current collector is non-generational mark/sweep. Explicit write
-        // barriers are semantically empty, so merge them into the preceding
-        // mutation. Keep this list explicit so switching collectors cannot
-        // silently invalidate the optimization.
+        // Managed mutation handlers execute StickyImmix's object barrier
+        // directly. Root-table stores (module/static fields) need no remembered
+        // set entry because VM roots are scanned on every collection. Therefore
+        // the following explicit WriteBarrier is redundant in the prepared
+        // stream and can still be folded away without weakening generational GC.
         if second == Opcode::WriteBarrier
             && matches!(
                 first,
@@ -1656,6 +2358,7 @@ enum FiberStatus {
 #[derive(Clone, Copy)]
 struct FiberLink {
     caller: u32,
+    caller_object: Value,
     dst: Reg,
     catch_error: bool,
 }
@@ -1743,6 +2446,44 @@ impl FiberState {
     }
 }
 
+/// Stable native storage for a fiber stack. The interpreter is the only mutator;
+/// GC workers read it exclusively while all mutators are stopped. Keeping this
+/// behind Arc makes FiberObject self-contained even if a native root outlives the
+/// Interpreter instance that originally created it.
+struct FiberCell {
+    state: std::cell::UnsafeCell<FiberState>,
+}
+
+impl FiberCell {
+    fn new(state: FiberState) -> Self {
+        Self { state: std::cell::UnsafeCell::new(state) }
+    }
+
+    #[inline(always)]
+    unsafe fn get(&self) -> &FiberState {
+        unsafe { &*self.state.get() }
+    }
+
+    #[inline(always)]
+    unsafe fn get_mut(&self) -> &mut FiberState {
+        unsafe { &mut *self.state.get() }
+    }
+}
+
+unsafe impl Send for FiberCell {}
+unsafe impl Sync for FiberCell {}
+
+impl fmt::Debug for FiberCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FiberCell(..)")
+    }
+}
+
+#[derive(Debug)]
+struct FiberTraceMetadata {
+    gc_maps: Box<[Box<[ReferenceMap]>]>,
+}
+
 // =============================================================================
 // Interpreter
 // =============================================================================
@@ -1758,7 +2499,7 @@ enum RunState {
 pub struct Interpreter<'p> {
     jit: Option<Box<TracingJit>>,
     program: &'p BytecodeProgram,
-    prepared: PreparedProgram,
+    prepared: Box<PreparedProgram>,
     host: Box<dyn Host>,
     heap: Heap,
     classes: Vec<RuntimeClass>,
@@ -1769,8 +2510,9 @@ pub struct Interpreter<'p> {
     /// Constants pre-resolved to physical register words once at VM startup.
     /// Hot LOAD_CONST never reinterprets Constant or performs metadata lookup.
     resolved_constants: Vec<Vec<RegisterWord>>,
-    fibers: Vec<Option<FiberState>>,
+    fibers: Vec<Option<Arc<FiberCell>>>,
     free_fibers: Vec<u32>,
+    fiber_trace_metadata: Arc<FiberTraceMetadata>,
     current_fiber: u32,
     run_state: RunState,
     result: Value,
@@ -1781,7 +2523,13 @@ pub struct Interpreter<'p> {
     profile_counters: Vec<Vec<u64>>,
     roots: Vec<Option<Value>>,
     free_roots: Vec<u32>,
+    /// Stable idle snapshot. Active execution additionally installs an exact
+    /// pointer-based provider, but this snapshot keeps VM-owned values alive
+    /// between execution entrypoints.
+    persistent_roots: Arc<HandleRootSet>,
+    _persistent_root_registration: GcRootRegistration,
     gc_enabled: bool,
+    last_gc_collections: u64,
 
     // Hot execution cache. These pointers are refreshed only when frames or
     // fibers change. They turn every GPR access into one pointer add/load.
@@ -1799,6 +2547,67 @@ pub struct Interpreter<'p> {
     hot_pc: u32,
 }
 
+/// Precise VM roots exposed to MMTk while an Interpreter execution entrypoint
+/// is active. The pointer is valid for the lifetime of run_function()/resume();
+/// MMTk only invokes providers after the mutator has reached the STW rendezvous.
+struct VmRootProvider {
+    vm: usize,
+}
+
+unsafe impl Send for VmRootProvider {}
+unsafe impl Sync for VmRootProvider {}
+
+unsafe impl GcRootProvider for VmRootProvider {
+    fn visit(&self, visitor: &mut GcRootVisitor<'_>) {
+        // Interpreter<'p> has the same runtime layout for every 'p. The provider
+        // never outlives the execution method that registered this pointer.
+        let vm = unsafe { &*(self.vm as *const Interpreter<'static>) };
+        let mut root = |value: Value| {
+            if let Some(handle) = value.heap_handle() {
+                if let Some(slot) = handles().gc_slot(handle) {
+                    visitor.slot(slot);
+                }
+            }
+        };
+
+        for &value in &vm.strings { root(value); }
+        for &value in &vm.builtin_values { root(value); }
+        for value in vm.roots.iter().filter_map(|slot| *slot) { root(value); }
+        for class in &vm.classes {
+            root(class.class_value);
+            for &value in &class.static_fields { root(value); }
+        }
+        for module in &vm.modules {
+            root(module.module_value);
+            for &value in &module.variables { root(value); }
+        }
+        if let Some(fiber) = vm
+            .fibers
+            .get(vm.current_fiber as usize)
+            .and_then(|slot| slot.as_ref())
+        {
+            // SAFETY: provider runs only while mutators are stopped.
+            root(unsafe { fiber.get() }.object);
+        }
+        root(vm.result);
+    }
+}
+
+impl Drop for Interpreter<'_> {
+    fn drop(&mut self) {
+        // Remove every VM-owned strong root and force a full collection while
+        // the mutator and its native resources are still alive. Managed fibers
+        // and closures are self-contained (Arc/Box-backed), so externally rooted
+        // objects may survive this VM; this collection primarily releases the
+        // ordinary VM-owned heap promptly and recycles stable handle IDs.
+        self.persistent_roots.replace(Vec::new());
+        self.roots.clear();
+        self.heap.clear_stack_owner();
+        self.heap.allocation_roots.clear();
+        self.heap.collect_full();
+    }
+}
+
 impl<'p> Interpreter<'p> {
     pub fn new(program: &'p BytecodeProgram) -> Result<Self, RuntimeError> {
         Self::with_host(program, Box::<NoHost>::default())
@@ -1809,22 +2618,41 @@ impl<'p> Interpreter<'p> {
         // one-time validation barrier. Never execute unverified bytecode.
         BytecodeVerifier::verify_program(program)
             .map_err(|error| RuntimeError::new(format!("bytecode verification failed: {error}")))?;
-        let mut prepared = PreparedProgram::prepare(program)?;
+        let mut prepared = Box::new(PreparedProgram::prepare(program)?);
+        let fiber_trace_metadata = Arc::new(FiberTraceMetadata {
+            gc_maps: prepared
+                .functions
+                .iter()
+                .map(|function| function.gc_maps.clone().into_boxed_slice())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        });
         let mut heap = Heap::default();
+        // VM construction itself may allocate enough metadata to trigger MMTk.
+        // Keep every object created so far live through one temporary provider;
+        // handles are canonical MMTk slots and are updated if a collection moves
+        // an object during initialization.
+        let init_roots = Arc::new(HandleRootSet::default());
+        let persistent_root_registration = heap.register_roots(init_roots.clone());
 
         let mut strings = Vec::with_capacity(program.metadata.strings.len());
         for string in &program.metadata.strings {
-            strings.push(heap.alloc(HeapObject::String(Arc::<[u8]>::from(string.as_bytes()))));
+            let value = heap.alloc(HeapObject::String(Arc::<[u8]>::from(string.as_bytes())));
+            init_roots.push(value);
+            strings.push(value);
         }
 
         let mut builtin_values = Vec::with_capacity(BuiltinId::COUNT);
         for builtin in BuiltinId::ALL {
-            builtin_values.push(heap.alloc(HeapObject::BuiltinClass { builtin }));
+            let value = heap.alloc(HeapObject::BuiltinClass { builtin });
+            init_roots.push(value);
+            builtin_values.push(value);
         }
 
         let mut modules = Vec::with_capacity(program.metadata.modules.len());
         for (slot, info) in program.metadata.modules.iter().enumerate() {
             let module_value = heap.alloc(HeapObject::ModuleObject { module_slot: slot as u32 });
+            init_roots.push(module_value);
             let mut variables = vec![Value::NULL; info.variable_count as usize];
             for binding in &info.builtin_bindings {
                 let Some(target) = variables.get_mut(binding.slot.0 as usize) else {
@@ -1847,6 +2675,7 @@ impl<'p> Interpreter<'p> {
         let mut classes = Vec::with_capacity(program.metadata.classes.len());
         for (slot, info) in program.metadata.classes.iter().enumerate() {
             let class_value = heap.alloc(HeapObject::ClassObject { class_slot: slot as u32 });
+            init_roots.push(class_value);
             classes.push(RuntimeClass {
                 id: info.id,
                 name: info.name,
@@ -1928,10 +2757,21 @@ impl<'p> Interpreter<'p> {
             vec![0; function.chunk.profile_counters.len()]
         }).collect();
 
-        // Main fiber is a permanent VM root.
-        let main_object = heap.alloc(HeapObject::FiberObject { fiber: 0 });
-        let mut main = FiberState::new(main_object, FiberStatus::Running);
-        main.registers.reserve(4096);
+        // FiberState lives in stable Arc storage. The managed Fiber object owns
+        // another Arc plus immutable GC-map metadata, so tracing never depends on
+        // raw pointers into Interpreter fields.
+        let mut main_state = FiberState::new(Value::NULL, FiberStatus::Running);
+        main_state.registers.reserve(4096);
+        let main = Arc::new(FiberCell::new(main_state));
+        let main_object = heap.alloc(HeapObject::FiberObject {
+            fiber: 0,
+            state: main.clone(),
+            trace_metadata: fiber_trace_metadata.clone(),
+        });
+        init_roots.push(main_object);
+        unsafe { main.get_mut() }.object = main_object;
+        heap.set_stack_owner(main_object);
+        let last_gc_collections = heap.collection_count();
 
         Ok(Self {
             jit: Some(Box::new(TracingJit::default())),
@@ -1947,6 +2787,7 @@ impl<'p> Interpreter<'p> {
             resolved_constants,
             fibers: vec![Some(main)],
             free_fibers: Vec::new(),
+            fiber_trace_metadata,
             current_fiber: 0,
             run_state: RunState::Running,
             result: Value::NULL,
@@ -1957,7 +2798,10 @@ impl<'p> Interpreter<'p> {
             profile_counters,
             roots: Vec::new(),
             free_roots: Vec::new(),
+            persistent_roots: init_roots,
+            _persistent_root_registration: persistent_root_registration,
             gc_enabled: true,
+            last_gc_collections,
             hot_frame: std::ptr::null_mut(),
             hot_banks: std::ptr::null_mut(),
             hot_registers: std::ptr::null_mut(),
@@ -1972,6 +2816,54 @@ impl<'p> Interpreter<'p> {
 
     pub fn set_gc_enabled(&mut self, enabled: bool) {
         self.gc_enabled = enabled;
+    }
+
+    #[inline]
+    fn gc_root_registration(&mut self) -> GcRootRegistration {
+        let provider: Arc<dyn GcRootProvider> = Arc::new(VmRootProvider {
+            vm: self as *mut Self as usize,
+        });
+        self.heap.register_roots(provider)
+    }
+
+    fn sync_persistent_roots(&self) {
+        let mut roots = Vec::with_capacity(
+            self.strings.len()
+                + self.builtin_values.len()
+                + self.classes.len()
+                + self.modules.len()
+                + self.roots.len()
+                + 8,
+        );
+        let mut push = |value: Value| {
+            if let Some(handle) = value.heap_handle() { roots.push(handle); }
+        };
+        for &value in &self.strings { push(value); }
+        for &value in &self.builtin_values { push(value); }
+        for value in self.roots.iter().filter_map(|slot| *slot) { push(value); }
+        for class in &self.classes {
+            push(class.class_value);
+            for &value in &class.static_fields { push(value); }
+        }
+        for module in &self.modules {
+            push(module.module_value);
+            for &value in &module.variables { push(value); }
+        }
+        if let Some(fiber) = self
+            .fibers
+            .get(self.current_fiber as usize)
+            .and_then(|slot| slot.as_deref())
+        {
+            // SAFETY: sync_persistent_roots runs on the owning mutator thread.
+            push(unsafe { fiber.get() }.object);
+        }
+        push(self.result);
+        self.persistent_roots.replace(roots);
+    }
+
+    /// Snapshot of collector counters for benchmarking/tuning.
+    pub fn gc_statistics(&self) -> crate::wren_gc::Statistics {
+        self.heap.mutator.statistics()
     }
 
         /// Set to None for an interpreter-only run, or provide tracing thresholds.
@@ -2106,20 +2998,23 @@ impl<'p> Interpreter<'p> {
     }
 
     pub fn add_root(&mut self, value: Value) -> u32 {
-        if let Some(index) = self.free_roots.pop() {
+        let index = if let Some(index) = self.free_roots.pop() {
             self.roots[index as usize] = Some(value);
             index
         } else {
             let index = self.roots.len() as u32;
             self.roots.push(Some(value));
             index
-        }
+        };
+        self.sync_persistent_roots();
+        index
     }
 
     pub fn set_root(&mut self, root: u32, value: Value) -> Result<(), RuntimeError> {
         let slot = self.roots.get_mut(root as usize).ok_or_else(|| RuntimeError::new("invalid root handle"))?;
         if slot.is_none() { return Err(RuntimeError::new("root handle has been released")); }
         *slot = Some(value);
+        self.sync_persistent_roots();
         Ok(())
     }
 
@@ -2127,9 +3022,11 @@ impl<'p> Interpreter<'p> {
         if let Some(slot) = self.roots.get_mut(root as usize) {
             if slot.take().is_some() { self.free_roots.push(root); }
         }
+        self.sync_persistent_roots();
     }
 
     pub fn run_function(&mut self, function: FuncId, args: &[Value]) -> Result<ExecutionResult, RuntimeError> {
+        let _gc_roots = self.gc_root_registration();
         let function_index = *self.prepared.function_by_id.get(&function)
             .ok_or_else(|| RuntimeError::new(format!("unknown function {:?}", function)))?;
         if !self.fiber(self.current_fiber).frames.is_empty() {
@@ -2158,7 +3055,9 @@ impl<'p> Interpreter<'p> {
         }
         self.push_frame_direct(function_index, &words[..args.len()], None, None)?;
         self.dispatch_loop();
-        self.finish_result()
+        let result = self.finish_result();
+        self.sync_persistent_roots();
+        result
     }
 
     pub fn run_module(&mut self, function: FuncId) -> Result<ExecutionResult, RuntimeError> {
@@ -2169,6 +3068,7 @@ impl<'p> Interpreter<'p> {
     ///
     /// The value becomes the result of the suspended Fiber operation.
     pub fn resume(&mut self, value: Value) -> Result<ExecutionResult, RuntimeError> {
+        let _gc_roots = self.gc_root_registration();
         if self.run_state != RunState::Suspended {
             return Err(RuntimeError::new("resume requires a suspended VM"));
         }
@@ -2191,7 +3091,9 @@ impl<'p> Interpreter<'p> {
         self.result = Value::NULL;
         self.error = None;
         self.dispatch_loop();
-        self.finish_result()
+        let result = self.finish_result();
+        self.sync_persistent_roots();
+        result
     }
 
     fn finish_result(&mut self) -> Result<ExecutionResult, RuntimeError> {
@@ -2229,12 +3131,21 @@ impl<'p> Interpreter<'p> {
 
     #[inline(always)]
     fn fiber(&self, id: u32) -> &FiberState {
-        unsafe { self.fibers.get_unchecked(id as usize).as_ref().unwrap_unchecked() }
+        let cell = unsafe { self.fibers.get_unchecked(id as usize).as_ref().unwrap_unchecked() };
+        unsafe { cell.get() }
     }
 
     #[inline(always)]
     fn fiber_mut(&mut self, id: u32) -> &mut FiberState {
-        unsafe { self.fibers.get_unchecked_mut(id as usize).as_mut().unwrap_unchecked() }
+        let cell = unsafe { self.fibers.get_unchecked(id as usize).as_ref().unwrap_unchecked() };
+        unsafe { cell.get_mut() }
+    }
+
+    #[inline]
+    fn switch_current_fiber(&mut self, id: u32) {
+        self.current_fiber = id;
+        let owner = self.fiber(id).object;
+        self.heap.set_stack_owner(owner);
     }
 
     #[inline(always)]
@@ -2278,10 +3189,11 @@ impl<'p> Interpreter<'p> {
     #[inline]
     fn refresh_hot_frame(&mut self) {
         let current = self.current_fiber as usize;
-        let Some(fiber) = self.fibers.get_mut(current).and_then(Option::as_mut) else {
+        let Some(cell) = self.fibers.get(current).and_then(Option::as_ref) else {
             self.clear_hot_frame();
             return;
         };
+        let fiber = unsafe { cell.get_mut() };
         let depth = fiber.frames.len();
         if depth == 0 {
             self.clear_hot_frame();
@@ -2438,6 +3350,7 @@ impl<'p> Interpreter<'p> {
 
     #[inline(always)]
     unsafe fn branch_to(&mut self, op: &PreparedOp, target: u32) {
+        let backwards = target < self.hot_pc;
         if target < self.hot_pc && self.jit.is_some() {
             // Once a loop has been blacklisted, never enter the tiering manager
             // from this header again. A byte lookup is substantially cheaper than
@@ -2460,6 +3373,15 @@ impl<'p> Interpreter<'p> {
             }
         } else {
             self.set_pc(target);
+        }
+        if backwards && self.heap.mutator.collection_requested()
+            && self.run_state == RunState::Running && !self.hot_frame.is_null()
+        {
+            let current = self.current_prepared().original_ops[self.hot_pc as usize];
+            if current.gc_map != NO_INDEX {
+                self.mark_gc_point(&current);
+                self.maybe_collect();
+            }
         }
     }
 
@@ -2596,7 +3518,7 @@ impl<'p> Interpreter<'p> {
         // while constructing the frame, so retaining this slice is safe here.
         let captures: &[RegisterWord] = if let Some(closure_value) = closure {
             match self.heap.get(closure_value) {
-                Some(HeapObject::Closure { function_index: actual, captures })
+                Some(HeapObject::Closure { function_index: actual, captures, .. })
                     if *actual == function_index => captures.as_ref(),
                 Some(HeapObject::Closure { .. }) => {
                     return Err(RuntimeError::new("closure/function mismatch"));
@@ -2608,10 +3530,16 @@ impl<'p> Interpreter<'p> {
         };
 
         let current = self.current_fiber;
-        let fiber = self.fibers[current as usize].as_mut().expect("live fiber");
+        let cell = self.fibers[current as usize].as_ref().expect("live fiber");
+        let fiber = unsafe { cell.get_mut() };
         let depth = fiber.frames.len();
         let base = fiber.register_top;
         let needed = base + reg_count;
+        // External stack storage is already charged at its current capacities.
+        // Re-account only when this push can force one of those Vecs to grow.
+        let may_grow_external = depth == fiber.frames.capacity()
+            || (fiber.banks.len() <= depth && fiber.banks.len() == fiber.banks.capacity())
+            || needed > fiber.registers.capacity();
         if fiber.registers.len() < needed {
             fiber.registers.resize(needed, RegisterWord(0));
         }
@@ -2679,6 +3607,12 @@ impl<'p> Interpreter<'p> {
             reg_count as u16,
             return_dst,
         ));
+        let external_update = may_grow_external.then(|| {
+            (fiber.object, fiber_state_external_bytes(fiber))
+        });
+        if let Some((owner, bytes)) = external_update {
+            self.heap.set_external_bytes(owner, bytes);
+        }
         self.refresh_hot_frame();
         Ok(())
     }
@@ -2764,7 +3698,7 @@ impl<'p> Interpreter<'p> {
             fiber.link.take()
         };
         if let Some(link) = link {
-            self.current_fiber = link.caller;
+            self.switch_current_fiber(link.caller);
             let caller = self.fiber_mut(link.caller);
             caller.status = FiberStatus::Running;
             if let Some(frame) = caller.frames.last() {
@@ -2800,7 +3734,7 @@ impl Interpreter<'_> {
     fn receiver_class(&self, value: Value) -> Result<ReceiverClass, RuntimeError> {
         // Numbers dominate operator dispatch and are the cheapest tag to classify.
         // Test them first; null/bool remain two direct-word comparisons, while all
-        // heap objects share the cached ReceiverClass stored in HeapSlot.
+        // Heap objects share the ReceiverClass cached in their managed payload.
         if value.is_num() {
             return Ok(ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Num as u64));
         }
@@ -3368,22 +4302,33 @@ impl Interpreter<'_> {
             NativeBuiltin::FiberError => {
                 let fiber = Value::from_word(receiver);
                 let id = match self.heap.get(fiber) {
-                    Some(HeapObject::FiberObject { fiber }) => *fiber,
+                    Some(HeapObject::FiberObject { fiber, .. }) => *fiber,
                     _ => { self.fail_at(op, "Fiber.error receiver is not a Fiber"); return; }
                 };
-                let value = self.fibers.get(id as usize).and_then(|slot| slot.as_ref()).map(|state| state.error).unwrap_or(Value::NULL);
+                let value = self.fibers
+                    .get(id as usize)
+                    .and_then(|slot| slot.as_ref())
+                    .map(|state| unsafe { state.get() }.error)
+                    .unwrap_or(Value::NULL);
                 unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
             }
             NativeBuiltin::FiberIsDone => {
                 let fiber = Value::from_word(receiver);
                 let id = match self.heap.get(fiber) {
-                    Some(HeapObject::FiberObject { fiber }) => *fiber,
+                    Some(HeapObject::FiberObject { fiber, .. }) => *fiber,
                     _ => { self.fail_at(op, "Fiber.isDone receiver is not a Fiber"); return; }
                 };
-                let done = self.fibers.get(id as usize).and_then(|slot| slot.as_ref()).map_or(true, |state| matches!(state.status, FiberStatus::Done | FiberStatus::Failed));
+                let done = self
+                    .fibers
+                    .get(id as usize)
+                    .and_then(|slot| slot.as_ref())
+                    .map_or(true, |state| matches!(unsafe { state.get() }.status, FiberStatus::Done | FiberStatus::Failed));
                 unsafe { self.set_reg(op.a, Value::from_bool(done).word()); self.advance(op); }
             }
             NativeBuiltin::SystemGc => {
+                // System.gc() is itself a GC-capable call. Publish the exact
+                // stack map for this Invoke before asking MMTk to stop the world.
+                self.mark_gc_point(op);
                 self.collect_garbage();
                 unsafe { self.set_reg(op.a, Value::NULL.word()); self.advance(op); }
             }
@@ -3511,150 +4456,58 @@ impl Interpreter<'_> {
         }
     }
 
+    #[inline]
     fn maybe_collect(&mut self) {
-        if self.gc_enabled && self.heap.should_collect() { self.collect_garbage(); }
+        // MMTk may request a rendezvous independently of the language-level
+        // System.gc switch. Polling is extremely cheap when no GC is requested.
+        self.heap.safepoint();
+        let collections = self.heap.collection_count();
+        if collections != self.last_gc_collections {
+            self.last_gc_collections = collections;
+            self.reap_dead_fibers();
+            // Drop stale idle handles promptly. During active execution the
+            // pointer-based provider remains the authoritative exact root set.
+            self.sync_persistent_roots();
+        }
     }
 
     pub fn collect_garbage(&mut self) {
+        if !self.gc_enabled {
+            self.heap.safepoint();
+            return;
+        }
+        // During dispatch run_function()/resume() already owns the provider. If
+        // collection is requested while idle, install one for this call only.
+        let _idle_gc_roots = if self.hot_frame.is_null() {
+            Some(self.gc_root_registration())
+        } else {
+            None
+        };
         self.flush_hot_pc();
-        let mut work = Vec::<u32>::new();
-        for &value in self
-            .strings
-            .iter()
-            .chain(self.builtin_values.iter())
-            .chain(self.roots.iter().filter_map(|x| x.as_ref()))
-        {
-            mark_value_handle(&mut self.heap, value, &mut work);
-        }
-        for class in &self.classes {
-            mark_value_handle(&mut self.heap, class.class_value, &mut work);
-            for &value in &class.static_fields { mark_value_handle(&mut self.heap, value, &mut work); }
-        }
-        for module in &self.modules {
-            mark_value_handle(&mut self.heap, module.module_value, &mut work);
-            for &value in &module.variables { mark_value_handle(&mut self.heap, value, &mut work); }
-        }
-        if let Some(fiber) = self.fibers.get(self.current_fiber as usize).and_then(|x| x.as_ref()) {
-            mark_value_handle(&mut self.heap, fiber.object, &mut work);
-        }
+        self.heap.collect_full();
+        self.last_gc_collections = self.heap.collection_count();
+        self.reap_dead_fibers();
+        self.sync_persistent_roots();
+    }
 
-        let mut traced_fibers = HashSet::<u32>::new();
-        while let Some(handle) = work.pop() {
-            let object_ptr: *const HeapObject = match self.heap.slots.get(handle as usize).and_then(|x| x.as_ref()) {
-                Some(slot) => &slot.object,
-                None => continue,
-            };
-            // SAFETY: objects are not moved or swept until the mark worklist is empty.
-            match unsafe { &*object_ptr } {
-                HeapObject::List(values) => for &value in values { mark_value_handle(&mut self.heap, value, &mut work); },
-                HeapObject::Map(map) => {
-                    for (key, &value) in &map.entries {
-                        if let MapKey::Object(handle) = key { mark_handle(&mut self.heap, *handle, &mut work); }
-                        mark_value_handle(&mut self.heap, value, &mut work);
-                    }
-                }
-                HeapObject::Cell(word) => mark_value_handle(&mut self.heap, Value::from_word(*word), &mut work),
-                HeapObject::Closure { function_index, captures } => {
-                    let function = &self.prepared.functions[*function_index as usize];
-                    for binding in &function.frame.captures {
-                        if binding.kind == RegisterKind::Value {
-                            if let Some(&word) = captures.get(binding.capture_index as usize) {
-                                mark_value_handle(&mut self.heap, Value::from_word(word), &mut work);
-                            }
-                        }
-                    }
-                }
-                HeapObject::Instance { fields, .. } => for &value in fields.iter() { mark_value_handle(&mut self.heap, value, &mut work); },
-                HeapObject::FiberObject { fiber } => {
-                    if traced_fibers.insert(*fiber) { self.mark_fiber_roots(*fiber, &mut work); }
-                }
-                HeapObject::String(_) | HeapObject::Range { .. } | HeapObject::ClassObject { .. }
-                | HeapObject::BuiltinClass { .. } | HeapObject::Foreign { .. } | HeapObject::ModuleObject { .. } => {}
-            }
-        }
-
-        self.heap.free.clear();
-        self.heap.live = 0;
-        for (index, slot) in self.heap.slots.iter_mut().enumerate() {
-            match slot {
-                Some(object) if object.marked => {
-                    object.marked = false;
-                    self.heap.live += 1;
-                }
-                Some(_) => {
-                    *slot = None;
-                    self.heap.free.push(index as u32);
-                }
-                None => self.heap.free.push(index as u32),
-            }
-        }
-        self.heap.allocations_since_gc = 0;
-        self.heap.next_gc = self.heap.live.saturating_mul(2).max(4096);
-
+    fn reap_dead_fibers(&mut self) {
+        // Fiber native state is intentionally outside the moving heap. The
+        // Managed FiberObject cleanup clears the canonical handle on a GC worker.
+        // Reclaim native FiberState storage only after mutators resume, so
+        // trace_fiber can never race the Box drop.
         for index in 1..self.fibers.len() {
-            let keep = self.fibers[index].as_ref().map_or(false, |fiber| {
-                fiber.object.heap_handle().and_then(|handle| self.heap.slots.get(handle as usize)).and_then(|x| x.as_ref()).is_some()
+            let dead = self.fibers[index].as_ref().is_some_and(|cell| {
+                let fiber = unsafe { cell.get() };
+                !matches!(
+                    self.heap.get(fiber.object),
+                    Some(HeapObject::FiberObject { fiber: live_id, .. })
+                        if *live_id == index as u32
+                )
             });
-            if !keep && self.fibers[index].take().is_some() { self.free_fibers.push(index as u32); }
-        }
-    }
-
-    fn mark_fiber_roots(&mut self, fiber_id: u32, work: &mut Vec<u32>) {
-        let Some(fiber) = self.fibers.get(fiber_id as usize).and_then(|x| x.as_ref()) else { return; };
-        let mut values = Vec::<Value>::new();
-        if let Some(starter) = fiber.starter { values.push(starter); }
-        values.push(fiber.last_value);
-        values.push(fiber.error);
-        // A call()/try() link is a strong runtime edge. The active callee must
-        // keep every suspended caller in its chain alive even when user code
-        // no longer holds an explicit Fiber reference. transfer() creates no
-        // such edge by design.
-        if let Some(link) = fiber.link {
-            if let Some(caller) = self.fibers.get(link.caller as usize).and_then(|slot| slot.as_ref()) {
-                values.push(caller.object);
+            if dead && self.fibers[index].take().is_some() {
+                self.free_fibers.push(index as u32);
             }
         }
-        for (depth, frame) in fiber.frames.iter().enumerate() {
-            let function = &self.prepared.functions[frame.function as usize];
-            if frame.root_map != NO_INDEX {
-                if let Some(map) = function.gc_maps.get(frame.root_map as usize) {
-                    let banks = unsafe { fiber.banks.get_unchecked(depth) };
-                    for reg in 0..frame.reg_count as usize {
-                        if map.general_is_reference(Reg(reg as u8)) {
-                            values.push(Value::from_word(fiber.registers[frame.reg_base + reg]));
-                        }
-                    }
-                    for index in 0..ARGUMENT_REGISTER_COUNT {
-                        if (map.arguments & (1u16 << index)) != 0 {
-                            values.push(Value::from_word(banks.arguments[index]));
-                        }
-                    }
-                    for index in 0..RETURN_REGISTER_COUNT {
-                        if (map.returns & (1u8 << index)) != 0 {
-                            values.push(Value::from_word(banks.returns[index]));
-                        }
-                    }
-                    for index in 0..SPECIAL_REGISTER_COUNT {
-                        if (map.special & (1u16 << index)) != 0 {
-                            values.push(Value::from_word(banks.special[index]));
-                        }
-                    }
-                }
-            }
-        }
-        for value in values { mark_value_handle(&mut self.heap, value, work); }
-    }
-}
-
-#[inline]
-fn mark_value_handle(heap: &mut Heap, value: Value, work: &mut Vec<u32>) {
-    if let Some(handle) = value.heap_handle() { mark_handle(heap, handle, work); }
-}
-
-#[inline]
-fn mark_handle(heap: &mut Heap, handle: u32, work: &mut Vec<u32>) {
-    if let Some(Some(slot)) = heap.slots.get_mut(handle as usize) {
-        if !slot.marked { slot.marked = true; work.push(handle); }
     }
 }
 
@@ -3680,18 +4533,32 @@ impl Interpreter<'_> {
         {
             return Err(RuntimeError::new("Fiber function cannot take more than one parameter"));
         }
-        let id = if let Some(id) = self.free_fibers.pop() { id } else { self.fibers.len() as u32 };
-        let object = self.heap.alloc(HeapObject::FiberObject { fiber: id });
-        let mut fiber = FiberState::new(object, FiberStatus::New);
-        fiber.starter = Some(closure);
-        if id as usize == self.fibers.len() { self.fibers.push(Some(fiber)); } else { self.fibers[id as usize] = Some(fiber); }
-        let _ = function_index;
+
+        let id = if let Some(id) = self.free_fibers.pop() {
+            id
+        } else {
+            self.fibers.len() as u32
+        };
+        let mut state = FiberState::new(Value::NULL, FiberStatus::New);
+        state.starter = Some(closure);
+        let fiber = Arc::new(FiberCell::new(state));
+        let object = self.heap.alloc(HeapObject::FiberObject {
+            fiber: id,
+            state: fiber.clone(),
+            trace_metadata: self.fiber_trace_metadata.clone(),
+        });
+        unsafe { fiber.get_mut() }.object = object;
+        if id as usize == self.fibers.len() {
+            self.fibers.push(Some(fiber));
+        } else {
+            self.fibers[id as usize] = Some(fiber);
+        }
         Ok(object)
     }
 
     fn fiber_id_from_value(&self, value: Value) -> Result<u32, RuntimeError> {
         match self.heap.get(value) {
-            Some(HeapObject::FiberObject { fiber }) => Ok(*fiber),
+            Some(HeapObject::FiberObject { fiber, .. }) => Ok(*fiber),
             _ => Err(RuntimeError::new("value is not a Fiber")),
         }
     }
@@ -3738,8 +4605,12 @@ impl Interpreter<'_> {
         self.fiber_mut(source).status = FiberStatus::Suspended;
 
         if is_call {
+            let caller_object = self.fiber(source).object;
+            let target_object = self.fiber(target).object;
+            self.heap.remember_if_reference(target_object, caller_object);
             self.fiber_mut(target).link = Some(FiberLink {
                 caller: source,
+                caller_object,
                 dst: Reg(op.a),
                 catch_error,
             });
@@ -3768,7 +4639,7 @@ impl Interpreter<'_> {
                 _ => { self.fail_at(op, "new fiber has invalid starter closure"); return; }
             };
 
-            self.current_fiber = target;
+            self.switch_current_fiber(target);
             self.fiber_mut(target).status = FiberStatus::Running;
             if let Err(error) = self.push_frame(
                 function_index,
@@ -3793,7 +4664,7 @@ impl Interpreter<'_> {
         }
 
         let suspend_dst = self.fiber_mut(target).suspend_dst.take();
-        self.current_fiber = target;
+        self.switch_current_fiber(target);
         self.fiber_mut(target).status = FiberStatus::Running;
 
         if let Some(dst) = suspend_dst {
@@ -3853,7 +4724,7 @@ impl Interpreter<'_> {
         // then immediately aborts that target. Error propagation therefore
         // follows the caller chain the target already had (typically from
         // try()), exactly like Wren's runFiber(..., isCall=false) + error.
-        self.current_fiber = target;
+        self.switch_current_fiber(target);
         self.fiber_mut(target).status = FiberStatus::Running;
         self.refresh_hot_frame();
         self.abort_current_fiber(op, error);
@@ -3870,7 +4741,7 @@ impl Interpreter<'_> {
         self.fiber_mut(current).suspend_dst = suspend_dst;
 
         if let Some(link) = link {
-            self.current_fiber = link.caller;
+            self.switch_current_fiber(link.caller);
             self.fiber_mut(link.caller).status = FiberStatus::Running;
             let caller = self.fiber_mut(link.caller);
             if let Some(frame) = caller.frames.last() {
@@ -3912,7 +4783,7 @@ impl Interpreter<'_> {
             self.fail(RuntimeError::new(format!("unhandled fiber error: {:?}", error)));
             return;
         };
-        self.current_fiber = link.caller;
+        self.switch_current_fiber(link.caller);
         self.fiber_mut(link.caller).status = FiberStatus::Running;
         self.refresh_hot_frame();
         if link.catch_error {
@@ -4595,6 +5466,7 @@ unsafe fn h_load_field_return(vm:&mut Interpreter, ptr:*const PreparedOp){
 }
 unsafe fn h_store_field(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;let obj=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));
+    vm.heap.remember_if_reference(obj, value);
     let Some(HeapObject::Instance{fields,..})=vm.heap.get_mut(obj) else {vm.fail_at(op,"StoreField object is not an instance");return;};
     let index=op.x as usize;
     debug_assert!(index < fields.len(), "verified StoreField slot is out of range");
@@ -4648,10 +5520,10 @@ unsafe fn h_load_module_var_return(vm:&mut Interpreter, ptr:*const PreparedOp){l
 unsafe fn h_store_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.a));*module_slot_ptr(op)=value;vm.advance(op)}
 
 unsafe fn h_alloc_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::Cell(vm.reg(op.b)));vm.set_reg(op.a,value.word());vm.advance(op)}
-unsafe fn h_load_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(v))=>{vm.set_reg(op.a,*v);vm.advance(op)},_=>vm.fail_at(op,"LoadCell operand is not cell")}}
-unsafe fn h_load_cell_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(v))=>vm.return_from_frame(*v,None),_=>vm.fail_at(op,"LoadCell operand is not cell")}}
-unsafe fn h_store_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.a));let value=vm.reg(op.b);match vm.heap.get_mut(cell){Some(HeapObject::Cell(v))=>{*v=value;vm.advance(op)},_=>vm.fail_at(op,"StoreCell operand is not cell")}}
-unsafe fn h_make_closure(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let count=((op.b as u16)|((op.c as u16)<<8)) as usize;let current=vm.current_frame().function as usize;let start=op.args_offset as usize;let mut captures=Vec::with_capacity(count);for index in 0..count{let reg=vm.prepared.functions[current].call_args[start+index];captures.push(vm.reg(reg.0));}let value=vm.heap.alloc(HeapObject::Closure{function_index:op.x,captures:captures.into_boxed_slice()});vm.set_reg(op.a,value.word());vm.advance(op)}
+unsafe fn h_load_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(value))=>{vm.set_reg(op.a,*value);vm.advance(op)},_=>vm.fail_at(op,"LoadCell operand is not cell")}}
+unsafe fn h_load_cell_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(value))=>vm.return_from_frame(*value,None),_=>vm.fail_at(op,"LoadCell operand is not cell")}}
+unsafe fn h_store_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.a));let word=vm.reg(op.b);let value=Value::from_word(word);vm.heap.remember_if_reference(cell,value);match vm.heap.get_mut(cell){Some(HeapObject::Cell(slot))=>{*slot=word;vm.advance(op)},_=>vm.fail_at(op,"StoreCell operand is not cell")}}
+unsafe fn h_make_closure(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let count=((op.b as u16)|((op.c as u16)<<8)) as usize;let current=vm.current_frame().function as usize;let start=op.args_offset as usize;let mut captures=Vec::with_capacity(count);for index in 0..count{let reg=vm.prepared.functions[current].call_args[start+index];captures.push(vm.reg(reg.0));}let reference_indices=vm.prepared.functions[op.x as usize].capture_reference_indices.clone();let value=vm.heap.alloc(HeapObject::Closure{function_index:op.x,captures:captures.into_boxed_slice(),reference_indices});vm.set_reg(op.a,value.word());vm.advance(op)}
 
 #[inline]
 fn normalize_index(index: i32, len: usize) -> Option<usize> {
@@ -4663,15 +5535,47 @@ unsafe fn h_alloc_list(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;
 unsafe fn h_alloc_list_cap(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cap=word_i32(vm.reg(op.b));if cap<0{vm.fail_at(op,"negative list capacity");return;}vm.mark_gc_point(op);vm.maybe_collect();let v=vm.heap.alloc(HeapObject::List(Vec::with_capacity(cap as usize)));vm.set_reg(op.a,v.word());vm.advance(op)}
 unsafe fn h_list_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.b));match vm.heap.get(list){Some(HeapObject::List(values))=>{vm.set_reg(op.a,i32_word(values.len() as i32));vm.advance(op)},_=>vm.fail_at(op,"ListLen operand is not list")}}
 unsafe fn h_list_get(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));let value=match vm.heap.get(list){Some(HeapObject::List(values))=>normalize_index(index,values.len()).map(|i|*values.get_unchecked(i)),_=>None};match value{Some(v)=>{vm.set_reg(op.a,v.word());vm.advance(op)},None=>vm.fail_at(op,"list index out of bounds")}}
-unsafe fn h_list_set(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let index=word_i32(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));match vm.heap.get_mut(list){Some(HeapObject::List(values))=>if let Some(i)=normalize_index(index,values.len()){*values.get_unchecked_mut(i)=value;vm.advance(op)}else{vm.fail_at(op,"list index out of bounds")},_=>vm.fail_at(op,"ListSet operand is not list")}}
-unsafe fn h_list_append(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));vm.mark_gc_point(op);vm.maybe_collect();match vm.heap.get_mut(list){Some(HeapObject::List(values))=>{values.push(value);vm.advance(op)},_=>vm.fail_at(op,"ListAppend operand is not list")}}
-unsafe fn h_list_insert(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let index=word_i32(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));vm.mark_gc_point(op);vm.maybe_collect();match vm.heap.get_mut(list){Some(HeapObject::List(values))=>{let mut i=index as i64;if i<0{i=values.len() as i64+i+1;}if i<0||i>values.len() as i64{vm.fail_at(op,"list insertion index out of bounds")}else{values.insert(i as usize,value);vm.advance(op)}},_=>vm.fail_at(op,"ListInsert operand is not list")}}
+unsafe fn h_list_set(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let index=word_i32(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));vm.heap.remember_if_reference(list,value);match vm.heap.get_mut(list){Some(HeapObject::List(values))=>if let Some(i)=normalize_index(index,values.len()){*values.get_unchecked_mut(i)=value;vm.advance(op)}else{vm.fail_at(op,"list index out of bounds")},_=>vm.fail_at(op,"ListSet operand is not list")}}
+unsafe fn h_list_append(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));
+    vm.mark_gc_point(op);vm.maybe_collect();vm.heap.remember_if_reference(list,value);
+    let resized=match vm.heap.get_mut(list){
+        Some(HeapObject::List(values))=>{let old=values.capacity();values.push(value);(values.capacity()!=old).then_some(values.capacity())},
+        _=>{vm.fail_at(op,"ListAppend operand is not list");return;}
+    };
+    if let Some(capacity)=resized{vm.heap.set_external_bytes(list,capacity*std::mem::size_of::<Value>());}
+    vm.advance(op)
+}
+unsafe fn h_list_insert(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;let list=Value::from_word(vm.reg(op.a));let index=word_i32(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));
+    vm.mark_gc_point(op);vm.maybe_collect();vm.heap.remember_if_reference(list,value);
+    let resized=match vm.heap.get_mut(list){
+        Some(HeapObject::List(values))=>{
+            let mut i=index as i64;if i<0{i=values.len() as i64+i+1;}
+            if i<0||i>values.len() as i64{vm.fail_at(op,"list insertion index out of bounds");return;}
+            let old=values.capacity();values.insert(i as usize,value);(values.capacity()!=old).then_some(values.capacity())
+        },
+        _=>{vm.fail_at(op,"ListInsert operand is not list");return;}
+    };
+    if let Some(capacity)=resized{vm.heap.set_external_bytes(list,capacity*std::mem::size_of::<Value>());}
+    vm.advance(op)
+}
 unsafe fn h_list_remove_at(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));match vm.heap.get_mut(list){Some(HeapObject::List(values))=>if let Some(i)=normalize_index(index,values.len()){let value=values.remove(i);vm.set_reg(op.a,value.word());vm.advance(op)}else{vm.fail_at(op,"list removal index out of bounds")},_=>vm.fail_at(op,"ListRemoveAt operand is not list")}}
 
 unsafe fn h_alloc_map(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let v=vm.heap.alloc(HeapObject::Map(WrenMap::default()));vm.set_reg(op.a,v.word());vm.advance(op)}
 unsafe fn h_map_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map=Value::from_word(vm.reg(op.b));match vm.heap.get(map){Some(HeapObject::Map(map))=>{vm.set_reg(op.a,i32_word(map.entries.len() as i32));vm.advance(op)},_=>vm.fail_at(op,"MapLen operand is not map")}}
 unsafe fn h_map_get(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map=Value::from_word(vm.reg(op.b));let key_value=Value::from_word(vm.reg(op.c));let key=match vm.value_to_map_key(key_value){Ok(k)=>k,Err(e)=>{vm.fail_at(op,e.message);return;}};match vm.heap.get(map){Some(HeapObject::Map(map))=>{let value=map.entries.get(&key).copied().unwrap_or(Value::NULL);vm.set_reg(op.a,value.word());vm.advance(op)},_=>vm.fail_at(op,"MapGet operand is not map")}}
-unsafe fn h_map_set(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map_value=Value::from_word(vm.reg(op.a));let key_value=Value::from_word(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));let key=match vm.value_to_map_key(key_value){Ok(k)=>k,Err(e)=>{vm.fail_at(op,e.message);return;}};vm.mark_gc_point(op);vm.maybe_collect();match vm.heap.get_mut(map_value){Some(HeapObject::Map(map))=>{map.entries.insert(key,value);vm.advance(op)},_=>vm.fail_at(op,"MapSet operand is not map")}}
+unsafe fn h_map_set(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;let map_value=Value::from_word(vm.reg(op.a));let key_value=Value::from_word(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));
+    let key=match vm.value_to_map_key(key_value){Ok(k)=>k,Err(e)=>{vm.fail_at(op,e.message);return;}};
+    vm.mark_gc_point(op);vm.maybe_collect();vm.heap.remember_if_reference(map_value,key_value);vm.heap.remember_if_reference(map_value,value);
+    let resized=match vm.heap.get_mut(map_value){
+        Some(HeapObject::Map(map))=>{let old=map.entries.capacity();map.entries.insert(key,value);(map.entries.capacity()!=old).then_some(map.entries.capacity())},
+        _=>{vm.fail_at(op,"MapSet operand is not map");return;}
+    };
+    if let Some(capacity)=resized{vm.heap.set_external_bytes(map_value,capacity*std::mem::size_of::<(MapKey,Value)>());}
+    vm.advance(op)
+}
 unsafe fn h_map_remove(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map_value=Value::from_word(vm.reg(op.b));let key_value=Value::from_word(vm.reg(op.c));let key=match vm.value_to_map_key(key_value){Ok(k)=>k,Err(e)=>{vm.fail_at(op,e.message);return;}};match vm.heap.get_mut(map_value){Some(HeapObject::Map(map))=>{let v=map.entries.remove(&key).unwrap_or(Value::NULL);vm.set_reg(op.a,v.word());vm.advance(op)},_=>vm.fail_at(op,"MapRemove operand is not map")}}
 
 #[inline]
@@ -4759,7 +5663,7 @@ unsafe fn h_fiber_yield(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;
 unsafe fn h_fiber_suspend(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;vm.suspend_vm(op,Reg(op.a))}
 unsafe fn h_fiber_abort(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let error=Value::from_word(vm.reg(op.a));vm.abort_current_fiber(op,error)}
 
-unsafe fn h_write_barrier(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;vm.advance(op)}
+unsafe fn h_write_barrier(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let owner=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));vm.heap.remember_if_reference(owner,value);vm.advance(op)}
 unsafe fn h_read_barrier(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let value=vm.reg(op.b);vm.set_reg(op.a,value);vm.advance(op)}
 unsafe fn h_profile_block(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let f=vm.current_frame().function as usize;if let Some(counter)=vm.profile_counters[f].get_mut(op.x as usize){*counter=counter.saturating_add(1);}vm.advance(op)}
 unsafe fn h_profile_numeric(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let f=vm.current_frame().function as usize;if let Some(counter)=vm.profile_counters[f].get_mut(op.x as usize){*counter=counter.saturating_add(1);}vm.advance(op)}
@@ -4783,7 +5687,7 @@ impl Interpreter<'_> {
         self.profile_counters.get(function)?.get(counter as usize).copied()
     }
 
-    pub fn heap_live_objects(&self) -> usize { self.heap.live }
+    pub fn heap_live_objects(&self) -> usize { handles().live.load(Ordering::Relaxed) }
 
     pub fn class_value(&self, class: ClassId) -> Option<Value> {
         let slot = *self.prepared.class_by_id.get(&class)?;
@@ -4809,7 +5713,7 @@ impl Interpreter<'_> {
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
             Some(HeapObject::Instance { class_slot, .. }) => format!("<{} instance>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign {}>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
-            Some(HeapObject::FiberObject { fiber }) => format!("<fiber:{fiber}>") ,
+            Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber:{fiber}>") ,
             Some(HeapObject::ModuleObject { module_slot }) => format!("<module:{}>", self.program.metadata.string(self.modules[*module_slot as usize].name).unwrap_or("module")),
             Some(HeapObject::Cell(_)) => "<cell>".into(),
             None => "<invalid value>".into(),
@@ -5104,7 +6008,7 @@ mod tests {
         let mut vm = Interpreter::new(&program).unwrap();
         vm.set_jit_options(Some(TracingJitOptions { hot_loop_threshold: 1, ..Default::default() }));
         for _ in 0..3 {
-            vm.heap.next_gc = 0;
+            vm.collect_garbage();
             let ExecutionResult::Returned(value) = vm.run_function(FuncId(0), &[]).unwrap() else { panic!() };
             assert_eq!(value.as_num(), Some(1.0));
         }
@@ -5421,6 +6325,274 @@ mod tests {
                 assert_eq!(source_result(&vm), expected, "{expression}, fast_path={fast_path}");
             }
         }
+    }
+
+    #[test]
+    fn sticky_binding_promotes_edges_and_reclaims_mature_resources() {
+        use crate::wren_gc::{Descriptor, Field, TraceLayout, RAW_CODEC};
+        static LEAF: Descriptor = Descriptor {
+            name: "test.leaf", trace: TraceLayout::Leaf, cleanup: None, finalizer: None,
+        };
+        static FIELDS: [Field; 1] = [Field { offset: 0, codec: &RAW_CODEC }];
+        static PARENT: Descriptor = Descriptor {
+            name: "test.parent", trace: TraceLayout::Fields(&FIELDS), cleanup: None, finalizer: None,
+        };
+        static CLEANED: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn cleanup(_: GcObject) { CLEANED.fetch_add(1, Ordering::Relaxed); }
+        static RESOURCE: Descriptor = Descriptor {
+            name: "test.resource", trace: TraceLayout::Leaf, cleanup: Some(cleanup), finalizer: None,
+        };
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+        let mutator = &mut vm.heap.mutator;
+        let parent = unsafe { mutator.allocate(&PARENT, std::mem::size_of::<usize>()) };
+        let root = unsafe { mutator.root(parent) };
+        mutator.collect();
+        let child = unsafe { mutator.allocate(&LEAF, 16) };
+        let weak = unsafe { mutator.downgrade(child) };
+        let parent = root.get(mutator, 0).unwrap();
+        unsafe { mutator.write(parent, parent.slot(0, &RAW_CODEC), child.address()) };
+        mutator.collect();
+        let child_root = weak.upgrade(mutator).expect("old-to-young edge was lost");
+        let parent = root.get(mutator, 0).unwrap();
+        unsafe { mutator.verify_object(parent) }.unwrap();
+        drop(child_root);
+        unsafe { mutator.write(parent, parent.slot(0, &RAW_CODEC), 0) };
+        mutator.collect_full();
+        assert!(weak.upgrade(mutator).is_none());
+        if std::env::var_os("MMTK_IMMIX_DEFRAG_EVERY_BLOCK").is_some() {
+            assert_ne!(parent.address(), root.get(mutator, 0).unwrap().address());
+        }
+
+        let resource = unsafe { mutator.allocate(&RESOURCE, 0) };
+        let resource_root = unsafe { mutator.root(resource) };
+        let resource_weak = unsafe { mutator.downgrade(resource) };
+        unsafe { mutator.set_external_bytes(resource, 1234) };
+        mutator.collect();
+        let full_before = mutator.statistics().full_collections;
+        drop(resource_root);
+        mutator.collect();
+        // Another test's full-GC request may subsume this nursery request.
+        if mutator.statistics().full_collections == full_before {
+            assert_eq!(CLEANED.load(Ordering::Relaxed), 0, "nursery must retain mature objects");
+            assert!(resource_weak.upgrade(mutator).is_some());
+        }
+        mutator.collect_full();
+        assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
+        assert!(resource_weak.upgrade(mutator).is_none());
+    }
+
+    #[test]
+    fn sticky_binding_large_objects_and_deferred_finalizers() {
+        use crate::wren_gc::{Descriptor, Mutator, RootFrame, TraceLayout, RAW_CODEC};
+        static FINALIZED: AtomicUsize = AtomicUsize::new(0);
+        static CLEANED: AtomicUsize = AtomicUsize::new(0);
+        static RESURRECTED: StdMutex<Option<crate::wren_gc::GlobalRoot>> = StdMutex::new(None);
+        unsafe fn cleanup(_: GcObject) { CLEANED.fetch_add(1, Ordering::Relaxed); }
+        fn finalize(mutator: &mut Mutator, root: &RootFrame) {
+            assert!(root.get(mutator, 0).is_some());
+            mutator.collect_full();
+            assert!(root.get(mutator, 0).is_some(), "finalizer argument must stay rooted");
+            *RESURRECTED.lock().unwrap() = Some(unsafe {
+                mutator.global_root(root.get(mutator, 0).unwrap())
+            });
+            FINALIZED.fetch_add(1, Ordering::Relaxed);
+        }
+        static RESOURCE: Descriptor = Descriptor {
+            name: "test.finalizable", trace: TraceLayout::Leaf,
+            cleanup: Some(cleanup), finalizer: Some(finalize),
+        };
+        static ARRAY: Descriptor = Descriptor {
+            name: "test.large", trace: TraceLayout::Words { offset: 0, codec: &RAW_CODEC },
+            cleanup: None, finalizer: None,
+        };
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+        let mutator = &mut vm.heap.mutator;
+        let array = unsafe { mutator.allocate(&ARRAY, 128 << 10) };
+        let array_root = unsafe { mutator.root(array) };
+        mutator.collect();
+        let child = unsafe { mutator.allocate(&RESOURCE, 0) };
+        let weak = unsafe { mutator.downgrade(child) };
+        let array = array_root.get(mutator, 0).unwrap();
+        unsafe { mutator.write(array, array.slot(0, &RAW_CODEC), child.address()) };
+        mutator.collect();
+        assert!(weak.upgrade(mutator).is_some());
+        drop(array_root);
+        mutator.collect_full();
+        assert_eq!(CLEANED.load(Ordering::Relaxed), 0);
+        assert_eq!(mutator.run_finalizers(1), 1);
+        assert_eq!(FINALIZED.load(Ordering::Relaxed), 1);
+        mutator.collect_full();
+        assert_eq!(CLEANED.load(Ordering::Relaxed), 0, "resurrection must retain native resources");
+        RESURRECTED.lock().unwrap().take();
+        mutator.collect_full();
+        assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
+        assert_eq!(mutator.run_finalizers(1), 0);
+        assert!(weak.upgrade(mutator).is_none());
+    }
+
+    #[test]
+    fn sticky_managed_mutations_and_allocation_roots_survive() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+        let list = vm.heap.alloc(HeapObject::List(Vec::new()));
+        let list_root = vm.add_root(list);
+        let map = vm.heap.alloc(HeapObject::Map(WrenMap::default()));
+        let map_root = vm.add_root(map);
+        vm.heap.mutator.collect();
+        let list_object = vm.heap.object(list).unwrap();
+        vm.heap.remember_owner(list);
+        {
+            use mmtk::vm::ObjectModel;
+            let reference = mmtk::util::ObjectReference::from_raw_address(unsafe {
+                mmtk::util::Address::from_usize(list_object.address())
+            }).unwrap();
+            assert_eq!(
+                crate::wren_gc::Model::GLOBAL_LOG_BIT_SPEC.as_spec()
+                    .load_atomic::<crate::wren_gc::Binding, u8>(reference, None, Ordering::SeqCst),
+                0,
+                "probable-write must claim the log bit, not enqueue duplicate owners",
+            );
+        }
+        for i in 0..32 {
+            let child = vm.heap.alloc(HeapObject::String(Arc::from(format!("child{i}").as_bytes())));
+            let mut context = HostContext { heap: &mut vm.heap };
+            context.list_push(list, child).unwrap();
+            context.map_set(map, list, child).unwrap();
+            vm.heap.mutator.collect();
+            assert!(matches!(vm.heap.get(child), Some(HeapObject::String(_))));
+        }
+        let child = match vm.heap.get(list).unwrap() {
+            HeapObject::List(items) => items[0],
+            _ => unreachable!(),
+        };
+        let closure = vm.heap.alloc(HeapObject::Closure {
+            function_index: 0,
+            captures: vec![child.word(), RegisterWord(TAG_HEAP | u32::MAX as u64)].into_boxed_slice(),
+            reference_indices: vec![0].into_boxed_slice(),
+        });
+        let closure_root = vm.add_root(closure);
+        vm.release_root(list_root);
+        vm.release_root(map_root);
+        vm.collect_garbage();
+        assert!(matches!(vm.heap.get(child), Some(HeapObject::String(_))));
+        // Force collection inside Heap::alloc while the child is only in its
+        // Rust-side constructor, no longer in any VM root or reference map.
+        let child_object = vm.heap.object(child).unwrap();
+        vm.release_root(closure_root);
+        let threshold = vm.heap.collector.config_external_threshold_for_test();
+        if threshold != 0 {
+            let bytes = threshold * 2 + vm.gc_statistics().external_bytes;
+            unsafe { vm.heap.mutator.set_external_bytes(child_object, bytes) };
+            let before = vm.heap.collection_count();
+            let wrapped = vm.heap.alloc(HeapObject::List(vec![child]));
+            let root = vm.add_root(wrapped);
+            assert!(vm.heap.collection_count() > before, "allocation must actually collect");
+            assert!(matches!(vm.heap.get(child), Some(HeapObject::String(_))));
+            vm.release_root(root);
+        }
+    }
+
+    #[test]
+    fn sticky_source_closures_fibers_and_pressure() {
+        let source = r#"
+class GcTest {
+  static run() {
+    var keep = []
+    var value = "captured"
+    var closure = Fn.new { value }
+    var fiber = Fiber.new {
+      var local = ["fiber"]
+      Fiber.yield(local)
+      System.gc()
+      return local[0]
+    }
+    var first = fiber.call()
+    System.gc()
+    var i = 0
+    while (i < 50000) {
+      var garbage = [i, i + 1, i + 2]
+      if (i < 100) keep.add([closure, first])
+      i = i + 1
+    }
+    System.gc()
+    if (closure.call() != "captured") Fiber.abort("lost capture")
+    if (fiber.call() != "fiber") Fiber.abort("lost suspended fiber")
+    return keep.count
+  }
+}
+var result = GcTest.run()
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 100.0);
+            assert!(vm.gc_statistics().full_collections > 0);
+        }
+    }
+
+    #[test]
+    fn sticky_numeric_loops_rendezvous_with_another_mutator() {
+        let (program, entry, manifest) = compile_local_wren(
+            "var i = 0\nwhile (i < 2000000) { i = i + 1 }\nreturn i",
+        );
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            let collector = vm.heap.collector;
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (go_tx, go_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut mutator = collector.attach();
+                unsafe {
+                    mutator.with_native(|| {
+                        ready_tx.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    });
+                }
+                mutator.collect_full();
+            });
+            unsafe { vm.heap.mutator.with_native(|| ready_rx.recv().unwrap()) };
+            go_tx.send(()).unwrap();
+            vm.run_module(entry).unwrap();
+            // Joining while Running could block a worker whose request arrived
+            // just after the finite loop returned.
+            unsafe { vm.heap.mutator.with_native(|| worker.join().unwrap()) };
+            assert_eq!(source_result(&vm), 2000000.0);
+        }
+    }
+
+    #[test]
+    fn sticky_attach_parks_idle_same_thread_peers() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+        let collector = vm.heap.collector;
+        let worker = std::thread::spawn(move || {
+            let mut mutator = collector.attach();
+            mutator.collect_full();
+        });
+        while !vm.heap.mutator.collection_requested() {
+            std::thread::yield_now();
+        }
+        let second = Heap::default();
+        drop(second);
+        unsafe { vm.heap.mutator.with_native(|| worker.join().unwrap()) };
     }
 
     #[test]

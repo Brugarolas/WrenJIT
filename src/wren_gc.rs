@@ -27,10 +27,6 @@ const ROOT_BATCH: usize = 512;
 const MAX_ALIGNMENT: usize = 16;
 static GC: OnceLock<Collector> = OnceLock::new();
 static INIT: Mutex<()> = Mutex::new(());
-thread_local! {
-    static CURRENT: Cell<*const ThreadRecord> = const { Cell::new(ptr::null()) };
-}
-
 /// An unrooted object address. Copying this value does not keep the object alive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -332,6 +328,8 @@ impl Default for Config {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Statistics {
     pub collections: u64,
+    pub nursery_collections: u64,
+    pub full_collections: u64,
     pub pause_ns: u64,
     pub rendezvous_ns: u64,
     pub external_bytes: usize,
@@ -348,6 +346,8 @@ pub enum VerificationError {
 #[derive(Default)]
 struct Counters {
     collections: AtomicU64,
+    nursery_collections: AtomicU64,
+    full_collections: AtomicU64,
     pause_ns: AtomicU64,
     rendezvous_ns: AtomicU64,
     external_bytes: AtomicUsize,
@@ -366,6 +366,7 @@ pub struct Collector {
     providers: Mutex<Vec<Weak<dyn RootProvider>>>,
     weak: Mutex<Vec<Weak<AtomicUsize>>>,
     tracked: Mutex<Vec<Tracked>>,
+    mature_tracked: Mutex<Vec<Tracked>>,
     pending: Mutex<Vec<Arc<RootStorage>>>,
     keep_roots: Mutex<Vec<Arc<RootStorage>>>,
     keep_providers: Mutex<Vec<Arc<dyn RootProvider>>>,
@@ -396,6 +397,14 @@ struct World {
 struct ThreadRecord {
     context: UnsafeCell<Option<Box<mmtk::Mutator<Binding>>>>,
     roots: Mutex<Vec<Weak<RootStorage>>>,
+    /// Multiple VMs may attach mutators on one OS thread. Only one can execute
+    /// at a time because Mutator is !Send; rendezvous parks same-thread peers
+    /// together so an idle VM cannot deadlock a collection requested by another.
+    owner: std::thread::ThreadId,
+    // Owned by the mutator while Running. The collector drains this only after
+    // the stop-the-world rendezvous, when the owner is Parked/Native. This keeps
+    // cleanup/finalizer registration completely lock-free on the allocation path.
+    tracked: UnsafeCell<Vec<Tracked>>,
 }
 // The owner accesses context while Running; GC accesses it only after rendezvous.
 // World membership prevents destruction until all GC work has completed.
@@ -417,6 +426,11 @@ impl ThreadRecord {
 }
 
 impl Collector {
+    #[cfg(test)]
+    pub(crate) fn config_external_threshold_for_test(&self) -> usize {
+        self.config.external_gc_threshold
+    }
+
     /// Initializes the process-wide collector once. Repeated calls must use
     /// identical configuration. MMTk 0.33 does not support teardown/restart here.
     pub fn initialize(config: Config) -> &'static Self {
@@ -433,6 +447,7 @@ impl Collector {
         assert!(config.heap_bytes >= 8 << 20 && config.workers > 0);
         let mut builder = MMTKBuilder::new();
         assert!(builder.set_option("plan", "StickyImmix"));
+        assert!(builder.set_option("full_heap_system_gc", "false"));
         assert!(builder.set_option("threads", &config.workers.to_string()));
         assert!(builder.set_option(
             "gc_trigger",
@@ -455,6 +470,7 @@ impl Collector {
             providers: Mutex::new(Vec::new()),
             weak: Mutex::new(Vec::new()),
             tracked: Mutex::new(Vec::new()),
+            mature_tracked: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             keep_roots: Mutex::new(Vec::new()),
             keep_providers: Mutex::new(Vec::new()),
@@ -468,14 +484,26 @@ impl Collector {
     }
 
     pub fn attach(&'static self) -> Mutator {
-        CURRENT.with(|current| assert!(current.get().is_null(), "thread already attached"));
         let mut world = self.world.lock();
         while world.active {
-            self.changed.wait(&mut world);
+            // An existing idle VM on this thread cannot poll while attach waits.
+            let peer = world.threads.iter().find(|entry| {
+                entry.record.owner == std::thread::current().id()
+                    && entry.state == ThreadState::Running
+            }).map(|entry| entry.record.clone());
+            if let Some(peer) = peer {
+                drop(world);
+                self.wait(&peer, false);
+                world = self.world.lock();
+            } else {
+                self.changed.wait(&mut world);
+            }
         }
         let record = Arc::new(ThreadRecord {
             context: UnsafeCell::new(None),
             roots: Mutex::new(Vec::new()),
+            owner: std::thread::current().id(),
+            tracked: UnsafeCell::new(Vec::new()),
         });
         let context = mm::bind_mutator(self.mmtk, record.token());
         unsafe {
@@ -486,7 +514,6 @@ impl Collector {
             record: record.clone(),
             state: ThreadState::Running,
         });
-        CURRENT.with(|current| current.set(Arc::as_ptr(&record)));
         Mutator {
             gc: self,
             record,
@@ -503,10 +530,17 @@ impl Collector {
         }
     }
 
+    #[inline]
+    pub fn collection_count(&self) -> u64 {
+        self.counters.collections.load(Ordering::Acquire)
+    }
+
     pub fn statistics(&self) -> Statistics {
         let c = &self.counters;
         Statistics {
             collections: c.collections.load(Ordering::Relaxed),
+            nursery_collections: c.nursery_collections.load(Ordering::Relaxed),
+            full_collections: c.full_collections.load(Ordering::Relaxed),
             pause_ns: c.pause_ns.load(Ordering::Relaxed),
             rendezvous_ns: c.rendezvous_ns.load(Ordering::Relaxed),
             external_bytes: c.external_bytes.load(Ordering::Relaxed),
@@ -526,24 +560,45 @@ impl Collector {
         } else {
             world.completed + 1
         };
-        let entry = world
-            .threads
-            .iter_mut()
-            .find(|e| ptr::eq(Arc::as_ptr(&e.record), record))
-            .unwrap();
-        assert!(entry.state == ThreadState::Running);
-        entry.state = ThreadState::Parked;
+
+        // A single OS thread may own several Interpreter instances, hence several
+        // MMTk mutators. They cannot execute simultaneously (`Mutator` is !Send),
+        // so when the active one parks it is both safe and necessary to park its
+        // idle same-thread peers as well. Otherwise a GC requested by VM B would
+        // wait forever for idle VM A on the very same blocked OS thread.
+        let owner = record.owner;
+        let mut parked_here = Vec::<*const ThreadRecord>::new();
+        for entry in &mut world.threads {
+            if entry.record.owner == owner && entry.state == ThreadState::Running {
+                entry.state = ThreadState::Parked;
+                parked_here.push(Arc::as_ptr(&entry.record));
+            }
+        }
+        assert!(parked_here.iter().any(|&p| ptr::eq(p, record)));
         self.changed.notify_all();
         while world.completed < target || world.active {
             self.changed.wait(&mut world);
         }
-        world
-            .threads
-            .iter_mut()
-            .find(|e| ptr::eq(Arc::as_ptr(&e.record), record))
-            .unwrap()
-            .state = ThreadState::Running;
+        for entry in &mut world.threads {
+            if entry.state == ThreadState::Parked
+                && parked_here
+                    .iter()
+                    .any(|&p| ptr::eq(p, Arc::as_ptr(&entry.record)))
+            {
+                entry.state = ThreadState::Running;
+            }
+        }
     }
+}
+
+fn drain_thread_tracked(gc: &Collector, record: &ThreadRecord) {
+    // SAFETY: callers either hold World with the record detached from execution,
+    // or have completed the STW rendezvous. No mutator can touch this Vec then.
+    let local = unsafe { &mut *record.tracked.get() };
+    if local.is_empty() {
+        return;
+    }
+    gc.tracked.lock().append(local);
 }
 
 fn gc() -> &'static Collector {
@@ -563,6 +618,13 @@ pub struct Mutator {
 }
 
 impl Mutator {
+    pub fn statistics(&self) -> Statistics {
+        let mut statistics = self.gc.statistics();
+        statistics.allocated_bytes = statistics.allocated_bytes.saturating_add(self.local_bytes);
+        statistics.barrier_slow_calls = statistics.barrier_slow_calls.saturating_add(self.local_barriers);
+        statistics
+    }
+
     /// Checks one object's outgoing references against MMTk's valid-object
     /// metadata. This is a diagnostic, not a replacement for correct rooting.
     /// # Safety
@@ -570,16 +632,26 @@ impl Mutator {
     /// mutators must not resize or destroy its external buffers during checking.
     pub unsafe fn verify_object(&self, object: Object) -> Result<(), VerificationError> {
         self.check_running();
-        if mm::is_mmtk_object(object.0.to_raw_address()) != Some(object.0) {
+
+        // Do not depend on the optional `vo_bit` feature merely for diagnostics.
+        // Wren objects are allocated exclusively in MMTk spaces, so membership in
+        // an MMTk space is sufficient for this inexpensive consistency check.
+        if !mm::is_in_mmtk_spaces(object.0) {
             return Err(VerificationError::InvalidObject(object.address()));
         }
+
         let mut error = None;
         trace(object, &mut |slot| {
-            if let Some(target) = (slot.codec.decode)(slot.word())
-                && (target == 0
-                    || !target.is_multiple_of(ObjectReference::ALIGNMENT)
-                    || mm::is_mmtk_object(unsafe { Address::from_usize(target) }).is_none())
-            {
+            let Some(target) = (slot.codec.decode)(slot.word()) else {
+                return;
+            };
+
+            let valid = target != 0
+                && target.is_multiple_of(ObjectReference::ALIGNMENT)
+                && ObjectReference::from_raw_address(unsafe { Address::from_usize(target) })
+                    .is_some_and(mm::is_in_mmtk_spaces);
+
+            if !valid {
                 error = Some(VerificationError::InvalidReference {
                     slot: slot.address,
                     target,
@@ -594,25 +666,48 @@ impl Mutator {
         assert!(!self.native.get(), "heap access in native-safe section");
     }
     #[inline]
+    pub fn collection_requested(&self) -> bool {
+        self.gc.requested.load(Ordering::Acquire)
+    }
+    #[inline]
     pub fn safepoint(&mut self) {
         self.check_running();
-        if self.gc.requested.load(Ordering::Acquire) {
+        if self.collection_requested() {
             self.flush_statistics();
             self.gc.wait(&self.record, false);
         }
     }
+    /// Waits for a collection. StickyImmix selects nursery or full-heap GC.
     pub fn collect(&mut self) {
-        self.check_running();
-        self.flush_statistics();
-        mm::handle_user_collection_request(self.gc.mmtk, self.record.token());
+        self.collect_kind(false);
     }
     /// Explicit full-heap collection, including unreachable mature objects.
     pub fn collect_full(&mut self) {
+        self.collect_kind(true);
+    }
+    fn collect_kind(&mut self, full: bool) {
         self.check_running();
         self.flush_statistics();
-        self.gc
-            .mmtk
-            .handle_user_collection_request(self.record.token(), true, true);
+        let counter = if full {
+            &self.gc.counters.full_collections
+        } else {
+            &self.gc.counters.collections
+        };
+        let before = counter.load(Ordering::Acquire);
+        loop {
+            // MMTk treats "exhaustive" as a hint: a request can join an already
+            // scheduled nursery GC, or return without blocking if GC is pending.
+            let blocked = self.gc.mmtk.handle_user_collection_request(
+                self.record.token(), true, full,
+            );
+            self.safepoint();
+            if counter.load(Ordering::Acquire) > before {
+                break;
+            }
+            if !blocked {
+                std::thread::yield_now();
+            }
+        }
     }
     /// The callback may block without delaying collection.
     /// # Safety
@@ -624,12 +719,12 @@ impl Mutator {
         self.flush_statistics();
         {
             let mut world = self.gc.world.lock();
-            world
-                .threads
-                .iter_mut()
-                .find(|e| Arc::ptr_eq(&e.record, &self.record))
-                .unwrap()
-                .state = ThreadState::Native;
+            let owner = self.record.owner;
+            for entry in &mut world.threads {
+                if entry.record.owner == owner && entry.state == ThreadState::Running {
+                    entry.state = ThreadState::Native;
+                }
+            }
             self.native.set(true);
             self.gc.changed.notify_all();
         }
@@ -640,13 +735,14 @@ impl Mutator {
                 while world.active {
                     self.0.gc.changed.wait(&mut world);
                 }
-                world
-                    .threads
-                    .iter_mut()
-                    .find(|e| Arc::ptr_eq(&e.record, &self.0.record))
-                    .unwrap()
-                    .state = ThreadState::Running;
+                let owner = self.0.record.owner;
+                for entry in &mut world.threads {
+                    if entry.record.owner == owner && entry.state == ThreadState::Native {
+                        entry.state = ThreadState::Running;
+                    }
+                }
                 self.0.native.set(false);
+                self.0.gc.changed.notify_all();
             }
         }
         let _exit = Exit(self);
@@ -680,7 +776,9 @@ impl Mutator {
         if self.gc.config.external_gc_threshold != 0
             && external.saturating_sub(baseline) >= self.gc.config.external_gc_threshold
         {
-            self.collect();
+            // Native buffers can dwarf their small GC owners. Nursery-only
+            // collections would never reclaim dead mature buffer owners.
+            self.collect_full();
         }
         match &descriptor.trace {
             TraceLayout::Fields(fields) => {
@@ -737,7 +835,9 @@ impl Mutator {
         }
         mm::post_alloc(context, object.0, bytes, semantics);
         if descriptor.cleanup.is_some() || descriptor.finalizer.is_some() {
-            self.gc.tracked.lock().push(Tracked {
+            // SAFETY: only this thread mutates its record while Running. GC
+            // drains the vector only after all Running mutators have parked.
+            unsafe { &mut *self.record.tracked.get() }.push(Tracked {
                 object,
                 finalized: false,
             });
@@ -766,6 +866,39 @@ impl Mutator {
             unsafe { self.pointer.as_mut() }
                 .barrier
                 .object_reference_write_slow(owner.0, slot, slot.decode(value));
+        }
+    }
+
+    /// Marks `owner` as probably modified. This is the cheapest correct barrier
+    /// for runtimes that use an indirection/handle table and therefore cannot
+    /// expose the language field itself as an MMTk slot. StickyImmix uses an
+    /// object remembered set, so the slow path only needs to log the source
+    /// object once per collection epoch.
+    ///
+    /// # Safety
+    /// `owner` must be the current live object whose outgoing references are
+    /// about to change. Call this before the mutation and do not safepoint between
+    /// this call and the stores it covers.
+    #[inline]
+    pub unsafe fn probable_write(&mut self, owner: Object) {
+        self.check_running();
+        if Model::GLOBAL_LOG_BIT_SPEC
+            .as_spec()
+            .load_atomic::<Binding, u8>(owner.0, None, Ordering::SeqCst)
+            != 0
+        {
+            self.local_barriers = self.local_barriers.saturating_add(1);
+            // MMTk 0.33's probable-write hook enqueues without claiming the
+            // unlog bit, producing duplicates on every stack/register boundary.
+            // StickyImmix's claiming post-barrier ignores slot and target; the
+            // reserved atomic forwarding word supplies an unused stable slot.
+            unsafe { self.pointer.as_mut() }
+                .barrier
+                .object_reference_write_slow(
+                    owner.0,
+                    Slot { address: owner.address(), codec: &RAW_CODEC },
+                    None,
+                );
         }
     }
 
@@ -827,31 +960,23 @@ impl Drop for Mutator {
             .roots
             .lock()
             .extend(self.record.roots.lock().drain(..));
+        drain_thread_tracked(self.gc, &self.record);
         unsafe {
             mm::destroy_mutator(self.pointer.as_mut());
             (*self.record.context.get()).take();
         }
         world.threads.swap_remove(index);
-        CURRENT.with(|current| current.set(ptr::null()));
         self.gc.changed.notify_all();
     }
 }
 
-#[derive(Clone, Copy)]
-enum RootKind {
-    Precise,
-    Pinned,
-    Conservative { max_search_bytes: usize },
-}
 struct RootStorage {
     words: Box<[AtomicUsize]>,
-    kind: RootKind,
 }
 impl RootStorage {
-    fn new(count: usize, kind: RootKind) -> Arc<Self> {
+    fn new(count: usize) -> Arc<Self> {
         Arc::new(Self {
             words: (0..count).map(|_| AtomicUsize::new(0)).collect(),
-            kind,
         })
     }
 }
@@ -921,19 +1046,6 @@ impl WeakRoot {
     }
 }
 
-/// Owned conservative candidates. These are addresses, not tagged runtime values.
-/// A validated interior pointer pins its containing object for that collection.
-pub struct ConservativeRoots {
-    storage: Arc<RootStorage>,
-    _not_send: PhantomData<Rc<()>>,
-}
-impl ConservativeRoots {
-    pub fn set_candidate(&self, mutator: &Mutator, index: usize, candidate: usize) {
-        mutator.check_running();
-        self.storage.words[index].store(candidate, Ordering::Relaxed);
-    }
-}
-
 /// Implementors publish roots from globals, JIT stack maps or external modules.
 /// Providers may be called repeatedly and must not allocate GC objects or panic.
 /// Their destructor may run on a GC worker during pause completion; it must not
@@ -950,34 +1062,17 @@ pub struct RootRegistration {
 }
 pub struct RootVisitor<'a> {
     slots: &'a mut Vec<Slot>,
-    pinned: &'a mut Vec<ObjectReference>,
 }
 impl RootVisitor<'_> {
     pub fn slot(&mut self, slot: Slot) {
         self.slots.push(slot);
-    }
-    /// # Safety
-    /// The object must be a current live reference.
-    pub unsafe fn pin(&mut self, object: Object) {
-        self.pinned.push(object.0);
-    }
-    pub fn conservative(&mut self, candidate: usize, max_search_bytes: usize) {
-        if candidate != 0
-            && max_search_bytes != 0
-            && let Some(object) = mm::find_object_from_internal_pointer(
-                unsafe { Address::from_usize(candidate) },
-                max_search_bytes,
-            )
-        {
-            self.pinned.push(object);
-        }
     }
 }
 
 impl Mutator {
     pub fn roots(&mut self, count: usize) -> RootFrame {
         self.check_running();
-        let storage = RootStorage::new(count, RootKind::Precise);
+        let storage = RootStorage::new(count);
         self.record.roots.lock().push(Arc::downgrade(&storage));
         RootFrame {
             storage,
@@ -993,24 +1088,11 @@ impl Mutator {
         }
         root
     }
-    /// Keeps the object's address stable, but does not pin its children.
-    /// # Safety
-    /// The object must be live at its current address. Rooting has no safepoint.
-    pub unsafe fn pinned_root(&mut self, object: Object) -> RootFrame {
-        self.check_running();
-        let storage = RootStorage::new(1, RootKind::Pinned);
-        storage.words[0].store(object.address(), Ordering::Relaxed);
-        self.record.roots.lock().push(Arc::downgrade(&storage));
-        RootFrame {
-            storage,
-            _not_send: PhantomData,
-        }
-    }
     /// # Safety
     /// The object must be live at its current address.
     pub unsafe fn global_root(&mut self, object: Object) -> GlobalRoot {
         self.check_running();
-        let storage = RootStorage::new(1, RootKind::Precise);
+        let storage = RootStorage::new(1);
         storage.words[0].store(object.address(), Ordering::Relaxed);
         self.gc.roots.lock().push(Arc::downgrade(&storage));
         GlobalRoot { storage }
@@ -1022,20 +1104,6 @@ impl Mutator {
         let cell = Arc::new(AtomicUsize::new(object.address()));
         self.gc.weak.lock().push(Arc::downgrade(&cell));
         WeakRoot { cell }
-    }
-    pub fn conservative_roots(
-        &mut self,
-        count: usize,
-        max_search_bytes: usize,
-    ) -> ConservativeRoots {
-        self.check_running();
-        assert!(max_search_bytes > 0);
-        let storage = RootStorage::new(count, RootKind::Conservative { max_search_bytes });
-        self.record.roots.lock().push(Arc::downgrade(&storage));
-        ConservativeRoots {
-            storage,
-            _not_send: PhantomData,
-        }
     }
     pub fn register_roots(&mut self, provider: Arc<dyn RootProvider>) -> RootRegistration {
         self.check_running();
@@ -1070,39 +1138,19 @@ impl Mutator {
 
 fn emit_storage(factory: &mut impl RootsWorkFactory<Slot>, storage: Arc<RootStorage>) {
     let mut slots = Vec::with_capacity(ROOT_BATCH);
-    let mut pinned = Vec::new();
     for word in &storage.words {
-        match storage.kind {
-            RootKind::Precise => {
-                slots.push(unsafe { Slot::from_ptr(word, &RAW_CODEC) });
-                if slots.len() == ROOT_BATCH {
-                    factory.create_process_roots_work(std::mem::replace(
-                        &mut slots,
-                        Vec::with_capacity(ROOT_BATCH),
-                    ));
-                }
-            }
-            RootKind::Pinned => {
-                let address = word.load(Ordering::Relaxed);
-                if address != 0 {
-                    pinned.push(unsafe { Object::from_address(address) }.0);
-                }
-            }
-            RootKind::Conservative { max_search_bytes } => {
-                RootVisitor {
-                    slots: &mut slots,
-                    pinned: &mut pinned,
-                }
-                .conservative(word.load(Ordering::Relaxed), max_search_bytes);
-            }
+        slots.push(unsafe { Slot::from_ptr(word, &RAW_CODEC) });
+        if slots.len() == ROOT_BATCH {
+            factory.create_process_roots_work(std::mem::replace(
+                &mut slots,
+                Vec::with_capacity(ROOT_BATCH),
+            ));
         }
     }
     if !slots.is_empty() {
         factory.create_process_roots_work(slots);
     }
-    if !pinned.is_empty() {
-        factory.create_process_pinning_roots_work(pinned);
-    }
+
     // Queued work contains raw slot addresses. Keep storage alive even if the
     // last public handle is dropped by a native-safe/unattached thread.
     gc().keep_roots.lock().push(storage);
@@ -1145,17 +1193,16 @@ impl vm::VMBinding for Binding {
 
 impl ObjectModel<Binding> for Model {
     const GLOBAL_LOG_BIT_SPEC: vm::VMGlobalLogBitSpec = vm::VMGlobalLogBitSpec::side_first();
+    const GLOBAL_FIELD_UNLOG_BIT_SPEC: vm::VMGlobalFieldUnlogBitSpec =
+        vm::VMGlobalFieldUnlogBitSpec::side_after(Self::GLOBAL_LOG_BIT_SPEC.as_spec());
     const LOCAL_FORWARDING_POINTER_SPEC: vm::VMLocalForwardingPointerSpec =
         vm::VMLocalForwardingPointerSpec::in_header(0);
     const LOCAL_FORWARDING_BITS_SPEC: vm::VMLocalForwardingBitsSpec =
         vm::VMLocalForwardingBitsSpec::side_first();
     const LOCAL_MARK_BIT_SPEC: vm::VMLocalMarkBitSpec =
         vm::VMLocalMarkBitSpec::side_after(Self::LOCAL_FORWARDING_BITS_SPEC.as_spec());
-    const LOCAL_PINNING_BIT_SPEC: vm::VMLocalPinningBitSpec =
-        vm::VMLocalPinningBitSpec::side_after(Self::LOCAL_MARK_BIT_SPEC.as_spec());
     const LOCAL_LOS_MARK_NURSERY_SPEC: vm::VMLocalLOSMarkNurserySpec =
-        vm::VMLocalLOSMarkNurserySpec::side_after(Self::LOCAL_PINNING_BIT_SPEC.as_spec());
-    const NEED_VO_BITS_DURING_TRACING: bool = true;
+        vm::VMLocalLOSMarkNurserySpec::side_after(Self::LOCAL_MARK_BIT_SPEC.as_spec());
     const OBJECT_REF_OFFSET_LOWER_BOUND: isize = 0;
     const UNIFIED_OBJECT_REFERENCE_ADDRESS: bool = true;
 
@@ -1174,6 +1221,17 @@ impl ObjectModel<Binding> for Model {
             .fetch_add(bytes as u64, Ordering::Relaxed);
         to
     }
+
+    fn try_copy(
+        from: ObjectReference,
+        semantics: CopySemantics,
+        context: &mut GCWorkerCopyContext<Binding>,
+    ) -> Option<ObjectReference> {
+        // Immix claims the forwarding bits before entering this callback, so
+        // only the winning GC worker copies this object.
+        Some(Self::copy(from, semantics, context))
+    }
+
     fn copy_to(from: ObjectReference, _to: ObjectReference, region: Address) -> Address {
         let bytes = Self::get_current_size(from);
         // Forwarding is claimed by MMTk. The reserved forwarding word may be
@@ -1222,10 +1280,10 @@ impl ObjectModel<Binding> for Model {
 }
 
 impl vm::Scanning<Binding> for Scanning {
-    fn scan_object<SV: vm::SlotVisitor<Slot>>(
+    fn scan_object(
         _tls: VMWorkerThread,
         object: ObjectReference,
-        visitor: &mut SV,
+        visitor: &mut impl vm::SlotVisitor<Slot>,
     ) {
         trace(Object(object), &mut |slot| visitor.visit_slot(slot));
     }
@@ -1242,16 +1300,9 @@ impl vm::Scanning<Binding> for Scanning {
         gc().providers.lock().retain(|weak| {
             if let Some(provider) = weak.upgrade() {
                 let mut slots = Vec::new();
-                let mut pinned = Vec::new();
-                provider.visit(&mut RootVisitor {
-                    slots: &mut slots,
-                    pinned: &mut pinned,
-                });
+                provider.visit(&mut RootVisitor { slots: &mut slots });
                 if !slots.is_empty() {
                     factory.create_process_roots_work(slots);
-                }
-                if !pinned.is_empty() {
-                    factory.create_process_pinning_roots_work(pinned);
                 }
                 gc().keep_providers.lock().push(provider);
                 true
@@ -1271,6 +1322,9 @@ impl vm::Scanning<Binding> for Scanning {
         context: impl ObjectTracerContext<Binding>,
     ) -> bool {
         let mut tracked = gc().tracked.lock();
+        if !gc().mmtk.get_plan().generational().unwrap().is_current_gc_nursery() {
+            tracked.append(&mut gc().mature_tracked.lock());
+        }
         let mut discovered = Vec::new();
         for entry in tracked.iter_mut() {
             if !entry.object.0.is_reachable()
@@ -1286,7 +1340,7 @@ impl vm::Scanning<Binding> for Scanning {
                 for entry in discovered {
                     let entry = unsafe { &mut *entry };
                     entry.object = Object(tracer.trace_object(entry.object.0));
-                    let storage = RootStorage::new(1, RootKind::Precise);
+                    let storage = RootStorage::new(1);
                     storage.words[0].store(entry.object.address(), Ordering::Relaxed);
                     gc().roots.lock().push(Arc::downgrade(&storage));
                     gc().pending.lock().push(storage);
@@ -1320,6 +1374,9 @@ impl vm::Scanning<Binding> for Scanning {
                 false
             }
         });
+        // Surviving nursery objects are now mature. Do not walk every live
+        // native-resource owner again on the next nursery collection.
+        gc().mature_tracked.lock().append(&mut tracked);
         drop(tracked);
         gc().weak.lock().retain(|weak| {
             if let Some(cell) = weak.upgrade() {
@@ -1376,6 +1433,11 @@ impl vm::Collection<Binding> for Collection {
         world.started = Some(Instant::now());
         let records: Vec<_> = world.threads.iter().map(|e| e.record.clone()).collect();
         drop(world);
+        // Every mutator is now Parked or Native, so publishing cleanup metadata
+        // is race-free and does not penalize normal allocation.
+        for record in &records {
+            drain_thread_tracked(gc, record);
+        }
         for record in records {
             let pointer = unsafe { record.context_ptr() };
             // World stays active until all GC work ends. No context is touched
@@ -1400,6 +1462,13 @@ impl vm::Collection<Binding> for Collection {
             Ordering::Relaxed,
         );
         gc.counters.collections.fetch_add(1, Ordering::Relaxed);
+        let nursery = gc.mmtk.get_plan().generational().unwrap().is_current_gc_nursery();
+        let counter = if nursery {
+            &gc.counters.nursery_collections
+        } else {
+            &gc.counters.full_collections
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
         world.completed = world.epoch;
         world.active = false;
         gc.requested.store(false, Ordering::Release);
