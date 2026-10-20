@@ -38,7 +38,7 @@ use crate::wren_bytecode::{
     BytecodeFunction, BytecodeInlinedFrameState, BytecodePc, BytecodeProgram,
     BytecodeSnapshotSlot, BytecodeVerifier, CaptureBinding, ClassGuardId, ConstIndex,
     DeoptLocation, FrameLayout, IcSlot, IncomingSource, InlineCacheDescriptor, Label,
-    Opcode, ParameterBinding, ProfileCounterKind, ReferenceMap, Reg, RegisterKind,
+    LiveRegisterEntry, LiveRegisterMap, Opcode, ParameterBinding, ProfileCounterKind, ReferenceMap, Reg, RegisterKind,
     ResumeEntry, RuntimeMetadata, SafepointKind, SourceMapEntry, SpecialReg,
     TypeGuardId, GENERAL_REGISTER_COUNT, MAX_WREN_ARITY,
 };
@@ -1645,6 +1645,19 @@ impl<'a> FunctionEmitter<'a> {
         self.positions.node_use[node.0 as usize]
     }
 
+    fn live_register_map(&self, position: u32) -> LiveRegisterMap {
+        let mut map = LiveRegisterMap::default();
+        for interval in &self.allocation.intervals {
+            if interval.ranges.is_empty() || !interval.contains(position) {
+                continue;
+            }
+            if let Some(reg) = self.allocation.value_regs[interval.value.0 as usize] {
+                map.set_general(reg, true);
+            }
+        }
+        map
+    }
+
     fn live_reference_map(&self, position: u32) -> ReferenceMap {
         let mut map = ReferenceMap::default();
         for interval in &self.allocation.intervals {
@@ -2737,14 +2750,29 @@ impl FunctionEmitter<'_> {
                         message: format!("emission references missing node {inst_id:?}"),
                     })?;
 
-                if self.dce.live_nodes[inst_id.0 as usize] {
+                let live = if self.dce.live_nodes[inst_id.0 as usize] {
                     self.stats.emitted_hir_nodes += 1;
+                    let live = self.live_register_map(self.instruction_position(inst_id));
                     self.emit_control_node(block_id, &node, next_block)?;
+                    Some(live)
                 } else {
                     self.stats.eliminated_hir_nodes += 1;
-                }
+                    None
+                };
 
                 let after = self.assembler.pc();
+                if before != after {
+                    if let Some(live) = live {
+                        // Side exits resume at original bytecode instruction boundaries.
+                        // Keep all physical GPR liveness separate from GC reference maps.
+                        // If a single HIR node emits several bytecodes, the start PC is
+                        // still the semantically valid re-entry point for that node.
+                        self.assembler.chunk.live_registers.push(LiveRegisterEntry {
+                            pc: before,
+                            live,
+                        });
+                    }
+                }
                 self.pc_map.after_inst[inst_id.0 as usize] = Some(after);
                 if self.options.emit_source_map && before != after {
                     if let Some(source) = node.source {

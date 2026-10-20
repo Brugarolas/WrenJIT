@@ -22,9 +22,9 @@ impl TraceLocation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FrameSlot { General(Reg), Argument(ArgReg), Return(ReturnReg), Special(SpecialReg) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TraceRep { Tagged, Int32, F64, Bool, HeapHandle, RawPtr }
+pub enum TraceRep { Tagged, Int32, UInt32, F64, Bool, HeapHandle, RawPtr }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TraceType { Any, Null, Bool, Num, Int32, F64 }
+pub enum TraceType { Any, Null, Bool, Num, Int32, UInt32, F64 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TraceClass { Builtin(BuiltinId) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -47,7 +47,7 @@ impl TraceConstant {
 pub enum TraceValueOrigin {
     EntrySlot { frame: TraceFrameId, slot: FrameSlot },
     /// Value guarded/unboxed once in the native preheader. This is used for
-    /// invariant loop inputs that would otherwise repeat GuardF64/GuardInt32.
+    /// invariant loop inputs that would otherwise repeat GuardF64/GuardInt32/GuardUInt32.
     GuardedEntry { value: TraceValueId, exit: SideExitId },
     Constant(TraceConstant),
     InstResult { node: usize }, LoopPhi { slot: FrameSlot }, Alias(TraceValueId),
@@ -70,6 +70,7 @@ pub enum TraceInst {
     GuardNotNull { value: TraceValueId, exit: SideExitId },
     GuardF64 { value: TraceValueId, exit: SideExitId },
     GuardInt32 { value: TraceValueId, exit: SideExitId },
+    GuardUInt32 { value: TraceValueId, exit: SideExitId },
     GuardBounds { index: TraceValueId, length: TraceValueId, exit: SideExitId },
     GuardEq { lhs: TraceValueId, rhs: TraceValueId, exit: SideExitId },
     GuardSwitch { tag: TraceValueId, observed: TraceSwitchGuard, exit: SideExitId },
@@ -84,8 +85,8 @@ pub enum TraceInst {
     RefEq { lhs: TraceValueId, rhs: TraceValueId },
     IsNull { value: TraceValueId },
     Select { condition: TraceValueId, if_true: TraceValueId, if_false: TraceValueId },
-    BoxInt32 { value: TraceValueId }, BoxF64 { value: TraceValueId },
-    Int32ToF64 { value: TraceValueId }, F64ToInt32 { value: TraceValueId, exit: SideExitId },
+    BoxInt32 { value: TraceValueId }, BoxUInt32 { value: TraceValueId }, BoxF64 { value: TraceValueId },
+    Int32ToF64 { value: TraceValueId }, UInt32ToF64 { value: TraceValueId }, F64ToInt32 { value: TraceValueId, exit: SideExitId },
     TaggedToHeapHandle { value: TraceValueId, exit: SideExitId },
     ReadBarrier { value: TraceValueId },
 }
@@ -96,9 +97,9 @@ impl TraceInst {
             Nop | LoadFrameSlot { .. } | Runtime { .. } => {},
             Copy { value } | Reinterpret { value } | CommitFrameSlot { value, .. } | GuardTruthy { value, .. }
             | GuardFalsey { value, .. } | GuardNotNull { value, .. } | GuardF64 { value, .. }
-            | GuardInt32 { value, .. } | GuardType { value, .. } | IntUnary { value, .. }
-            | F64Unary { value, .. } | IsNull { value } | BoxInt32 { value } | BoxF64 { value }
-            | Int32ToF64 { value } | F64ToInt32 { value, .. } | TaggedToHeapHandle { value, .. }
+            | GuardInt32 { value, .. } | GuardUInt32 { value, .. } | GuardType { value, .. } | IntUnary { value, .. }
+            | F64Unary { value, .. } | IsNull { value } | BoxInt32 { value } | BoxUInt32 { value } | BoxF64 { value }
+            | Int32ToF64 { value } | UInt32ToF64 { value } | F64ToInt32 { value, .. } | TaggedToHeapHandle { value, .. }
             | ReadBarrier { value } => f(value),
             GuardBounds { index, length, .. } => { f(index); f(length); },
             GuardSwitch { tag, .. } => f(tag),
@@ -115,7 +116,7 @@ impl TraceInst {
         use TraceInst::*;
         match self {
             GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
-            | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardType { exit, .. }
+            | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. } | GuardType { exit, .. }
             | GuardBounds { exit, .. } | GuardSwitch { exit, .. } | GuardEq { exit, .. }
             | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. } => Some(*exit),
             _ => None,
@@ -125,7 +126,7 @@ impl TraceInst {
 #[derive(Clone, Debug)]
 pub struct TraceNode { pub id: usize, pub kind: TraceInst, pub results: Vec<TraceValueId>, pub source: TraceLocation }
 #[derive(Clone, Copy, Debug)]
-pub enum ExitReason { GuardTruthy, GuardFalsey, GuardValue, GuardNotNull, GuardInteger, GuardNumber, GuardBounds }
+pub enum ExitReason { GuardTruthy, GuardFalsey, GuardValue, GuardNotNull, GuardInteger, GuardUnsignedInteger, GuardNumber, GuardBounds }
 #[derive(Clone, Copy, Debug)]
 pub enum ExitTarget { Interpreter(TraceLocation), Trace(TraceId), Return }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,7 +162,7 @@ pub struct LoopPhi {
     pub entry_exit: Option<SideExitId>,
 }
 #[derive(Clone, Copy, Debug)]
-pub enum TraceKind { Loop }
+pub enum TraceKind { Loop, Side }
 #[derive(Clone, Debug)]
 pub struct TraceAnchor { pub kind: TraceKind, pub location: TraceLocation }
 #[derive(Clone, Debug)]
@@ -172,9 +173,11 @@ pub struct TraceStats {
     pub recorded_bytecodes: usize,
     pub promoted_f64_loop_phis: usize,
     pub promoted_i32_loop_phis: usize,
+    pub promoted_u32_loop_phis: usize,
     pub eliminated_guards: usize,
     pub eliminated_boxes: usize,
     pub eliminated_copies: usize,
+    pub pruned_snapshot_writes: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Trace {
@@ -247,7 +250,7 @@ impl TraceBuilder {
         let writes = self.dirty.iter().map(|slot| {
             let value = self.slots[slot];
             let kind = match self.trace.value(value).unwrap().rep {
-                TraceRep::Int32 | TraceRep::Bool => RegisterKind::Int32,
+                TraceRep::Int32 | TraceRep::UInt32 | TraceRep::Bool => RegisterKind::Int32,
                 TraceRep::F64 => RegisterKind::F64,
                 _ => RegisterKind::Value,
             };
@@ -265,7 +268,7 @@ impl TraceBuilder {
             let value = self.slots[slot];
             let rep = self.trace.value(value).unwrap().rep;
             let kind = match rep {
-                TraceRep::Int32 | TraceRep::Bool => RegisterKind::Int32,
+                TraceRep::Int32 | TraceRep::UInt32 | TraceRep::Bool => RegisterKind::Int32,
                 TraceRep::F64 => RegisterKind::F64,
                 _ => RegisterKind::Value,
             };
@@ -364,7 +367,7 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
             let source = t.canonical_value(*source);
             if available.get(source.0 as usize).copied().unwrap_or(false)
                 && t.value(source).is_some_and(|v| v.rep == TraceRep::Tagged)
-                && matches!(value.rep, TraceRep::F64 | TraceRep::Int32)
+                && matches!(value.rep, TraceRep::F64 | TraceRep::Int32 | TraceRep::UInt32)
             {
                 available[index] = true;
             } else {
@@ -417,7 +420,7 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
                 && (v.rep == phi.rep
                     || (phi.entry_exit.is_some()
                         && v.rep == TraceRep::Tagged
-                        && matches!(phi.rep, TraceRep::F64 | TraceRep::Int32)))
+                        && matches!(phi.rep, TraceRep::F64 | TraceRep::Int32 | TraceRep::UInt32)))
         });
         let backedge_ok = phi.backedge.and_then(|v| t.value(v)).is_some_and(|v| {
             v.rep == phi.rep && available[v.id.0 as usize]
@@ -466,7 +469,7 @@ pub struct TraceOptimizer;
 
 impl TraceOptimizer {
     /// Full optimizer, including loop-carried representation promotion.
-    /// Retained for backends that have validated raw F64/Int32 loop phis.
+    /// Retained for backends that have validated raw F64/Int32/UInt32 loop phis.
     pub fn optimize(&self, trace: &mut Trace) -> Result<(), Vec<String>> {
         self.optimize_impl(trace, true)
     }
@@ -550,15 +553,38 @@ impl TraceOptimizer {
                 let Some(result) = trace.nodes[index].results.first().copied() else { continue; };
                 match kind {
                     TraceInst::GuardF64 { value, .. } => {
-                        if let Some((_, TraceInst::BoxF64 { value: raw })) = Self::producer(trace, value) {
+                        if let Some((_, producer)) = Self::producer(trace, value) {
+                            match producer {
+                                TraceInst::BoxF64 { value: raw } => {
+                                    Self::alias_value(trace, result, raw);
+                                    trace.nodes[index].kind = TraceInst::Nop;
+                                    trace.stats.eliminated_guards += 1;
+                                    changed = true;
+                                }
+                                TraceInst::BoxInt32 { value: raw } => {
+                                    trace.nodes[index].kind = TraceInst::Int32ToF64 { value: raw };
+                                    trace.stats.eliminated_guards += 1;
+                                    changed = true;
+                                }
+                                TraceInst::BoxUInt32 { value: raw } => {
+                                    trace.nodes[index].kind = TraceInst::UInt32ToF64 { value: raw };
+                                    trace.stats.eliminated_guards += 1;
+                                    changed = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    TraceInst::GuardInt32 { value, .. } => {
+                        if let Some((_, TraceInst::BoxInt32 { value: raw })) = Self::producer(trace, value) {
                             Self::alias_value(trace, result, raw);
                             trace.nodes[index].kind = TraceInst::Nop;
                             trace.stats.eliminated_guards += 1;
                             changed = true;
                         }
                     }
-                    TraceInst::GuardInt32 { value, .. } => {
-                        if let Some((_, TraceInst::BoxInt32 { value: raw })) = Self::producer(trace, value) {
+                    TraceInst::GuardUInt32 { value, .. } => {
+                        if let Some((_, TraceInst::BoxUInt32 { value: raw })) = Self::producer(trace, value) {
                             Self::alias_value(trace, result, raw);
                             trace.nodes[index].kind = TraceInst::Nop;
                             trace.stats.eliminated_guards += 1;
@@ -575,6 +601,14 @@ impl TraceOptimizer {
                     }
                     TraceInst::BoxInt32 { value } => {
                         if let Some((_, TraceInst::GuardInt32 { value: tagged, .. })) = Self::producer(trace, value) {
+                            Self::alias_value(trace, result, tagged);
+                            trace.nodes[index].kind = TraceInst::Nop;
+                            trace.stats.eliminated_boxes += 1;
+                            changed = true;
+                        }
+                    }
+                    TraceInst::BoxUInt32 { value } => {
+                        if let Some((_, TraceInst::GuardUInt32 { value: tagged, .. })) = Self::producer(trace, value) {
                             Self::alias_value(trace, result, tagged);
                             trace.nodes[index].kind = TraceInst::Nop;
                             trace.stats.eliminated_boxes += 1;
@@ -603,6 +637,7 @@ impl TraceOptimizer {
             let (source, rep) = match &node.kind {
                 TraceInst::GuardF64 { value, .. } => (trace.canonical_value(*value), TraceRep::F64),
                 TraceInst::GuardInt32 { value, .. } => (trace.canonical_value(*value), TraceRep::Int32),
+                TraceInst::GuardUInt32 { value, .. } => (trace.canonical_value(*value), TraceRep::UInt32),
                 _ => continue,
             };
             let Some(source_value) = trace.value(source) else { continue; };
@@ -635,6 +670,7 @@ impl TraceOptimizer {
                     ty: match candidate.rep {
                         TraceRep::F64 => TraceType::F64,
                         TraceRep::Int32 => TraceType::Int32,
+                        TraceRep::UInt32 => TraceType::UInt32,
                         _ => unreachable!(),
                     },
                     rep: candidate.rep,
@@ -671,6 +707,7 @@ impl TraceOptimizer {
             let (raw_backedge, rep) = match producer {
                 TraceInst::BoxF64 { value } => (trace.canonical_value(value), TraceRep::F64),
                 TraceInst::BoxInt32 { value } => (trace.canonical_value(value), TraceRep::Int32),
+                TraceInst::BoxUInt32 { value } => (trace.canonical_value(value), TraceRep::UInt32),
                 _ => continue,
             };
             if trace.value(raw_backedge).map(|v| v.rep) != Some(rep) { continue; }
@@ -689,6 +726,7 @@ impl TraceOptimizer {
                 compatible &= match (&node.kind, rep) {
                     (TraceInst::GuardF64 { value, .. }, TraceRep::F64) => trace.canonical_value(*value) == phi.value,
                     (TraceInst::GuardInt32 { value, .. }, TraceRep::Int32) => trace.canonical_value(*value) == phi.value,
+                    (TraceInst::GuardUInt32 { value, .. }, TraceRep::UInt32) => trace.canonical_value(*value) == phi.value,
                     _ => false,
                 };
                 if !compatible { break; }
@@ -730,6 +768,7 @@ impl TraceOptimizer {
                 value.ty = match candidate.rep {
                     TraceRep::F64 => TraceType::F64,
                     TraceRep::Int32 => TraceType::Int32,
+                    TraceRep::UInt32 => TraceType::UInt32,
                     _ => value.ty,
                 };
             }
@@ -744,6 +783,9 @@ impl TraceOptimizer {
                         trace.canonical_value(value) == candidate.phi_value
                     }
                     TraceInst::GuardInt32 { value, .. } if candidate.rep == TraceRep::Int32 => {
+                        trace.canonical_value(value) == candidate.phi_value
+                    }
+                    TraceInst::GuardUInt32 { value, .. } if candidate.rep == TraceRep::UInt32 => {
                         trace.canonical_value(value) == candidate.phi_value
                     }
                     _ => false,
@@ -775,6 +817,7 @@ impl TraceOptimizer {
             match candidate.rep {
                 TraceRep::F64 => trace.stats.promoted_f64_loop_phis += 1,
                 TraceRep::Int32 => trace.stats.promoted_i32_loop_phis += 1,
+                TraceRep::UInt32 => trace.stats.promoted_u32_loop_phis += 1,
                 _ => {}
             }
         }
@@ -837,8 +880,8 @@ impl TraceOptimizer {
         for node in &mut trace.nodes {
             let Some(result) = node.results.first().copied() else { continue; };
             if used.contains(&canonical_values[result.0 as usize]) { continue; }
-            if matches!(&node.kind, TraceInst::BoxF64 { .. } | TraceInst::BoxInt32 { .. } | TraceInst::Copy { .. } | TraceInst::Reinterpret { .. }) {
-                if matches!(&node.kind, TraceInst::BoxF64 { .. } | TraceInst::BoxInt32 { .. }) {
+            if matches!(&node.kind, TraceInst::BoxF64 { .. } | TraceInst::BoxInt32 { .. } | TraceInst::BoxUInt32 { .. } | TraceInst::Copy { .. } | TraceInst::Reinterpret { .. }) {
+                if matches!(&node.kind, TraceInst::BoxF64 { .. } | TraceInst::BoxInt32 { .. } | TraceInst::BoxUInt32 { .. }) {
                     eliminated_boxes += 1;
                 }
                 node.kind = TraceInst::Nop;
@@ -968,6 +1011,46 @@ mod optimizer_tests {
         assert!(trace.loop_phis[0].entry_exit.is_some());
         assert_eq!(trace.canonical_value(trace.loop_phis[0].backedge.unwrap()), next);
         assert!(trace.stats.promoted_i32_loop_phis >= 1);
+    }
+
+    #[test]
+    fn promotes_tagged_unsigned_loop_phi_to_u32() {
+        let anchor = TraceLocation::new(FuncId(0), BytecodePc(25));
+        let mut builder = TraceBuilder::new(
+            TraceId(2),
+            TraceAnchor { kind: TraceKind::Loop, location: anchor },
+        );
+        let slot = FrameSlot::General(Reg(2));
+        let initial = builder.read_slot(slot, TraceType::Num, TraceRep::Tagged);
+        let phi = builder.add_loop_phi(slot, initial, TraceType::Num, TraceRep::Tagged);
+        let guard_exit = builder.add_side_exit(ExitReason::GuardUnsignedInteger, anchor.pc);
+        let raw = builder.emit1(
+            TraceInst::GuardUInt32 { value: phi, exit: guard_exit },
+            TraceType::UInt32,
+            TraceRep::UInt32,
+        );
+        let one = builder.constant(TraceConstant::Int32(1));
+        let next = builder.emit1(
+            TraceInst::IntBinary { op: IntBinOp::BitXor, lhs: raw, rhs: one },
+            TraceType::UInt32,
+            TraceRep::UInt32,
+        );
+        let boxed = builder.emit1(
+            TraceInst::BoxUInt32 { value: next },
+            TraceType::Num,
+            TraceRep::Tagged,
+        );
+        builder.write_slot(slot, boxed);
+        builder.set_loop_backedge(phi, boxed).unwrap();
+        builder.set_terminator(TraceTerminator::LoopBack);
+
+        let mut trace = builder.finish().unwrap();
+        TraceOptimizer::default().optimize(&mut trace).unwrap();
+
+        assert_eq!(trace.loop_phis[0].rep, TraceRep::UInt32);
+        assert!(trace.loop_phis[0].entry_exit.is_some());
+        assert_eq!(trace.canonical_value(trace.loop_phis[0].backedge.unwrap()), next);
+        assert!(trace.stats.promoted_u32_loop_phis >= 1);
     }
 
     #[test]

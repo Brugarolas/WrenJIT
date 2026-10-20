@@ -1341,6 +1341,42 @@ pub struct SafepointEntry {
     pub references: ReferenceMap,
 }
 
+/// Physical GPR liveness at one bytecode instruction boundary.
+///
+/// This is separate from `ReferenceMap`: tracing-JIT side exits must restore
+/// every value that the baseline interpreter may read after resuming, including
+/// unboxed numeric registers, while the GC map only tracks tagged references.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveRegisterMap {
+    pub general: [u64; 4],
+}
+
+impl LiveRegisterMap {
+    #[inline]
+    pub fn set_general(&mut self, reg: Reg, live: bool) {
+        let word = reg.index() / 64;
+        let bit = reg.index() % 64;
+        if live {
+            self.general[word] |= 1u64 << bit;
+        } else {
+            self.general[word] &= !(1u64 << bit);
+        }
+    }
+
+    #[inline]
+    pub fn general_is_live(&self, reg: Reg) -> bool {
+        let word = reg.index() / 64;
+        let bit = reg.index() % 64;
+        (self.general[word] & (1u64 << bit)) != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveRegisterEntry {
+    pub pc: BytecodePc,
+    pub live: LiveRegisterMap,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DeoptLocation {
     General(Reg),
@@ -1414,6 +1450,8 @@ pub struct BytecodeChunk {
     pub switch_tables: Vec<SwitchTable>,
     pub deopts: Vec<BytecodeDeoptPoint>,
     pub safepoints: Vec<SafepointEntry>,
+    /// Sorted instruction-boundary liveness used by tracing-JIT side exits.
+    pub live_registers: Vec<LiveRegisterEntry>,
     pub resume_points: Vec<ResumeEntry>,
     pub source_map: Vec<SourceMapEntry>,
     pub profile_counters: Vec<ProfileCounterDescriptor>,
@@ -1461,6 +1499,14 @@ impl BytecodeChunk {
 
     pub fn safepoint_at(&self, pc: BytecodePc) -> Option<&SafepointEntry> {
         self.safepoints.iter().find(|entry| entry.pc == pc)
+    }
+
+    #[inline]
+    pub fn live_registers_at(&self, pc: BytecodePc) -> Option<&LiveRegisterMap> {
+        self.live_registers
+            .binary_search_by_key(&pc.0, |entry| entry.pc.0)
+            .ok()
+            .map(|index| &self.live_registers[index].live)
     }
 
     pub fn deopt_by_id(&self, id: DeoptId) -> Option<&BytecodeDeoptPoint> {
@@ -2111,6 +2157,7 @@ impl Assembler {
         }
 
         self.chunk.safepoints.sort_by_key(|entry| entry.pc);
+        self.chunk.live_registers.sort_by_key(|entry| entry.pc);
         self.chunk.resume_points.sort_by_key(|entry| entry.pc);
         self.chunk.source_map.sort_by_key(|entry| entry.start_pc);
         Ok(self.chunk)
@@ -2897,6 +2944,34 @@ impl BytecodeVerifier {
                     "safepoint {} sets invalid return-register GC bits",
                     entry.pc.0
                 )));
+            }
+        }
+
+        let mut last_live_pc = None;
+        for entry in &chunk.live_registers {
+            if !boundaries.contains(&entry.pc) {
+                return Err(VerificationError::function(format!(
+                    "live-register PC {} is not an instruction boundary",
+                    entry.pc.0
+                )));
+            }
+            if let Some(previous) = last_live_pc {
+                if previous >= entry.pc.0 {
+                    return Err(VerificationError::function(
+                        "live-register entries must be strictly sorted and unique",
+                    ));
+                }
+            }
+            last_live_pc = Some(entry.pc.0);
+
+            for reg_index in function.frame.general_register_count as usize..GENERAL_REGISTER_COUNT {
+                let reg = Reg(reg_index as u8);
+                if entry.live.general_is_live(reg) {
+                    return Err(VerificationError::function(format!(
+                        "live-register entry {} marks {:?} live outside the frame",
+                        entry.pc.0, reg
+                    )));
+                }
             }
         }
 

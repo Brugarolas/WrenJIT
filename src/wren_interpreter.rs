@@ -835,6 +835,9 @@ struct PreparedFunction {
     /// is still cold/uncompiled. This bypasses the loop-state HashMap on every
     /// subsequent hot backedge once tiering succeeds.
     jit_trace_headers: Vec<u32>,
+    /// Invoke op indices patched to the monomorphic stock-Num fast handler.
+    /// Method rebinding restores these sites to the generic invoke handler.
+    quickened_numeric_ops: Vec<u32>,
     module_slot: u32,
     kind: FunctionKind,
     arity: u8,
@@ -1117,6 +1120,7 @@ impl PreparedProgram {
             field_slots_relocated: function.field_owner.is_none(),
             jit_disabled_headers,
             jit_trace_headers,
+            quickened_numeric_ops: Vec::new(),
             module_slot,
             kind: function.kind,
             arity: function.arity,
@@ -1334,6 +1338,81 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
     })
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumericQuickOp {
+    Neg = 1,
+    BitNot,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    ShrU,
+}
+
+impl NumericQuickOp {
+    #[inline]
+    fn from_flag(flag: u8) -> Option<Self> {
+        Some(match flag {
+            1 => Self::Neg,
+            2 => Self::BitNot,
+            3 => Self::Add,
+            4 => Self::Sub,
+            5 => Self::Mul,
+            6 => Self::Div,
+            7 => Self::Rem,
+            8 => Self::Lt,
+            9 => Self::Le,
+            10 => Self::Gt,
+            11 => Self::Ge,
+            12 => Self::Eq,
+            13 => Self::Ne,
+            14 => Self::BitAnd,
+            15 => Self::BitOr,
+            16 => Self::BitXor,
+            17 => Self::Shl,
+            18 => Self::ShrU,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    fn from_method(name: &str, arity: u8) -> Option<Self> {
+        Some(match (name, arity) {
+            ("-", 0) => Self::Neg,
+            ("~", 0) => Self::BitNot,
+            ("+", 1) => Self::Add,
+            ("-", 1) => Self::Sub,
+            ("*", 1) => Self::Mul,
+            ("/", 1) => Self::Div,
+            ("%", 1) => Self::Rem,
+            ("<", 1) => Self::Lt,
+            ("<=", 1) => Self::Le,
+            (">", 1) => Self::Gt,
+            (">=", 1) => Self::Ge,
+            ("==", 1) => Self::Eq,
+            ("!=", 1) => Self::Ne,
+            ("&", 1) => Self::BitAnd,
+            ("|", 1) => Self::BitOr,
+            ("^", 1) => Self::BitXor,
+            ("<<", 1) => Self::Shl,
+            (">>", 1) => Self::ShrU,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct IcEntry {
     class: ReceiverClass,
@@ -1497,7 +1576,7 @@ enum RunState {
 }
 
 pub struct Interpreter<'p> {
-    jit: Option<TracingJit>,
+    jit: Option<Box<TracingJit>>,
     program: &'p BytecodeProgram,
     prepared: PreparedProgram,
     host: Box<dyn Host>,
@@ -1649,7 +1728,7 @@ impl<'p> Interpreter<'p> {
         main.registers.reserve(4096);
 
         Ok(Self {
-            jit: Some(TracingJit::default()),
+            jit: Some(Box::new(TracingJit::default())),
             program,
             prepared,
             host,
@@ -1690,18 +1769,27 @@ impl<'p> Interpreter<'p> {
             function.jit_disabled_headers.fill(0);
             function.jit_trace_headers.fill(NO_INDEX);
         }
-        self.jit = options.map(TracingJit::new);
+        self.jit = options.map(|options| Box::new(TracingJit::new(options)));
     }
 
     pub fn jit_stats(&self) -> Option<&TracingJitStats> {
-        self.jit.as_ref().map(TracingJit::stats)
+        self.jit.as_ref().map(|jit| jit.stats())
     }
 
     fn invalidate_method_traces(&mut self) {
-        if let Some(jit) = &self.jit { self.jit = Some(TracingJit::new(jit.options().clone())); }
+        if let Some(options) = self.jit.as_ref().map(|jit| jit.options().clone()) {
+            self.jit = Some(Box::new(TracingJit::new(options)));
+        }
         for function in &mut self.prepared.functions {
             function.jit_disabled_headers.fill(0);
             function.jit_trace_headers.fill(NO_INDEX);
+            for op_index in std::mem::take(&mut function.quickened_numeric_ops) {
+                let index = op_index as usize;
+                if index < function.handlers.len() && index < function.ops.len() {
+                    function.handlers[index] = h_invoke;
+                    function.ops[index].flags = 0;
+                }
+            }
         }
         self.megamorphic_cache.clear();
         for function in &mut self.inline_caches {
@@ -2009,16 +2097,6 @@ impl<'p> Interpreter<'p> {
         let function_index = self.current_frame().function as usize;
         debug_assert!(target < from_index);
 
-        let function = self.current_prepared().id;
-        let target_raw_pc = match self.current_prepared().original_ops.get(target as usize) {
-            Some(target_op) => target_op.raw_pc,
-            None => {
-                self.fail(RuntimeError::new("invalid prepared backedge target"));
-                return;
-            }
-        };
-        let from = TraceLocation::new(function, BytecodePc(op.raw_pc));
-        let to = TraceLocation::new(function, BytecodePc(target_raw_pc));
         let cached_trace = self
             .prepared
             .functions
@@ -2031,25 +2109,40 @@ impl<'p> Interpreter<'p> {
 
         // During recording/native runtime helpers the manager is temporarily
         // taken out of the Interpreter, which also prevents recursive tiering.
+        // The manager itself is boxed, so this hot transition moves one pointer
+        // instead of the whole JIT state.
         let Some(mut jit) = self.jit.take() else { return; };
-        let result = if cached_trace != NO_INDEX {
-            // Once a header owns native code, bypass the loop-state HashMap and
-            // enter its dense TraceId directly. Inner loops may hit this path
-            // hundreds of thousands of times.
-            jit.enter_trace(self, TraceId(cached_trace))
+
+        let (result, uncached_target) = if cached_trace != NO_INDEX {
+            // Compiled headers need neither raw-PC lookup nor TraceLocation
+            // construction nor a loop-state hash probe.
+            (jit.enter_trace(self, TraceId(cached_trace)), None)
         } else {
-            jit.on_backedge(self, from, to)
+            let function = self.prepared.functions[function_index].id;
+            let target_raw_pc = match self.prepared.functions[function_index]
+                .original_ops
+                .get(target as usize)
+            {
+                Some(target_op) => target_op.raw_pc,
+                None => {
+                    self.jit = Some(jit);
+                    self.fail(RuntimeError::new("invalid prepared backedge target"));
+                    return;
+                }
+            };
+            let from = TraceLocation::new(function, BytecodePc(op.raw_pc));
+            let to = TraceLocation::new(function, BytecodePc(target_raw_pc));
+            (jit.on_backedge(self, from, to), Some(to))
         };
 
         // Cold/uncompiled headers need a loop-state lookup to learn whether a
         // sequence of recording failures finally blacklisted the header.
-        // Cached traces report temporary cooldowns directly.
         let disable_header = if matches!(&result, Ok(JitAction::Blacklisted)) {
             true
-        } else if cached_trace != NO_INDEX {
-            false
-        } else {
+        } else if let Some(to) = uncached_target {
             jit.is_blacklisted(to)
+        } else {
+            false
         };
         let newly_compiled = match &result {
             Ok(JitAction::Compiled { trace })
@@ -2527,6 +2620,48 @@ impl Interpreter<'_> {
             self.megamorphic_cache.insert(mega_key, target);
         }
         Ok(target)
+    }
+
+    #[inline]
+    fn maybe_quicken_numeric_invoke(
+        &mut self,
+        function_index: u32,
+        op_index: u32,
+        ic_slot: u32,
+        class: ReceiverClass,
+        target: CallTarget,
+    ) {
+        let expected_num = ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Num as u64);
+        if class != expected_num { return; }
+        let CallTarget::Primitive(primitive) = target else { return; };
+
+        let Some(descriptor) = self
+            .program
+            .functions
+            .get(function_index as usize)
+            .and_then(|function| function.chunk.inline_caches.get(ic_slot as usize))
+        else { return; };
+        let Some(signature) = self.program.metadata.method(descriptor.method) else { return; };
+        let Some(name) = self.program.metadata.string(signature.name) else { return; };
+        if !self.host.standard_numeric_method(primitive, name, signature.arity) { return; }
+        let Some(quick) = NumericQuickOp::from_method(name, signature.arity) else { return; };
+
+        let Some(function) = self.prepared.functions.get_mut(function_index as usize) else { return; };
+        let index = op_index as usize;
+        if index >= function.handlers.len() || index >= function.ops.len() { return; }
+        if function.ops[index].flags != 0 { return; }
+        if signature.arity == 1 {
+            let Some(rhs) = function.call_args.get(function.ops[index].args_offset as usize).copied() else {
+                return;
+            };
+            // `y` is not consumed by generic Invoke execution. Cache the first
+            // argument register here so the quickened handler avoids the call-args
+            // side table and current-function lookup on every arithmetic operation.
+            function.ops[index].y = rhs.0 as u32;
+        }
+        function.ops[index].flags = quick as u8;
+        function.handlers[index] = h_invoke_num_quick;
+        function.quickened_numeric_ops.push(op_index);
     }
 
     /// Execute the stock Num primitives directly in the interpreter when the
@@ -3522,24 +3657,91 @@ unsafe fn h_guard_f64(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;l
 unsafe fn h_bailout(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let _reason=decode_bailout_reason(op.a).unwrap_or(BailoutReason::Explicit);vm.deopt(op,op.x)}
 
 unsafe fn h_invoke(vm:&mut Interpreter, ptr:*const PreparedOp){
-    let op=&*ptr;
+    // Copy the descriptor so quickening may mutate the prepared opcode/handler
+    // without aliasing the currently executing PreparedOp reference.
+    let op=*ptr;
     let function=(*vm.hot_frame).function;
+    let op_index=(*vm.hot_frame).pc;
     let receiver=vm.reg(op.b);
     let receiver_value=Value::from_word(receiver);
     let class=match vm.receiver_class(receiver_value){
         Ok(class)=>class,
-        Err(error)=>{vm.fail_at(op,error.message);return;}
+        Err(error)=>{vm.fail_at(&op,error.message);return;}
     };
     let target=match vm.probe_invoke_cache(function,op.x,class){
         Some(target)=>target,
         None=>match vm.resolve_invoke_miss(function,op.x,class){
             Ok(target)=>target,
-            Err(error)=>{vm.fail_at(op,error.message);return;}
+            Err(error)=>{vm.fail_at(&op,error.message);return;}
         },
     };
+    vm.maybe_quicken_numeric_invoke(function,op_index,op.x,class,target);
     let mut args=[RegisterWord(0);17];
-    let count=vm.gather_call_words(op,&mut args);
-    vm.invoke_target(op,target,receiver,&args[..count]);
+    let count=vm.gather_call_words(&op,&mut args);
+    vm.invoke_target(&op,target,receiver,&args[..count]);
+}
+
+unsafe fn h_invoke_num_quick(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=*ptr;
+    let Some(quick)=NumericQuickOp::from_flag(op.flags) else {
+        h_invoke(vm,ptr);
+        return;
+    };
+    let receiver=Value::from_word(vm.reg(op.b));
+    let Some(lhs)=receiver.as_num() else {
+        h_invoke(vm,ptr);
+        return;
+    };
+
+    let rhs_value = if op.c != 0 {
+        Some(Value::from_word(vm.reg(op.y as u8)))
+    } else {
+        None
+    };
+
+    let rhs_num = || rhs_value.and_then(Value::as_num);
+    let result = match quick {
+        NumericQuickOp::Neg => Value::from_num(-lhs),
+        NumericQuickOp::BitNot => Value::from_num((!num_to_u32(lhs)) as f64),
+        NumericQuickOp::Eq => Value::from_bool(rhs_num().is_some_and(|rhs| lhs == rhs)),
+        NumericQuickOp::Ne => Value::from_bool(!rhs_num().is_some_and(|rhs| lhs == rhs)),
+        NumericQuickOp::Add | NumericQuickOp::Sub | NumericQuickOp::Mul | NumericQuickOp::Div
+        | NumericQuickOp::Rem | NumericQuickOp::Lt | NumericQuickOp::Le | NumericQuickOp::Gt
+        | NumericQuickOp::Ge | NumericQuickOp::BitAnd | NumericQuickOp::BitOr
+        | NumericQuickOp::BitXor | NumericQuickOp::Shl | NumericQuickOp::ShrU => {
+            let Some(rhs)=rhs_num() else {
+                h_invoke(vm,ptr);
+                return;
+            };
+            match quick {
+                NumericQuickOp::Add => Value::from_num(lhs+rhs),
+                NumericQuickOp::Sub => Value::from_num(lhs-rhs),
+                NumericQuickOp::Mul => Value::from_num(lhs*rhs),
+                NumericQuickOp::Div => Value::from_num(lhs/rhs),
+                NumericQuickOp::Rem => Value::from_num(lhs%rhs),
+                NumericQuickOp::Lt => Value::from_bool(lhs<rhs),
+                NumericQuickOp::Le => Value::from_bool(lhs<=rhs),
+                NumericQuickOp::Gt => Value::from_bool(lhs>rhs),
+                NumericQuickOp::Ge => Value::from_bool(lhs>=rhs),
+                NumericQuickOp::BitAnd | NumericQuickOp::BitOr | NumericQuickOp::BitXor
+                | NumericQuickOp::Shl | NumericQuickOp::ShrU => {
+                    let left=num_to_u32(lhs);
+                    let right=num_to_u32(rhs);
+                    Value::from_num(match quick {
+                        NumericQuickOp::BitAnd => (left & right) as f64,
+                        NumericQuickOp::BitOr => (left | right) as f64,
+                        NumericQuickOp::BitXor => (left ^ right) as f64,
+                        NumericQuickOp::Shl => left.wrapping_shl(right) as f64,
+                        NumericQuickOp::ShrU => left.wrapping_shr(right) as f64,
+                        _ => unreachable!(),
+                    })
+                }
+                _ => unreachable!(),
+            }
+        }
+    };
+    vm.set_reg(op.a,result.word());
+    vm.advance(&op);
 }
 unsafe fn h_call_direct(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr; let mut words=[RegisterWord(0);17]; let count=vm.gather_call_words(op,&mut words);
@@ -4177,7 +4379,11 @@ mod tests {
         let stats = vm.jit_stats().unwrap();
         // Only the innermost loop should become a root native loop. The outer
         // loop necessarily encounters the inner cycle before it can close.
-        assert_eq!(stats.traces_compiled, 1, "outer nested loop must not install a finite-prefix trace: {stats:?}");
+        assert_eq!(
+            stats.traces_compiled.saturating_sub(stats.side_traces_compiled),
+            1,
+            "outer nested loop must not install a second root trace: {stats:?}",
+        );
         assert!(stats.recordings_aborted > 0, "outer recording should abort on the nested cycle: {stats:?}");
         assert!(stats.blacklisted_loops > 0, "repeatedly untraceable outer loop should fall back to baseline: {stats:?}");
         assert_eq!(stats.trace_cooldowns, 0, "nested-cycle rejection should happen before native thrashing: {stats:?}");
@@ -4333,7 +4539,11 @@ mod tests {
         let stats = vm.jit_stats().unwrap();
         assert!(stats.recordings_aborted > 0, "{stats:?}");
         assert!(stats.native_iterations > 45000, "{stats:?}");
-        assert_eq!(stats.traces_compiled, 1, "{stats:?}");
+        assert_eq!(
+            stats.traces_compiled.saturating_sub(stats.side_traces_compiled),
+            1,
+            "{stats:?}",
+        );
     }
 
     #[test]
@@ -4355,8 +4565,12 @@ mod tests {
                 let result = source_result(&vm);
                 assert!((result - expected).abs() < 1e-12,
                     "{expression}, JIT={enabled}: {result} != {expected}");
-                if enabled && !expression.contains("xorshift") {
-                    assert!(vm.jit_stats().unwrap().native_iterations > 9000);
+                if enabled {
+                    let stats = vm.jit_stats().unwrap();
+                    assert!(stats.native_iterations > 9000, "{expression}: {stats:?}");
+                    if expression.contains("xorshift") {
+                        assert!(stats.promoted_u32_loop_phis > 0, "{stats:?}");
+                    }
                 }
             }
         }
