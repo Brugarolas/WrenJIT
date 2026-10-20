@@ -125,18 +125,21 @@ fn setup<'p>(program: &'p BytecodeProgram, opcode: Opcode) -> Interpreter<'p> {
         _ => {},
     }
     for (i, word) in regs.into_iter().enumerate() { vm.trace_write_slot(FrameSlot::General(Reg(i as u8)), word).unwrap(); }
-    vm.current_frame_mut().arguments[1] = Value::TRUE.word();
-    vm.current_frame_mut().returns[1] = Value::FALSE.word();
+    vm.current_banks_mut().arguments[1] = Value::TRUE.word();
+    vm.current_banks_mut().returns[1] = Value::FALSE.word();
     vm
 }
 
 /// Heap handles are deterministic in these fixtures. Include contents as well
 /// as registers so stores, binding, allocation and profile effects are checked.
-fn state(vm: &Interpreter<'_>) -> String {
+fn state(vm: &mut Interpreter<'_>) -> String {
+    // Commit the cached PC before comparing the saved frame state.
+    vm.flush_hot_pc();
     let fibers: Vec<_> = vm.fibers.iter().map(|f| f.as_ref().map(|f| (
-        format!("{:?}", f.status), f.registers.clone(), f.frames.iter().map(|frame| (
-            frame.function, frame.pc, frame.arguments, frame.returns, frame.special,
-        )).collect::<Vec<_>>(), f.last_value, f.error,
+        format!("{:?}", f.status), f.registers.clone(), f.frames.iter().enumerate().map(|(depth, frame)| {
+            let banks = &f.banks[depth];
+            (frame.function, frame.pc, banks.arguments, banks.returns, banks.special)
+        }).collect::<Vec<_>>(), f.last_value, f.error,
     ))).collect();
     let heap: Vec<_> = vm.heap.slots.iter().map(|slot| format!("{:?}", slot.as_ref().map(|slot| &slot.object))).collect();
     let modules: Vec<_> = vm.modules.iter().map(|m| (&m.variables, m.initialized, m.initializing)).collect();
@@ -158,7 +161,7 @@ fn all_122_opcodes_execute_in_native_traces_like_the_interpreter() {
         let mut jit = TracingJit::new(options);
         jit.execute_one_for_test(&mut native).unwrap_or_else(|e| panic!("{opcode:?}: {e}"));
         assert_eq!(jit.stats().native_entries, 1, "{opcode:?}");
-        assert_eq!(state(&native), state(&baseline), "{opcode:?}");
+        assert_eq!(state(&mut native), state(&mut baseline), "{opcode:?}");
         count += 1;
     }
     assert_eq!(count, 122);

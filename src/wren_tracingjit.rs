@@ -167,6 +167,18 @@ pub struct TraceActivation {
     pub runtime: *mut c_void,
     pub execute: RuntimeTraceFn,
 
+    /// Dense native entry table and per-trace link-table pointers. The Cranelift
+    /// dispatcher uses these to follow stitched trace-tree edges without returning
+    /// to the Rust tiering manager. They remain stable for one dispatcher call.
+    pub trace_entries: *const usize,
+    pub trace_link_tables: *const usize,
+    pub current_links: *const u32,
+    pub trace_entries_len: u32,
+    pub next_trace: u32,
+    /// Link transitions left before the native dispatcher cooperatively yields.
+    /// u32::MAX disables dispatcher-level yielding.
+    pub dispatch_links_remaining: u32,
+
     /// Written only by native side exits.
     pub exit_id: u32,
     pub result_code: u32,
@@ -185,6 +197,12 @@ impl TraceActivation {
             special: inputs.special,
             runtime: inputs.runtime,
             execute: inputs.execute,
+            trace_entries: std::ptr::null(),
+            trace_link_tables: std::ptr::null(),
+            current_links: std::ptr::null(),
+            trace_entries_len: 0,
+            next_trace: u32::MAX,
+            dispatch_links_remaining: u32::MAX,
             exit_id: u32::MAX,
             result_code: TRACE_RESULT_CONTINUE,
             native_iterations: 0,
@@ -2234,6 +2252,7 @@ struct CompiledExitValue {
 struct CompiledExitWrite {
     slot: FrameSlot,
     kind: RegisterKind,
+    target_rep: TraceRep,
     source: ExitWriteSource,
 }
 
@@ -2243,6 +2262,9 @@ struct CompiledExitPlan {
     target: ExitTarget,
     writes: Vec<CompiledExitWrite>,
     dynamic_values: Vec<CompiledExitValue>,
+    /// Runtime-owned String/BuiltinClass constants cannot be reconstructed by
+    /// generated code, so exits containing them keep manager-level stitching.
+    native_linkable: bool,
 }
 
 impl CompiledExitPlan {
@@ -2302,15 +2324,24 @@ impl CompiledExitPlan {
             writes.push(CompiledExitWrite {
                 slot: write.slot,
                 kind: write.kind,
+                target_rep: write.target_rep,
                 source,
             });
         }
+
+        let native_linkable = writes.iter().all(|write| {
+            !matches!(
+                write.source,
+                ExitWriteSource::Constant(TraceConstant::String(_) | TraceConstant::BuiltinClass(_))
+            )
+        });
 
         Ok(Self {
             id: exit.id,
             target: exit.target,
             writes,
             dynamic_values,
+            native_linkable,
         })
     }
 }
@@ -2327,6 +2358,9 @@ struct CompiledTrace {
     exits: Vec<CompiledExitPlan>,
     exit_hits: Vec<u32>,
     side_trace_attempted: Vec<bool>,
+    /// Dense child TraceId per exit. u32::MAX means manager-level side exit. The
+    /// boxed allocation has a stable address consumed by generated code.
+    native_links: Box<[u32]>,
     /// Root loop owning this trace tree and depth from that root.
     root_trace: TraceId,
     tree_depth: u8,
@@ -2345,6 +2379,9 @@ impl CompiledTrace {
 
 struct CraneliftBackend {
     module: JITModule,
+    context: codegen::Context,
+    function_context: FunctionBuilderContext,
+    dispatcher: NativeTraceFn,
 }
 
 impl CraneliftBackend {
@@ -2378,12 +2415,155 @@ impl CraneliftBackend {
             .finish(settings::Flags::new(flag_builder))
             .map_err(|error| format!("cannot build Cranelift host ISA: {error}"))?;
 
-        let module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+        let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
         if module.target_config().pointer_type() != types::I64 {
             return Err("WrenJIT's NaN-boxed native tier currently requires a 64-bit host".to_owned());
         }
 
-        Ok(Self { module })
+        let dispatcher = Self::compile_dispatcher(&mut module)?;
+        let context = module.make_context();
+        let function_context = FunctionBuilderContext::new();
+        Ok(Self { module, context, function_context, dispatcher })
+    }
+
+    /// Native trace-tree dispatcher. Individual traces keep the simple C ABI
+    /// `fn(*mut TraceActivation) -> u32`; linked exits return TRACE_RESULT_LINK
+    /// after writing `next_trace`. This loop immediately calls the child trace in
+    /// generated code, avoiding a Rust-manager round trip and avoiding recursive
+    /// native calls for root <-> side cycles.
+    fn compile_dispatcher(module: &mut JITModule) -> Result<NativeTraceFn, String> {
+        let pointer_type = module.target_config().pointer_type();
+        let mut signature = module.make_signature();
+        signature.params.push(AbiParam::new(pointer_type));
+        signature.returns.push(AbiParam::new(types::I32));
+        let function = module
+            .declare_anonymous_function(&signature)
+            .map_err(|error| format!("cannot declare native trace dispatcher: {error}"))?;
+
+        let trace_signature = signature.clone();
+        let mut context = module.make_context();
+        context.func.signature = signature;
+        context.func.name = UserFuncName::user(0, function.as_u32());
+        let target_config = module.target_config();
+        let mut function_context = FunctionBuilderContext::new();
+
+        {
+            let mut builder = FunctionBuilder::new(&mut context.func, &mut function_context);
+            let entry = builder.create_block();
+            let dispatch = builder.create_block();
+            let linked_result = builder.create_block();
+            let budgeted_link = builder.create_block();
+            let done = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.append_block_param(linked_result, types::I32);
+            builder.append_block_param(budgeted_link, types::I32);
+            builder.append_block_param(done, types::I32);
+
+            builder.switch_to_block(entry);
+            let activation = builder.block_params(entry)[0];
+            let trace_signature = builder.import_signature(trace_signature);
+            builder.ins().jump(dispatch, &[]);
+
+            builder.switch_to_block(dispatch);
+            let trace_id = builder.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, next_trace) as i32,
+            );
+            let trace_index = builder.ins().uextend(types::I64, trace_id);
+            let byte_offset = builder.ins().ishl_imm(trace_index, 3);
+
+            let entries = builder.ins().load(
+                pointer_type,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, trace_entries) as i32,
+            );
+            let entry_addr = builder.ins().iadd(entries, byte_offset);
+            let callee = builder.ins().load(
+                pointer_type,
+                MemFlagsData::trusted(),
+                entry_addr,
+                0,
+            );
+
+            let link_tables = builder.ins().load(
+                pointer_type,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, trace_link_tables) as i32,
+            );
+            let link_addr = builder.ins().iadd(link_tables, byte_offset);
+            let current_links = builder.ins().load(
+                pointer_type,
+                MemFlagsData::trusted(),
+                link_addr,
+                0,
+            );
+            builder.ins().store(
+                MemFlagsData::trusted(),
+                current_links,
+                activation,
+                offset_of!(TraceActivation, current_links) as i32,
+            );
+
+            let call = builder.ins().call_indirect(trace_signature, callee, &[activation]);
+            let result = builder.inst_results(call)[0];
+            let linked = builder.ins().icmp_imm(
+                IntCC::Equal,
+                result,
+                TRACE_RESULT_LINK as i64,
+            );
+            builder.ins().brif(linked, linked_result, &[result.into()], done, &[result.into()]);
+
+            // A trace-tree cycle can otherwise remain in generated code forever
+            // while each individual trace resets its own loop watchdog. Bound the
+            // number of native-to-native links as a second cooperative safepoint.
+            builder.switch_to_block(linked_result);
+            let result = builder.block_params(linked_result)[0];
+            let remaining = builder.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, dispatch_links_remaining) as i32,
+            );
+            let unlimited = builder.ins().icmp_imm(IntCC::Equal, remaining, -1);
+            builder.ins().brif(unlimited, dispatch, &[], budgeted_link, &[result.into()]);
+
+            builder.switch_to_block(budgeted_link);
+            let result = builder.block_params(budgeted_link)[0];
+            let remaining = builder.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                activation,
+                offset_of!(TraceActivation, dispatch_links_remaining) as i32,
+            );
+            let remaining = builder.ins().iadd_imm(remaining, -1);
+            builder.ins().store(
+                MemFlagsData::trusted(),
+                remaining,
+                activation,
+                offset_of!(TraceActivation, dispatch_links_remaining) as i32,
+            );
+            let exhausted = builder.ins().icmp_imm(IntCC::Equal, remaining, 0);
+            builder.ins().brif(exhausted, done, &[result.into()], dispatch, &[]);
+
+            builder.switch_to_block(done);
+            let result = builder.block_params(done)[0];
+            builder.ins().return_(&[result]);
+            builder.seal_all_blocks();
+            builder.finalize(target_config);
+        }
+
+        module
+            .define_function(function, &mut context)
+            .map_err(|error| format!("cannot compile native trace dispatcher: {error}"))?;
+        module
+            .finalize_definitions()
+            .map_err(|error| format!("cannot finalize native trace dispatcher: {error}"))?;
+        let code_ptr = module.get_finalized_function(function);
+        Ok(unsafe { std::mem::transmute(code_ptr) })
     }
 }
 
@@ -2399,7 +2579,7 @@ struct CraneliftLoweringState<'a, 'p> {
     activation: Value,
     pointer_type: Type,
     runtime_signature: codegen::ir::SigRef,
-    values: HashMap<TraceValueId, Value>,
+    values: Vec<Option<Value>>,
     exit_plans: &'p [CompiledExitPlan],
     /// Current loop budget block parameter. The manager derives completed native
     /// iterations from it only when a side exit is materialized.
@@ -2446,8 +2626,10 @@ impl<'a> CraneliftTraceCompiler<'a> {
         })
     }
 
-    fn compile(self, module: &mut JITModule) -> Result<CompiledTrace, TracingJitError> {
+    fn compile(self, backend: &mut CraneliftBackend) -> Result<CompiledTrace, TracingJitError> {
         let trace_id = self.trace.id;
+        let CraneliftBackend { module, context, function_context, .. } = backend;
+        context.clear();
         let pointer_type = module.target_config().pointer_type();
 
         let mut signature = module.make_signature();
@@ -2468,16 +2650,14 @@ impl<'a> CraneliftTraceCompiler<'a> {
         runtime_signature.params.push(AbiParam::new(types::I32));
         runtime_signature.returns.push(AbiParam::new(types::I32));
 
-        let mut context = module.make_context();
         context.func.signature = signature;
         context.func.name = UserFuncName::user(0, function.as_u32());
         context.set_disasm(self.options.cranelift_dump_disassembly);
 
         let target_config = module.target_config();
-        let mut function_context = FunctionBuilderContext::new();
 
         {
-            let mut builder = FunctionBuilder::new(&mut context.func, &mut function_context);
+            let mut builder = FunctionBuilder::new(&mut context.func, function_context);
             let entry_block = builder.create_block();
             let loop_block = builder.create_block();
 
@@ -2495,7 +2675,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 activation,
                 pointer_type,
                 runtime_signature,
-                values: HashMap::new(),
+                values: vec![None; self.trace.values.len()],
                 exit_plans: &self.exit_plans,
                 native_budget_remaining: None,
                 native_budget_initial: self.options.native_loop_iteration_budget,
@@ -2565,7 +2745,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
 
             for (phi, variable) in self.trace.loop_phis.iter().zip(phi_vars.iter().copied()) {
                 let value = state.builder.use_var(variable);
-                state.values.insert(phi.value, value);
+                state.cache_value(phi.value, value);
             }
             state.native_budget_remaining = budget_var.map(|variable| state.builder.use_var(variable));
 
@@ -2673,7 +2853,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
         }
 
         module
-            .define_function(function, &mut context)
+            .define_function(function, context)
             .map_err(|error| TracingJitError::CraneliftLowering {
                 trace: trace_id,
                 message: format!("native code generation failed: {error}"),
@@ -2707,6 +2887,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
             entry,
             exit_hits: vec![0; self.exit_plans.len()],
             side_trace_attempted: vec![false; self.exit_plans.len()],
+            native_links: vec![u32::MAX; self.exit_plans.len()].into_boxed_slice(),
             root_trace: trace_id,
             tree_depth: 0,
             exits: self.exit_plans,
@@ -2717,6 +2898,17 @@ impl<'a> CraneliftTraceCompiler<'a> {
 }
 
 impl CraneliftLoweringState<'_, '_> {
+    #[inline(always)]
+    fn cached_value(&self, id: TraceValueId) -> Option<Value> {
+        self.values.get(id.0 as usize).and_then(|value| *value)
+    }
+
+    #[inline(always)]
+    fn cache_value(&mut self, id: TraceValueId, value: Value) {
+        let slot = self.values.get_mut(id.0 as usize).expect("trace value id out of range");
+        *slot = Some(value);
+    }
+
     #[inline]
     fn trusted_mem() -> MemFlagsData {
         MemFlagsData::trusted()
@@ -2743,7 +2935,7 @@ impl CraneliftLoweringState<'_, '_> {
 
     fn lower_value(&mut self, value: TraceValueId) -> Result<Value, TracingJitError> {
         let value = self.trace.canonical_value(value);
-        if let Some(existing) = self.values.get(&value).copied() {
+        if let Some(existing) = self.cached_value(value) {
             return Ok(existing);
         }
 
@@ -2794,7 +2986,7 @@ impl CraneliftLoweringState<'_, '_> {
             TraceValueOrigin::Alias(alias) => return self.lower_value(alias),
         };
 
-        self.values.insert(value, lowered);
+        self.cache_value(value, lowered);
         Ok(lowered)
     }
 
@@ -3171,7 +3363,7 @@ impl CraneliftLoweringState<'_, '_> {
             .brif(failure_condition, stop, &[], resume, &[]);
 
         self.builder.switch_to_block(stop);
-        self.materialize_side_exit(&plan)?;
+        self.materialize_exit_or_native_link(&plan)?;
 
         self.builder.switch_to_block(resume);
         Ok(())
@@ -3186,7 +3378,108 @@ impl CraneliftLoweringState<'_, '_> {
             .get(exit_id.0 as usize)
             .ok_or_else(|| self.error(format!("unknown side exit {exit_id:?}")))?
             .clone();
-        self.materialize_side_exit(&plan)
+        self.materialize_exit_or_native_link(&plan)
+    }
+
+    /// Materialize an exit either into a stitched child trace or back to Rust.
+    /// This is shared by conditional guard exits and unconditional terminators so
+    /// hot branch side traces get the same native-to-native path as loop tails.
+    fn materialize_exit_or_native_link(
+        &mut self,
+        plan: &CompiledExitPlan,
+    ) -> Result<(), TracingJitError> {
+        if !plan.native_linkable {
+            return self.materialize_side_exit(plan);
+        }
+
+        // Stitching updates a stable per-trace u32 child table. Generated code
+        // probes its own exit slot directly; u32::MAX means the edge still needs
+        // manager-level processing. Once stitched, frame state is materialized and
+        // TRACE_RESULT_LINK returns to the native dispatcher, not to Rust.
+        let links = self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            self.activation,
+            offset_of!(TraceActivation, current_links) as i32,
+        );
+        let child = self.builder.ins().load(
+            types::I32,
+            Self::trusted_mem(),
+            links,
+            (plan.id.0 as i32).saturating_mul(std::mem::size_of::<u32>() as i32),
+        );
+        let linked = self.builder.ins().icmp_imm(IntCC::NotEqual, child, -1);
+        let linked_block = self.builder.create_block();
+        let slow_exit = self.builder.create_block();
+        self.builder.set_cold_block(slow_exit);
+        self.builder.ins().brif(linked, linked_block, &[], slow_exit, &[]);
+
+        self.builder.switch_to_block(linked_block);
+        self.materialize_native_link(plan, child)?;
+
+        self.builder.switch_to_block(slow_exit);
+        self.materialize_side_exit(plan)
+    }
+
+    fn materialize_native_link(
+        &mut self,
+        plan: &CompiledExitPlan,
+        child: Value,
+    ) -> Result<(), TracingJitError> {
+        let completed = if let Some(remaining) = self.native_budget_remaining {
+            let initial = self.builder.ins().iconst(
+                types::I64,
+                self.native_budget_initial as i64,
+            );
+            let completed = self.builder.ins().isub(initial, remaining);
+            self.builder.ins().ireduce(types::I32, completed)
+        } else {
+            self.builder.ins().iconst(types::I32, 0)
+        };
+        self.builder.ins().store(
+            Self::trusted_mem(),
+            completed,
+            self.activation,
+            offset_of!(TraceActivation, native_iterations) as i32,
+        );
+
+        for write in &plan.writes {
+            let word = match write.source {
+                ExitWriteSource::Dynamic(index) => {
+                    let dynamic = plan
+                        .dynamic_values
+                        .get(index as usize)
+                        .copied()
+                        .ok_or_else(|| self.error("side-exit dynamic value index out of bounds"))?;
+                    let source_rep = self.value_rep(dynamic.value)?;
+                    let value = self.lower_value(dynamic.value)?;
+                    self.materialize_exit_word(value, source_rep, dynamic.target_rep)?
+                }
+                ExitWriteSource::Constant(constant) => {
+                    let source_rep = match constant {
+                        TraceConstant::Int32(_) => TraceRep::Int32,
+                        TraceConstant::F64Bits(_) => TraceRep::F64,
+                        TraceConstant::Null | TraceConstant::Bool(_) | TraceConstant::NumBits(_) => TraceRep::Tagged,
+                        TraceConstant::String(_) | TraceConstant::BuiltinClass(_) => {
+                            return Err(self.error("runtime-owned constant reached native trace link"));
+                        }
+                    };
+                    let value = self.lower_constant(constant)?;
+                    self.materialize_exit_word(value, source_rep, write.target_rep)?
+                }
+            };
+            self.store_frame_word(write.slot, word);
+        }
+
+        self.builder.ins().store(
+            Self::trusted_mem(),
+            child,
+            self.activation,
+            offset_of!(TraceActivation, next_trace) as i32,
+        );
+        let result = self.builder.ins().iconst(types::I32, TRACE_RESULT_LINK as i64);
+        self.builder.ins().return_(&[result]);
+        Ok(())
     }
 
     fn materialize_side_exit(&mut self, plan: &CompiledExitPlan) -> Result<(), TracingJitError> {
@@ -3316,7 +3609,7 @@ impl CraneliftLoweringState<'_, '_> {
             Copy { value } => {
                 let result = one_result(node)?;
                 let value = self.lower_value(*value)?;
-                self.values.insert(result, value);
+                self.cache_value(result, value);
             }
 
             Reinterpret { value } => {
@@ -3335,14 +3628,14 @@ impl CraneliftLoweringState<'_, '_> {
                         .bitcast(types::F64, Self::plain_mem(), word),
                     _ => word,
                 };
-                self.values.insert(result, value);
+                self.cache_value(result, value);
             }
 
             LoadFrameSlot { slot } => {
                 let result = one_result(node)?;
                 let rep = self.value_rep(result)?;
                 let value = self.load_frame_slot(*slot, rep);
-                self.values.insert(result, value);
+                self.cache_value(result, value);
             }
 
             CommitFrameSlot { slot, value } => {
@@ -3370,26 +3663,26 @@ impl CraneliftLoweringState<'_, '_> {
                 let failure = self.bool32(failure);
                 self.emit_side_exit(*exit, failure)?;
                 if let Some(result) = node.results.first().copied() {
-                    self.values.insert(result, tagged);
+                    self.cache_value(result, tagged);
                 }
             }
 
             GuardF64 { value, exit } => {
                 let tagged = self.lower_value(*value)?;
                 let raw = self.guard_numeric(tagged, *exit)?;
-                self.values.insert(one_result(node)?, raw);
+                self.cache_value(one_result(node)?, raw);
             }
 
             GuardInt32 { value, exit } => {
                 let tagged = self.lower_value(*value)?;
                 let raw = self.guard_int32_numeric(tagged, *exit)?;
-                self.values.insert(one_result(node)?, raw);
+                self.cache_value(one_result(node)?, raw);
             }
 
             GuardUInt32 { value, exit } => {
                 let tagged = self.lower_value(*value)?;
                 let raw = self.guard_uint32_numeric(tagged, *exit)?;
-                self.values.insert(one_result(node)?, raw);
+                self.cache_value(one_result(node)?, raw);
             }
 
             GuardBounds {
@@ -3501,7 +3794,7 @@ impl CraneliftLoweringState<'_, '_> {
                 }
 
                 if let Some(result) = node.results.first().copied() {
-                    self.values.insert(result, value);
+                    self.cache_value(result, value);
                 }
             }
 
@@ -3511,7 +3804,7 @@ impl CraneliftLoweringState<'_, '_> {
                     IntUnaryOp::Neg => self.builder.ins().ineg(value),
                     IntUnaryOp::BitNot => self.builder.ins().bnot(value),
                 };
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             IntBinary { op, lhs, rhs } => {
@@ -3545,7 +3838,7 @@ impl CraneliftLoweringState<'_, '_> {
                         ));
                     }
                 };
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             IntBinaryChecked {
@@ -3600,7 +3893,7 @@ impl CraneliftLoweringState<'_, '_> {
                         )));
                     }
                 };
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             F64Unary { op, value } => {
@@ -3608,7 +3901,7 @@ impl CraneliftLoweringState<'_, '_> {
                 let result = match op {
                     F64UnaryOp::Neg => self.builder.ins().fneg(value),
                 };
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             F64Binary { op, lhs, rhs } => {
@@ -3623,21 +3916,21 @@ impl CraneliftLoweringState<'_, '_> {
                         return Err(self.error("floating remainder helper is not enabled"));
                     }
                 };
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             IntCompare { op, lhs, rhs } => {
                 let lhs = self.lower_value(*lhs)?;
                 let rhs = self.lower_value(*rhs)?;
                 let result = self.int_compare(*op, lhs, rhs);
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             F64Compare { op, lhs, rhs } => {
                 let lhs = self.lower_value(*lhs)?;
                 let rhs = self.lower_value(*rhs)?;
                 let result = self.f64_compare(*op, lhs, rhs);
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             RefEq { lhs, rhs } => {
@@ -3645,14 +3938,14 @@ impl CraneliftLoweringState<'_, '_> {
                 let rhs = self.lower_value(*rhs)?;
                 let result = self.builder.ins().icmp(IntCC::Equal, lhs, rhs);
                 let result = self.bool32(result);
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             IsNull { value } => {
                 let value = self.lower_value(*value)?;
                 let result = self.builder.ins().icmp_imm_s(IntCC::Equal, value, TAG_NULL as i64);
                 let result = self.bool32(result);
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             Select {
@@ -3664,7 +3957,7 @@ impl CraneliftLoweringState<'_, '_> {
                 let if_true = self.lower_value(*if_true)?;
                 let if_false = self.lower_value(*if_false)?;
                 let result = self.builder.ins().select(condition, if_true, if_false);
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             BoxInt32 { value } => {
@@ -3674,7 +3967,7 @@ impl CraneliftLoweringState<'_, '_> {
                     .builder
                     .ins()
                     .bitcast(types::I64, Self::plain_mem(), number);
-                self.values.insert(one_result(node)?, tagged);
+                self.cache_value(one_result(node)?, tagged);
             }
 
             BoxUInt32 { value } => {
@@ -3685,26 +3978,26 @@ impl CraneliftLoweringState<'_, '_> {
                     .builder
                     .ins()
                     .bitcast(types::I64, Self::plain_mem(), number);
-                self.values.insert(one_result(node)?, tagged);
+                self.cache_value(one_result(node)?, tagged);
             }
 
             BoxF64 { value } => {
                 let value = self.lower_value(*value)?;
                 let tagged = self.box_f64(value);
-                self.values.insert(one_result(node)?, tagged);
+                self.cache_value(one_result(node)?, tagged);
             }
 
             Int32ToF64 { value } => {
                 let value = self.lower_value(*value)?;
                 let number = self.builder.ins().fcvt_from_sint(types::F64, value);
-                self.values.insert(one_result(node)?, number);
+                self.cache_value(one_result(node)?, number);
             }
 
             UInt32ToF64 { value } => {
                 let value = self.lower_value(*value)?;
                 let wide = self.builder.ins().uextend(types::I64, value);
                 let number = self.builder.ins().fcvt_from_uint(types::F64, wide);
-                self.values.insert(one_result(node)?, number);
+                self.cache_value(one_result(node)?, number);
             }
 
             F64ToInt32 { value, exit } => {
@@ -3758,7 +4051,7 @@ impl CraneliftLoweringState<'_, '_> {
                 self.emit_side_exit(*exit, not_exact)?;
 
                 let result = self.builder.ins().ireduce(types::I32, wide);
-                self.values.insert(one_result(node)?, result);
+                self.cache_value(one_result(node)?, result);
             }
 
             TaggedToHeapHandle { value, exit } => {
@@ -3779,12 +4072,12 @@ impl CraneliftLoweringState<'_, '_> {
                     .ins()
                     .iconst(types::I64, PAYLOAD_MASK as i64);
                 let handle = self.builder.ins().band(tagged, payload);
-                self.values.insert(one_result(node)?, handle);
+                self.cache_value(one_result(node)?, handle);
             }
 
             ReadBarrier { value } => {
                 let value = self.lower_value(*value)?;
-                self.values.insert(one_result(node)?, value);
+                self.cache_value(one_result(node)?, value);
             }
         }
 
@@ -3852,6 +4145,11 @@ pub struct TracingJit {
     backend: Option<CraneliftBackend>,
     loops: HashMap<LoopKey, LoopState>,
     traces: Vec<Option<CompiledTrace>>,
+    /// Dense tables consumed by the generated native dispatcher. They may move
+    /// while compiling new traces, but no compilation occurs during one native
+    /// dispatcher invocation, so pointers installed in TraceActivation stay valid.
+    entry_table: Vec<usize>,
+    link_table_ptrs: Vec<usize>,
     next_trace_id: u32,
     stats: TracingJitStats,
 }
@@ -3901,6 +4199,8 @@ impl TracingJit {
             backend: None,
             loops: HashMap::new(),
             traces: Vec::new(),
+            entry_table: Vec::new(),
+            link_table_ptrs: Vec::new(),
             next_trace_id: 0,
             stats: TracingJitStats::default(),
         }
@@ -3924,11 +4224,40 @@ impl TracingJit {
         self.traces.get_mut(id.0 as usize).and_then(Option::as_mut)
     }
 
-    fn insert_compiled(&mut self, id: TraceId, compiled: CompiledTrace) {
+    fn insert_compiled(&mut self, id: TraceId, mut compiled: CompiledTrace) {
         let index = id.0 as usize;
+
+        // Side traces are born with their closing edge already targeting the root.
+        // Prime such links immediately; ordinary root exits start unlinked and are
+        // updated later by stitch().
+        for exit_index in 0..compiled.exits.len() {
+            let native_target = {
+                let plan = &compiled.exits[exit_index];
+                if plan.native_linkable {
+                    match plan.target {
+                        ExitTarget::Trace(child) => Some(child),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(child) = native_target {
+                if let Some(slot) = compiled.native_links.get_mut(exit_index) {
+                    *slot = child.0;
+                }
+            }
+        }
+
         if self.traces.len() <= index {
             self.traces.resize_with(index + 1, || None);
         }
+        if self.entry_table.len() <= index {
+            self.entry_table.resize(index + 1, 0);
+            self.link_table_ptrs.resize(index + 1, 0);
+        }
+        self.entry_table[index] = compiled.entry as usize;
+        self.link_table_ptrs[index] = compiled.native_links.as_ptr() as usize;
         self.traces[index] = Some(compiled);
     }
 
@@ -3945,7 +4274,7 @@ impl TracingJit {
         }
 
         let compiler = CraneliftTraceCompiler::new(trace, &options)?;
-        compiler.compile(&mut self.backend.as_mut().unwrap().module)
+        compiler.compile(self.backend.as_mut().unwrap())
     }
 
     pub fn trace(&self, id: TraceId) -> Option<&Trace> {
@@ -4125,9 +4454,10 @@ impl TracingJit {
     ) -> Result<JitAction, TracingJitError> {
         let mut trace_id = initial_trace;
 
-        // Trace-tree links are followed iteratively. This is important for cycles
-        // such as root -> side -> root: recursive enter_compiled() calls would grow
-        // the Rust stack once per source-level loop iteration.
+        // A generated Cranelift dispatcher follows already-stitched trace-tree
+        // edges without re-entering this Rust manager. Rust is involved only when
+        // an exit is still unlinked, a runtime helper terminates the trace, or the
+        // source program itself returns/suspends.
         loop {
             let inputs = runtime
                 .trace_activation_inputs()
@@ -4142,41 +4472,81 @@ impl TracingJit {
                     "runtime returned null trace register-bank pointer".to_owned(),
                 ));
             }
-
-            let mut activation = TraceActivation::new(inputs);
-
-            // Keep the owning JITModule alive in `self.backend` for the entire call.
-            // Trace IDs are dense and index a Vec, so a hot entry does not hash.
-            let entry = self
-                .compiled(trace_id)
-                .ok_or_else(|| TracingJitError::CraneliftLowering {
+            if self.compiled(trace_id).is_none() {
+                return Err(TracingJitError::CraneliftLowering {
                     trace: trace_id,
                     message: "compiled trace disappeared".to_owned(),
+                });
+            }
+
+            let mut activation = TraceActivation::new(inputs);
+            activation.trace_entries = self.entry_table.as_ptr();
+            activation.trace_link_tables = self.link_table_ptrs.as_ptr();
+            activation.trace_entries_len = self.entry_table.len() as u32;
+            activation.next_trace = trace_id.0;
+            activation.dispatch_links_remaining = if self.options.native_loop_iteration_budget == 0 {
+                u32::MAX
+            } else {
+                self.options.native_loop_iteration_budget
+            };
+
+            let dispatcher = self
+                .backend
+                .as_ref()
+                .ok_or_else(|| TracingJitError::CraneliftLowering {
+                    trace: trace_id,
+                    message: "native backend disappeared".to_owned(),
                 })?
-                .entry;
+                .dispatcher;
+
             self.stats.native_entries = self.stats.native_entries.saturating_add(1);
-            let result = unsafe { entry(&mut activation) };
+            let result = unsafe { dispatcher(&mut activation) };
+            let producer = TraceId(activation.next_trace);
 
             match result {
                 TRACE_RESULT_SIDE_EXIT => {
                     self.stats.side_exits = self.stats.side_exits.saturating_add(1);
-                    match self.apply_side_exit(runtime, trace_id, &activation)? {
+                    match self.apply_side_exit(runtime, producer, &activation)? {
                         SideExitDispatch::Action(action) => return Ok(action),
                         SideExitDispatch::Link(child) => {
+                            // This path is normally taken only once while a hot edge
+                            // is being stitched. Subsequent executions are consumed by
+                            // the native dispatcher directly. Rebuild activation here
+                            // because side-trace compilation may have reallocated the
+                            // dense entry/link pointer tables.
                             trace_id = child;
                             continue;
                         }
                     }
                 }
 
-                TRACE_RESULT_RETURNED | TRACE_RESULT_RUNTIME | TRACE_RESULT_LINK => {
-                    return Ok(JitAction::EnteredNative { trace: trace_id });
+                TRACE_RESULT_RETURNED | TRACE_RESULT_RUNTIME => {
+                    return Ok(JitAction::EnteredNative { trace: producer });
+                }
+
+                TRACE_RESULT_LINK => {
+                    // Dispatcher fuel expired after the linked exit had already
+                    // materialized the child entry state. Resume baseline at that
+                    // exact trace anchor to preserve cooperative runtime/GC access.
+                    let next = TraceId(activation.next_trace);
+                    let location = self
+                        .compiled(next)
+                        .ok_or_else(|| TracingJitError::CraneliftLowering {
+                            trace: next,
+                            message: "dispatcher yielded to an unknown child trace".to_owned(),
+                        })?
+                        .trace
+                        .anchor
+                        .location;
+                    runtime.trace_set_location(location).map_err(runtime_error)?;
+                    self.stats.native_budget_exits = self.stats.native_budget_exits.saturating_add(1);
+                    return Ok(JitAction::EnteredNative { trace: next });
                 }
 
                 other => {
                     return Err(TracingJitError::Activation(format!(
                         "native trace {:?} returned unknown result code {}",
-                        trace_id, other
+                        producer, other
                     )));
                 }
             }
@@ -4300,6 +4670,9 @@ impl TracingJit {
         const MIN_PROFITABLE_NATIVE_ITERATIONS: u32 = 8;
 
         let exit_index = activation.exit_id as usize;
+        // Snapshot option values before borrowing a compiled trace mutably below.
+        // Besides satisfying Rust's aliasing rules, this keeps option loads out of
+        // the mutable side-exit accounting scope.
         let hot_side_exit_threshold = self.options.hot_side_exit_threshold.max(1);
         let cooldown_threshold = hot_side_exit_threshold.min(u16::MAX as u32) as u16;
         let budget_tracking = self.options.native_loop_iteration_budget != 0;
@@ -4459,7 +4832,7 @@ impl TracingJit {
                 // stitch it immediately. This removes the manager/baseline round
                 // trip for common trace-tree edges.
                 let hits = self.exit_hits(trace_id, plan_id).unwrap_or(0);
-                if hits >= self.options.hot_side_exit_threshold.max(1) {
+                if hits >= hot_side_exit_threshold {
                     let child = self
                         .loops
                         .get(&LoopKey { location })
@@ -4517,9 +4890,9 @@ impl TracingJit {
 
     /// Link a side exit to an already compiled child trace.
     ///
-    /// This performs dispatch-free manager-level stitching immediately. A future
-    /// Cranelift late-link trampoline can turn the same metadata relation into a direct
-    /// machine-code jump without changing Trace IR.
+    /// Native-linkable exits update a stable per-trace child table consumed by the
+    /// generated Cranelift dispatcher. Runtime-owned constants keep the manager
+    /// fallback because they cannot be reconstructed without VM access.
     pub fn stitch(
         &mut self,
         parent: TraceId,
@@ -4547,16 +4920,25 @@ impl TracingJit {
             });
         }
 
-        let plan = parent_trace
-            .exits
-            .get_mut(exit.0 as usize)
-            .ok_or_else(|| TracingJitError::InvalidSideExit {
-                trace: parent,
-                exit: exit.0,
-            })?;
-        plan.target = ExitTarget::Trace(child);
+        let exit_index = exit.0 as usize;
+        let native_linkable = {
+            let plan = parent_trace
+                .exits
+                .get_mut(exit_index)
+                .ok_or_else(|| TracingJitError::InvalidSideExit {
+                    trace: parent,
+                    exit: exit.0,
+                })?;
+            plan.target = ExitTarget::Trace(child);
+            plan.native_linkable
+        };
+        if native_linkable {
+            if let Some(slot) = parent_trace.native_links.get_mut(exit_index) {
+                *slot = child.0;
+            }
+        }
 
-        if let Some(side_exit) = parent_trace.trace.exits.get_mut(exit.0 as usize) {
+        if let Some(side_exit) = parent_trace.trace.exits.get_mut(exit_index) {
             side_exit.target = ExitTarget::Trace(child);
             side_exit.linked_trace = Some(child);
         }
