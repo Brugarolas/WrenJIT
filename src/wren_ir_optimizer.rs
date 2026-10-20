@@ -16,10 +16,6 @@
 #![allow(dead_code)]
 #![allow(clippy::needless_return)]
 
-//pub mod helpers;
-//pub mod optimization;
-//pub mod pass;
-
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::mem::{discriminant, replace, Discriminant};
@@ -657,7 +653,7 @@ impl FuncState {
 /// allocated only when a formerly pure/sink instruction becomes a chain node or
 /// a newly-created chain node has no output yet. Old unused effect entries stay
 /// in the append-only arena.
-fn repair_effect_chain(function: &mut Function, block_ix: usize) {
+pub(crate) fn repair_effect_chain(function: &mut Function, block_ix: usize) {
     let block_effect = function.blocks[block_ix].effect;
     let insts = function.blocks[block_ix].insts.clone();
     let mut current_effect = block_effect;

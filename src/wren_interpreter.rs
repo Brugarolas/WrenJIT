@@ -5877,7 +5877,7 @@ mod tests {
         Assembler, BytecodeFunction, SafepointEntry, SafepointKind,
     };
     use crate::wren_builtin::{self, BuiltinHost, BuiltinManifest};
-    use crate::wren_bytecodecompiler::compile_program;
+    use crate::wren_pipeline::compile_program;
     use crate::wren_front::parse;
     use crate::wren_ir::{FunctionKind, ModuleInfo, Program};
     use crate::wren_lowerer::lower_module;
@@ -5921,7 +5921,7 @@ mod tests {
             .as_ref()
             .expect("module should lower successfully")
             .entry;
-        let bytecode = compile_program(&hir).expect("bytecode compilation should succeed");
+        let bytecode = compile_program(&mut hir).expect("compilation pipeline should succeed");
         (bytecode, entry, manifest)
     }
 
@@ -5946,6 +5946,36 @@ mod tests {
 
     fn source_result(vm: &Interpreter<'_>) -> f64 {
         vm.modules.last().unwrap().variables.last().unwrap().as_num().unwrap()
+    }
+
+    #[test]
+    fn optimized_source_preserves_closures_branches_and_side_effects() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var value = 0
+            var update = Fn.new {
+                if (false) { value = 1000 } else { value = value + 1 }
+                return value
+            }
+            var i = 0
+            while (i < 20) {
+                update.call()
+                i = i + 1
+            }
+            if (true) {
+                return value + 22
+            } else {
+                return 0
+            }
+        "#);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                ..Default::default()
+            }));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 42.0);
+        }
     }
 
     #[test]

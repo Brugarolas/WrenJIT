@@ -1,5 +1,27 @@
 # WrenJIT
 
+Source compilation uses `wren_pipeline::compile_program(&mut hir)` after AST
+lowering: HIR -> optimization passes -> register bytecode. The CLI and source
+execution tests share this entry point. HIR is optimized in place, and the
+existing IR and bytecode verification remains enabled by default.
+
+Add default passes in `wren_ir_optimizing::optimization_passes()`. For a custom
+configuration, reuse the optimizer builder:
+
+```rust,ignore
+let passes = wren_ir_optimizing::optimization_passes()
+    .with_function_pass(MyFunctionPass)
+    .with_pass(my_node_pass);
+let bytecode = wren_pipeline::CompilationPipeline::new(passes)
+    .compile(&mut hir)?;
+```
+
+Pass `wren_ir_optimizer::Optimize::new()` to select an empty HIR optimization
+stage. Bytecode lowering has its own options, configurable through
+`with_bytecode_options(...)`; `compile_with_stats(...)` reports backend statistics
+after HIR optimization. `wren_bytecodecompiler` remains the direct backend API
+for callers that already prepared their HIR.
+
 Run performance workloads with an optimized build:
 
 ```powershell

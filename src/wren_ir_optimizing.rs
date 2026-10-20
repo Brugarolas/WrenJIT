@@ -1,26 +1,70 @@
 #![allow(dead_code)]
 
+use hashbrown::{HashMap, HashSet};
+
 use crate::wren_ir::{
-    CmpKind, Constant, EffectBehavior, F64BinOp, F64UnaryOp, Function, Inst, InstId, IntBinOp,
-    IntUnaryOp, Type, ValueDef, ValueId,
+    BlockId, ClassSet, CmpKind, Constant, Edge, EffectBehavior, EffectKind, F64BinOp, F64UnaryOp,
+    FieldSlot, Function, Inst, InstId, IntBinOp, IntUnaryOp, ModuleId, ModuleSlot, Node, SiteId,
+    StaticFieldSlot, StringId, Type, ValueDef, ValueId,
 };
-use crate::wren_ir_optimizer::{FunctionOptimization, Optimize};
+use crate::wren_ir_optimizer::{repair_effect_chain, FunctionOptimization, Optimize};
 
 /// Interpreter-oriented WIR optimization pipeline.
 ///
-/// The ordering is deliberate:
-/// 1. Fold constants/control and turn algebraic identities into `Move`s.
-/// 2. RAUW those moves and physically detach them.
-/// 3. Remove the now-dead pure SSA producer chains.
-///
-/// These are whole-function passes because they naturally need global SSA-use
-/// information. Node-local peepholes can still be added through
-/// `OptimizationPass` in `wren_ir_optimizer`.
+/// The default stage combines bounded scalar folding, local value numbering,
+/// memory forwarding/DSE, guard cleanup, copy propagation, DCE and cheap CFG
+/// cleanup. The implementation intentionally avoids dominator trees, PRE, LICM
+/// and other analyses whose cold-start cost belongs in the later JIT tier.
 pub fn optimization_passes() -> Optimize {
-    Optimize::new()
-        .with_function_pass(ConstantFold::default())
-        .with_function_pass(CopyPropagation::default())
-        .with_function_pass(DeadCodeElimination::default())
+    // Keep the default pipeline as a single optimizer stage. In debug builds the
+    // framework verifies after every stage, so bundling the cheap transforms also
+    // avoids repeatedly paying verifier cost during development.
+    Optimize::new().with_function_pass(InterpreterOptimizationBundle::default())
+}
+
+/// Cold-start-conscious optimizer bundle for interpreter-visible WIR.
+///
+/// The expensive optimizations deliberately live elsewhere (JIT/trace IR). This
+/// bundle sticks to bounded local analyses and linear whole-function cleanups.
+#[derive(Default)]
+pub struct InterpreterOptimizationBundle;
+
+impl FunctionOptimization for InterpreterOptimizationBundle {
+    fn optimize_function(&mut self, function: &mut Function) -> bool {
+        let mut changed_any = false;
+        let mut simplify = FastLocalSimplify::default();
+        let mut copies = CopyPropagation::default();
+
+        // Two rounds are enough to expose almost all copy/fold/CSE chains while
+        // giving cold start a strict upper bound.
+        for _ in 0..2 {
+            let simplified = simplify.optimize_function(function);
+            let propagated = copies.optimize_function(function);
+            changed_any |= simplified | propagated;
+            if !simplified && !propagated {
+                break;
+            }
+        }
+
+        let mut dce = DeadCodeElimination::default();
+        changed_any |= dce.optimize_function(function);
+
+        let mut cfg = ControlFlowCleanup::default();
+        let cfg_changed = cfg.optimize_function(function);
+        changed_any |= cfg_changed;
+
+        // CFG threading can make block parameters trivially invariant. One final
+        // copy/DCE cleanup captures that win without another full fixed point.
+        if cfg_changed {
+            let propagated = copies.optimize_function(function);
+            changed_any |= propagated;
+            if propagated {
+                changed_any |= dce.optimize_function(function);
+            }
+        }
+
+        changed_any
+    }
 }
 
 /// Constant propagation/folding plus cheap algebraic and control-flow folding.
@@ -38,10 +82,9 @@ impl FunctionOptimization for ConstantFold {
     fn optimize_function(&mut self, function: &mut Function) -> bool {
         let mut changed_any = false;
 
-        // A replacement can expose a constant to a later node whose arena ID is
-        // not necessarily adjacent (especially around CFG construction). Keep a
-        // cheap fixed point. In practice this converges in one or two rounds.
-        loop {
+        // Keep this public standalone pass bounded as well. The default bundle
+        // performs its own bounded revisit after copy propagation.
+        for _ in 0..2 {
             let live = live_instruction_ids(function);
             let mut changed = false;
 
@@ -82,6 +125,16 @@ fn fold_instruction(function: &Function, id: InstId) -> Option<Inst> {
 
     match kind {
         IntUnary { op, value } => {
+            if op == IntUnaryOp::BitNot {
+                if let Some(Inst::IntUnary {
+                    op: IntUnaryOp::BitNot,
+                    value: inner,
+                }) = producer_kind(function, value)
+                {
+                    return Some(Move(*inner));
+                }
+            }
+
             let value = resolve_i32(function, value, 0)?;
             fold_int_unary(op, value).map(|value| Const(Constant::Int32(value)))
         }
@@ -120,9 +173,12 @@ fn fold_instruction(function: &Function, id: InstId) -> Option<Inst> {
                 return Some(Const(Constant::Bool(value)));
             }
 
-            let left = resolve_i32(function, left, 0)?;
-            let right = resolve_i32(function, right, 0)?;
-            Some(Const(Constant::Bool(compare_i32(kind, left, right))))
+            let lhs = resolve_i32(function, left, 0);
+            let rhs = resolve_i32(function, right, 0);
+            if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+                return Some(Const(Constant::Bool(compare_i32(kind, lhs, rhs))));
+            }
+            fold_cmp_int_bounds(kind, lhs, rhs).map(|value| Const(Constant::Bool(value)))
         }
 
         CmpF64 { kind, left, right } => {
@@ -131,9 +187,33 @@ fn fold_instruction(function: &Function, id: InstId) -> Option<Inst> {
             Some(Const(Constant::Bool(compare_f64(kind, left, right))))
         }
 
+        F64Unary {
+            op: F64UnaryOp::Neg,
+            value,
+        } => {
+            if let Some(Inst::F64Unary {
+                op: F64UnaryOp::Neg,
+                value: inner,
+            }) = producer_kind(function, value)
+            {
+                return Some(Move(*inner));
+            }
+            None
+        }
+
         NumToInt32 { value } => {
+            if let Some(Inst::Int32ToNum { value: inner }) = producer_kind(function, value) {
+                return Some(Move(*inner));
+            }
             let value = resolve_num(function, value, 0)?;
             exact_i32(value).map(|value| Const(Constant::Int32(value)))
+        }
+
+        NumToF64 { value } => {
+            if let Some(Inst::F64ToNum { value: inner }) = producer_kind(function, value) {
+                return Some(Move(*inner));
+            }
+            None
         }
 
         Int32ToNum { value } => {
@@ -142,6 +222,9 @@ fn fold_instruction(function: &Function, id: InstId) -> Option<Inst> {
         }
 
         F64ToNum { value } => {
+            if let Some(Inst::NumToF64 { value: inner }) = producer_kind(function, value) {
+                return Some(Move(*inner));
+            }
             let value = resolve_f64(function, value, 0)?;
             Some(Const(Constant::Num(value)))
         }
@@ -217,7 +300,18 @@ fn fold_int_identity(
                 None
             }
         }
-        Sub => (rhs == Some(0)).then_some(Inst::Move(left)),
+        Sub => {
+            if rhs == Some(0) {
+                Some(Inst::Move(left))
+            } else if lhs == Some(0) {
+                Some(Inst::IntUnary {
+                    op: IntUnaryOp::Neg,
+                    value: right,
+                })
+            } else {
+                None
+            }
+        }
         Mul => {
             if rhs == Some(1) {
                 Some(Inst::Move(left))
@@ -225,11 +319,32 @@ fn fold_int_identity(
                 Some(Inst::Move(right))
             } else if rhs == Some(0) || lhs == Some(0) {
                 Some(Inst::Const(Constant::Int32(0)))
+            } else if rhs == Some(-1) {
+                Some(Inst::IntUnary {
+                    op: IntUnaryOp::Neg,
+                    value: left,
+                })
+            } else if lhs == Some(-1) {
+                Some(Inst::IntUnary {
+                    op: IntUnaryOp::Neg,
+                    value: right,
+                })
             } else {
                 None
             }
         }
-        DivS => (rhs == Some(1)).then_some(Inst::Move(left)),
+        DivS => {
+            if rhs == Some(1) {
+                Some(Inst::Move(left))
+            } else if rhs == Some(-1) {
+                Some(Inst::IntUnary {
+                    op: IntUnaryOp::Neg,
+                    value: left,
+                })
+            } else {
+                None
+            }
+        }
         RemS => (rhs == Some(1)).then_some(Inst::Const(Constant::Int32(0))),
         BitAnd => {
             if rhs == Some(-1) {
@@ -242,11 +357,32 @@ fn fold_int_identity(
                 None
             }
         }
-        BitOr | BitXor => {
+        BitOr => {
             if rhs == Some(0) {
                 Some(Inst::Move(left))
             } else if lhs == Some(0) {
                 Some(Inst::Move(right))
+            } else if rhs == Some(-1) || lhs == Some(-1) {
+                Some(Inst::Const(Constant::Int32(-1)))
+            } else {
+                None
+            }
+        }
+        BitXor => {
+            if rhs == Some(0) {
+                Some(Inst::Move(left))
+            } else if lhs == Some(0) {
+                Some(Inst::Move(right))
+            } else if rhs == Some(-1) {
+                Some(Inst::IntUnary {
+                    op: IntUnaryOp::BitNot,
+                    value: left,
+                })
+            } else if lhs == Some(-1) {
+                Some(Inst::IntUnary {
+                    op: IntUnaryOp::BitNot,
+                    value: right,
+                })
             } else {
                 None
             }
@@ -280,6 +416,20 @@ fn fold_int_bin(op: IntBinOp, left: i32, right: i32) -> Option<i32> {
         }
         IntBinOp::Sar if (0..32).contains(&right) => Some(left >> (right as u32)),
         IntBinOp::Shl | IntBinOp::ShrU | IntBinOp::Sar => None,
+    }
+}
+
+fn fold_cmp_int_bounds(kind: CmpKind, lhs: Option<i32>, rhs: Option<i32>) -> Option<bool> {
+    match (kind, lhs, rhs) {
+        (CmpKind::Lt, _, Some(i32::MIN)) => Some(false),
+        (CmpKind::Ge, _, Some(i32::MIN)) => Some(true),
+        (CmpKind::Gt, _, Some(i32::MAX)) => Some(false),
+        (CmpKind::Le, _, Some(i32::MAX)) => Some(true),
+        (CmpKind::Gt, Some(i32::MIN), _) => Some(false),
+        (CmpKind::Le, Some(i32::MIN), _) => Some(true),
+        (CmpKind::Lt, Some(i32::MAX), _) => Some(false),
+        (CmpKind::Ge, Some(i32::MAX), _) => Some(true),
+        _ => None,
     }
 }
 
@@ -318,6 +468,13 @@ fn exact_i32(value: f64) -> Option<i32> {
     } else {
         None
     }
+}
+
+fn producer_kind(function: &Function, value: ValueId) -> Option<&Inst> {
+    let ValueDef::InstResult(inst, _) = function.value(value)?.def else {
+        return None;
+    };
+    function.node(inst).map(|node| &node.kind)
 }
 
 fn resolve_constant(function: &Function, value: ValueId, depth: u8) -> Option<Constant> {
@@ -446,10 +603,859 @@ fn reflexive_ref_eq_type(function: &Function, value: ValueId) -> bool {
 fn fold_ref_eq_constants(left: &Constant, right: &Constant) -> Option<bool> {
     match (left, right) {
         (Constant::Null, Constant::Null) => Some(true),
-        (Constant::Null, Constant::Bool(_)) | (Constant::Bool(_), Constant::Null) => Some(false),
         (Constant::Bool(left), Constant::Bool(right)) => Some(left == right),
+        (Constant::Null, _) | (_, Constant::Null) => Some(false),
+        (Constant::Bool(_), Constant::Num(_) | Constant::String(_) | Constant::Int32(_))
+        | (Constant::Num(_) | Constant::String(_) | Constant::Int32(_), Constant::Bool(_)) => {
+            Some(false)
+        }
         _ => None,
     }
+}
+
+
+/// One bounded block-local sweep that combines scalar folding, guard cleanup,
+/// local value numbering, load forwarding and conservative dead-store removal.
+#[derive(Default)]
+pub struct FastLocalSimplify;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum PureKey {
+    Null,
+    Bool(bool),
+    Num(u64),
+    String(StringId),
+    Int32(i32),
+    IntUnary(IntUnaryOp, ValueId),
+    IntBin(IntBinOp, ValueId, ValueId),
+    F64Unary(F64UnaryOp, ValueId),
+    F64Bin(F64BinOp, ValueId, ValueId),
+    CmpInt(CmpKind, ValueId, ValueId),
+    CmpF64(CmpKind, ValueId, ValueId),
+    RefEq(ValueId, ValueId),
+    NumToInt32(ValueId),
+    NumToF64(ValueId),
+    Int32ToNum(ValueId),
+    F64ToNum(ValueId),
+    IsInstance(ValueId, ValueId),
+    StringLen(ValueId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum GuardKey {
+    Type(ValueId, Type),
+    Class(ValueId, ClassSet),
+    NotNull(ValueId),
+    Int32(ValueId),
+    F64(ValueId),
+    Bounds(ValueId, ValueId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SeqReadKey {
+    ListLen(ValueId),
+    ListGet(ValueId, ValueId),
+    MapLen(ValueId),
+    MapGet(ValueId, ValueId),
+    StringCodePointAt(ValueId, ValueId),
+}
+
+type FieldKey = (ValueId, FieldSlot);
+type StaticFieldKey = (ValueId, StaticFieldSlot);
+type ModuleKey = (ModuleId, ModuleSlot);
+
+impl FunctionOptimization for FastLocalSimplify {
+    fn optimize_function(&mut self, function: &mut Function) -> bool {
+        if function.blocks.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        let mut removed = vec![false; function.nodes.len()];
+
+        for block_ix in 0..function.blocks.len() {
+            let insts = function.blocks[block_ix].insts.clone();
+            if insts.is_empty() {
+                continue;
+            }
+
+            let mut pure_values: HashMap<PureKey, ValueId> = HashMap::new();
+            let mut guards: HashMap<GuardKey, Option<ValueId>> = HashMap::new();
+
+            let mut field_values: HashMap<FieldKey, ValueId> = HashMap::new();
+            let mut static_values: HashMap<StaticFieldKey, ValueId> = HashMap::new();
+            let mut cell_values: HashMap<ValueId, ValueId> = HashMap::new();
+            let mut module_values: HashMap<ModuleKey, ValueId> = HashMap::new();
+            let mut list_values: HashMap<SeqReadKey, ValueId> = HashMap::new();
+            let mut map_values: HashMap<SeqReadKey, ValueId> = HashMap::new();
+            let mut string_values: HashMap<SeqReadKey, ValueId> = HashMap::new();
+
+            let mut last_field_store: HashMap<FieldKey, InstId> = HashMap::new();
+            let mut last_static_store: HashMap<StaticFieldKey, InstId> = HashMap::new();
+            let mut last_cell_store: HashMap<ValueId, InstId> = HashMap::new();
+            let mut last_module_store: HashMap<ModuleKey, InstId> = HashMap::new();
+
+            let mut effect_shape_changed = false;
+
+            for id in insts {
+                if removed.get(id.0 as usize).copied().unwrap_or(false) {
+                    continue;
+                }
+
+                // Scalar/control folding is deliberately done in the same sweep as
+                // CSE and memory simplification to minimize front-end passes.
+                if let Some(replacement) = fold_instruction(function, id) {
+                    let node = &mut function.nodes[id.0 as usize];
+                    debug_assert_eq!(node.results.len(), replacement.result_count());
+                    debug_assert_eq!(node.kind.effect_behavior(), replacement.effect_behavior());
+                    node.kind = replacement;
+                    changed = true;
+                }
+
+                let mut kind = function.nodes[id.0 as usize].kind.clone();
+
+                // Prove guards from static WIR types or an identical dominating
+                // guard earlier in the same block. Replacing a value-producing
+                // guard by Move keeps its SSA result ID stable.
+                if let Some(replacement) = redundant_guard_replacement(function, id, &kind, &guards) {
+                    match replacement {
+                        GuardReplacement::Move(value) => {
+                            function.nodes[id.0 as usize].kind = Inst::Move(value);
+                        }
+                        GuardReplacement::Erase => {
+                            removed[id.0 as usize] = true;
+                        }
+                    }
+                    changed = true;
+                    effect_shape_changed = true;
+                    continue;
+                }
+
+                if let Some((key, result)) = guard_fact(function, id, &kind) {
+                    guards.entry(key).or_insert(result);
+                }
+
+                kind = function.nodes[id.0 as usize].kind.clone();
+
+                // Block-local CSE is dominance-free by construction: an earlier
+                // instruction in the same basic block dominates the later one.
+                if let Some(key) = pure_key(&kind) {
+                    if let Some(result) = single_result(function, id) {
+                        if let Some(existing) = pure_values.get(&key).copied() {
+                            function.nodes[id.0 as usize].kind = Inst::Move(existing);
+                            changed = true;
+                            continue;
+                        }
+                        pure_values.insert(key, result);
+                    }
+                }
+
+                let effect_kind = kind.effect_kind();
+                match kind {
+                    Inst::LoadField { object, slot } => {
+                        // Any field load can observe a prior store through an alias.
+                        last_field_store.clear();
+                        let key = (object, slot);
+                        if let Some(value) = field_values.get(&key).copied() {
+                            function.nodes[id.0 as usize].kind = Inst::Move(value);
+                            changed = true;
+                            effect_shape_changed = true;
+                        } else if let Some(result) = single_result(function, id) {
+                            field_values.insert(key, result);
+                        }
+                    }
+                    Inst::StoreField { object, slot, value } => {
+                        let key = (object, slot);
+                        if let Some(previous) = last_field_store.insert(key, id) {
+                            removed[previous.0 as usize] = true;
+                            changed = true;
+                            effect_shape_changed = true;
+                        }
+                        // Different SSA values may still alias the same object.
+                        field_values.clear();
+                        field_values.insert(key, value);
+                    }
+                    Inst::LoadStaticField { class, slot } => {
+                        last_static_store.clear();
+                        let key = (class, slot);
+                        if let Some(value) = static_values.get(&key).copied() {
+                            function.nodes[id.0 as usize].kind = Inst::Move(value);
+                            changed = true;
+                            effect_shape_changed = true;
+                        } else if let Some(result) = single_result(function, id) {
+                            static_values.insert(key, result);
+                        }
+                    }
+                    Inst::StoreStaticField { class, slot, value } => {
+                        let key = (class, slot);
+                        if let Some(previous) = last_static_store.insert(key, id) {
+                            removed[previous.0 as usize] = true;
+                            changed = true;
+                            effect_shape_changed = true;
+                        }
+                        static_values.clear();
+                        static_values.insert(key, value);
+                    }
+                    Inst::LoadCell { cell } => {
+                        last_cell_store.clear();
+                        if let Some(value) = cell_values.get(&cell).copied() {
+                            function.nodes[id.0 as usize].kind = Inst::Move(value);
+                            changed = true;
+                            effect_shape_changed = true;
+                        } else if let Some(result) = single_result(function, id) {
+                            cell_values.insert(cell, result);
+                        }
+                    }
+                    Inst::StoreCell { cell, value } => {
+                        if let Some(previous) = last_cell_store.insert(cell, id) {
+                            removed[previous.0 as usize] = true;
+                            changed = true;
+                            effect_shape_changed = true;
+                        }
+                        cell_values.clear();
+                        cell_values.insert(cell, value);
+                    }
+                    Inst::LoadModuleVar { module, slot } => {
+                        let key = (module, slot);
+                        last_module_store.remove(&key);
+                        if let Some(value) = module_values.get(&key).copied() {
+                            function.nodes[id.0 as usize].kind = Inst::Move(value);
+                            changed = true;
+                            effect_shape_changed = true;
+                        } else if let Some(result) = single_result(function, id) {
+                            module_values.insert(key, result);
+                        }
+                    }
+                    Inst::StoreModuleVar { module, slot, value } => {
+                        let key = (module, slot);
+                        if let Some(previous) = last_module_store.insert(key, id) {
+                            removed[previous.0 as usize] = true;
+                            changed = true;
+                            effect_shape_changed = true;
+                        }
+                        module_values.insert(key, value);
+                    }
+                    Inst::ListLen { list } => {
+                        cse_read(
+                            function,
+                            id,
+                            SeqReadKey::ListLen(list),
+                            &mut list_values,
+                            &mut changed,
+                            &mut effect_shape_changed,
+                        );
+                    }
+                    Inst::ListGet { list, index } => {
+                        cse_read(
+                            function,
+                            id,
+                            SeqReadKey::ListGet(list, index),
+                            &mut list_values,
+                            &mut changed,
+                            &mut effect_shape_changed,
+                        );
+                    }
+                    Inst::ListSet { list, index, value } => {
+                        list_values.clear();
+                        list_values.insert(SeqReadKey::ListGet(list, index), value);
+                    }
+                    Inst::ListAppend { .. }
+                    | Inst::ListInsert { .. }
+                    | Inst::ListRemoveAt { .. } => {
+                        list_values.clear();
+                    }
+                    Inst::MapLen { map } => {
+                        cse_read(
+                            function,
+                            id,
+                            SeqReadKey::MapLen(map),
+                            &mut map_values,
+                            &mut changed,
+                            &mut effect_shape_changed,
+                        );
+                    }
+                    Inst::MapGet { map, key } => {
+                        cse_read(
+                            function,
+                            id,
+                            SeqReadKey::MapGet(map, key),
+                            &mut map_values,
+                            &mut changed,
+                            &mut effect_shape_changed,
+                        );
+                    }
+                    Inst::MapSet { map, key, value } => {
+                        map_values.clear();
+                        map_values.insert(SeqReadKey::MapGet(map, key), value);
+                    }
+                    Inst::MapRemove { .. } => {
+                        map_values.clear();
+                    }
+                    Inst::StringCodePointAt { string, index } => {
+                        cse_read(
+                            function,
+                            id,
+                            SeqReadKey::StringCodePointAt(string, index),
+                            &mut string_values,
+                            &mut changed,
+                            &mut effect_shape_changed,
+                        );
+                    }
+                    _ => match effect_kind {
+                        Some(
+                            EffectKind::Call
+                            | EffectKind::Foreign
+                            | EffectKind::Fiber
+                            | EffectKind::Class
+                            | EffectKind::Module,
+                        ) => {
+                            invalidate_memory_values(
+                                &mut field_values,
+                                &mut static_values,
+                                &mut cell_values,
+                                &mut module_values,
+                                &mut list_values,
+                                &mut map_values,
+                            );
+                            clear_last_stores(
+                                &mut last_field_store,
+                                &mut last_static_store,
+                                &mut last_cell_store,
+                                &mut last_module_store,
+                            );
+                        }
+                        Some(
+                            EffectKind::Alloc
+                            | EffectKind::Guard
+                            | EffectKind::Safepoint
+                            | EffectKind::Barrier,
+                        ) => {
+                            // Allocation/guard/safepoint can make prior stores
+                            // observable through GC or deoptimization state, but do
+                            // not mutate ordinary Wren memory by themselves.
+                            clear_last_stores(
+                                &mut last_field_store,
+                                &mut last_static_store,
+                                &mut last_cell_store,
+                                &mut last_module_store,
+                            );
+                        }
+                        _ => {}
+                    },
+                }
+            }
+
+            if removed.iter().any(|removed| *removed) {
+                function.blocks[block_ix]
+                    .insts
+                    .retain(|id| !removed.get(id.0 as usize).copied().unwrap_or(false));
+            }
+
+            if effect_shape_changed {
+                repair_effect_chain(function, block_ix);
+            }
+        }
+
+        if changed {
+            function
+                .profiles
+                .numeric_sites
+                .retain(|id, _| !removed.get(id.0 as usize).copied().unwrap_or(false));
+        }
+
+        changed
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GuardReplacement {
+    Move(ValueId),
+    Erase,
+}
+
+fn redundant_guard_replacement(
+    function: &Function,
+    _id: InstId,
+    kind: &Inst,
+    guards: &HashMap<GuardKey, Option<ValueId>>,
+) -> Option<GuardReplacement> {
+    let key = match kind {
+        Inst::GuardType { value, expected, .. } => {
+            if function
+                .value(*value)
+                .is_some_and(|actual| expected.accepts(&actual.ty))
+            {
+                return Some(GuardReplacement::Move(*value));
+            }
+            GuardKey::Type(*value, expected.clone())
+        }
+        Inst::GuardClass { value, expected, .. } => {
+            if function
+                .value(*value)
+                .is_some_and(|actual| class_guard_known(&actual.ty, expected))
+            {
+                return Some(GuardReplacement::Move(*value));
+            }
+            GuardKey::Class(*value, expected.clone())
+        }
+        Inst::GuardNotNull { value, .. } => {
+            if function
+                .value(*value)
+                .is_some_and(|value| type_definitely_non_null(&value.ty))
+            {
+                return Some(GuardReplacement::Move(*value));
+            }
+            GuardKey::NotNull(*value)
+        }
+        Inst::GuardInt32 { value, .. } => {
+            if function
+                .value(*value)
+                .is_some_and(|value| matches!(&value.ty, Type::Int32))
+            {
+                return Some(GuardReplacement::Move(*value));
+            }
+            GuardKey::Int32(*value)
+        }
+        Inst::GuardF64 { value, .. } => {
+            if function
+                .value(*value)
+                .is_some_and(|value| matches!(&value.ty, Type::F64))
+            {
+                return Some(GuardReplacement::Move(*value));
+            }
+            GuardKey::F64(*value)
+        }
+        Inst::GuardBounds { index, length, .. } => {
+            if let (Some(index), Some(length)) = (
+                resolve_i32(function, *index, 0),
+                resolve_i32(function, *length, 0),
+            ) {
+                if index >= 0 && index < length {
+                    return Some(GuardReplacement::Erase);
+                }
+            }
+            GuardKey::Bounds(*index, *length)
+        }
+        _ => return None,
+    };
+
+    guards.get(&key).and_then(|result| match result {
+        Some(value) => Some(GuardReplacement::Move(*value)),
+        None => Some(GuardReplacement::Erase),
+    })
+}
+
+fn guard_fact(function: &Function, id: InstId, kind: &Inst) -> Option<(GuardKey, Option<ValueId>)> {
+    let result = single_result(function, id);
+    match kind {
+        Inst::GuardType { value, expected, .. } => {
+            Some((GuardKey::Type(*value, expected.clone()), result))
+        }
+        Inst::GuardClass { value, expected, .. } => {
+            Some((GuardKey::Class(*value, expected.clone()), result))
+        }
+        Inst::GuardNotNull { value, .. } => Some((GuardKey::NotNull(*value), result)),
+        Inst::GuardInt32 { value, .. } => Some((GuardKey::Int32(*value), result)),
+        Inst::GuardF64 { value, .. } => Some((GuardKey::F64(*value), result)),
+        Inst::GuardBounds { index, length, .. } => {
+            Some((GuardKey::Bounds(*index, *length), None))
+        }
+        _ => None,
+    }
+}
+
+fn class_guard_known(actual: &Type, expected: &ClassSet) -> bool {
+    if expected.is_unknown() {
+        return true;
+    }
+    match actual {
+        Type::Class(actual) | Type::Instance(actual) if !actual.is_unknown() => actual
+            .as_slice()
+            .iter()
+            .all(|class| expected.contains(*class)),
+        Type::Union(types) => types.iter().all(|ty| class_guard_known(ty, expected)),
+        Type::Bottom => true,
+        _ => false,
+    }
+}
+
+fn type_definitely_non_null(ty: &Type) -> bool {
+    match ty {
+        Type::Bottom => true,
+        Type::Top | Type::Null | Type::RawPtr => false,
+        Type::Union(types) => !types.is_empty() && types.iter().all(type_definitely_non_null),
+        _ => true,
+    }
+}
+
+fn single_result(function: &Function, id: InstId) -> Option<ValueId> {
+    let node = function.node(id)?;
+    match node.results.as_slice() {
+        [result] => Some(*result),
+        _ => None,
+    }
+}
+
+fn pure_key(kind: &Inst) -> Option<PureKey> {
+    match kind {
+        Inst::Const(Constant::Null) => Some(PureKey::Null),
+        Inst::Const(Constant::Bool(value)) => Some(PureKey::Bool(*value)),
+        Inst::Const(Constant::Num(value)) => Some(PureKey::Num(value.to_bits())),
+        Inst::Const(Constant::String(value)) => Some(PureKey::String(*value)),
+        Inst::Const(Constant::Int32(value)) => Some(PureKey::Int32(*value)),
+        Inst::IntUnary { op, value } => Some(PureKey::IntUnary(*op, *value)),
+        Inst::IntBin { op, left, right } => {
+            let (left, right) = if matches!(
+                *op,
+                IntBinOp::Add | IntBinOp::Mul | IntBinOp::BitAnd | IntBinOp::BitOr | IntBinOp::BitXor
+            ) {
+                ordered_pair(*left, *right)
+            } else {
+                (*left, *right)
+            };
+            Some(PureKey::IntBin(*op, left, right))
+        }
+        Inst::F64Unary { op, value } => Some(PureKey::F64Unary(*op, *value)),
+        Inst::F64Bin { op, left, right } => Some(PureKey::F64Bin(*op, *left, *right)),
+        Inst::CmpInt { kind, left, right } => {
+            let (left, right) = if matches!(*kind, CmpKind::Eq | CmpKind::Ne) {
+                ordered_pair(*left, *right)
+            } else {
+                (*left, *right)
+            };
+            Some(PureKey::CmpInt(*kind, left, right))
+        }
+        Inst::CmpF64 { kind, left, right } => {
+            let (left, right) = if matches!(*kind, CmpKind::Eq | CmpKind::Ne) {
+                ordered_pair(*left, *right)
+            } else {
+                (*left, *right)
+            };
+            Some(PureKey::CmpF64(*kind, left, right))
+        }
+        Inst::RefEq { left, right } => {
+            let (left, right) = ordered_pair(*left, *right);
+            Some(PureKey::RefEq(left, right))
+        }
+        Inst::NumToInt32 { value } => Some(PureKey::NumToInt32(*value)),
+        Inst::NumToF64 { value } => Some(PureKey::NumToF64(*value)),
+        Inst::Int32ToNum { value } => Some(PureKey::Int32ToNum(*value)),
+        Inst::F64ToNum { value } => Some(PureKey::F64ToNum(*value)),
+        Inst::IsInstance { value, class } => Some(PureKey::IsInstance(*value, *class)),
+        Inst::StringLen { string } => Some(PureKey::StringLen(*string)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn ordered_pair(left: ValueId, right: ValueId) -> (ValueId, ValueId) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn cse_read(
+    function: &mut Function,
+    id: InstId,
+    key: SeqReadKey,
+    values: &mut HashMap<SeqReadKey, ValueId>,
+    changed: &mut bool,
+    effect_shape_changed: &mut bool,
+) {
+    if let Some(value) = values.get(&key).copied() {
+        function.nodes[id.0 as usize].kind = Inst::Move(value);
+        *changed = true;
+        *effect_shape_changed = true;
+    } else if let Some(result) = single_result(function, id) {
+        values.insert(key, result);
+    }
+}
+
+fn invalidate_memory_values(
+    fields: &mut HashMap<FieldKey, ValueId>,
+    statics: &mut HashMap<StaticFieldKey, ValueId>,
+    cells: &mut HashMap<ValueId, ValueId>,
+    modules: &mut HashMap<ModuleKey, ValueId>,
+    lists: &mut HashMap<SeqReadKey, ValueId>,
+    maps: &mut HashMap<SeqReadKey, ValueId>,
+) {
+    fields.clear();
+    statics.clear();
+    cells.clear();
+    modules.clear();
+    lists.clear();
+    maps.clear();
+}
+
+fn clear_last_stores(
+    fields: &mut HashMap<FieldKey, InstId>,
+    statics: &mut HashMap<StaticFieldKey, InstId>,
+    cells: &mut HashMap<ValueId, InstId>,
+    modules: &mut HashMap<ModuleKey, InstId>,
+) {
+    fields.clear();
+    statics.clear();
+    cells.clear();
+    modules.clear();
+}
+
+/// Cheap CFG cleanup: bounded jump threading, switch cleanup and unreachable
+/// block compaction. Blocks keep stable IDs; unreachable blocks become a single
+/// `Unreachable` terminator instead of forcing global ID renumbering.
+#[derive(Default)]
+pub struct ControlFlowCleanup;
+
+impl FunctionOptimization for ControlFlowCleanup {
+    fn optimize_function(&mut self, function: &mut Function) -> bool {
+        let mut changed = false;
+
+        for block_ix in 0..function.blocks.len() {
+            let Some(id) = function.blocks[block_ix].insts.last().copied() else {
+                continue;
+            };
+            let old = function.nodes[id.0 as usize].kind.clone();
+            if let Some(new_kind) = simplify_terminator(function, old) {
+                function.nodes[id.0 as usize].kind = new_kind;
+                changed = true;
+            }
+        }
+
+        let reachable = compute_reachable(function);
+        let mut compacted = false;
+
+        for block_ix in 0..function.blocks.len() {
+            if reachable.get(block_ix).copied().unwrap_or(false) {
+                continue;
+            }
+
+            let already_unreachable = function.blocks[block_ix].insts.len() == 1
+                && matches!(
+                    &function.nodes[function.blocks[block_ix].insts[0].0 as usize].kind,
+                    Inst::Unreachable
+                );
+            if already_unreachable {
+                continue;
+            }
+
+            let source = function.blocks[block_ix]
+                .insts
+                .first()
+                .and_then(|id| function.node(*id))
+                .and_then(|node| node.source);
+            let id = InstId(function.nodes.len() as u32);
+            function.nodes.push(Node {
+                id,
+                kind: Inst::Unreachable,
+                results: Vec::new(),
+                effect_in: Some(function.blocks[block_ix].effect),
+                effect_out: None,
+                source,
+            });
+            function.blocks[block_ix].insts.clear();
+            function.blocks[block_ix].insts.push(id);
+            compacted = true;
+        }
+
+        if compacted {
+            changed = true;
+        }
+
+        if changed {
+            let live = live_node_bitmap(function);
+            function
+                .profiles
+                .numeric_sites
+                .retain(|id, _| live.get(id.0 as usize).copied().unwrap_or(false));
+            function.profiles.block_counters.retain(|block, _| {
+                reachable
+                    .get(block.0 as usize)
+                    .copied()
+                    .unwrap_or(false)
+            });
+
+            let mut live_sites: HashSet<SiteId> = HashSet::new();
+            for block in &function.blocks {
+                for id in block.insts.iter().copied() {
+                    match &function.nodes[id.0 as usize].kind {
+                        Inst::Invoke { site, .. } | Inst::InvokeSuper { site, .. } => {
+                            live_sites.insert(*site);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            function
+                .profiles
+                .call_sites
+                .retain(|site, _| live_sites.contains(site));
+        }
+
+        changed
+    }
+}
+
+fn simplify_terminator(function: &Function, kind: Inst) -> Option<Inst> {
+    match kind {
+        Inst::Jump { mut edge } => {
+            if thread_edge(function, &mut edge) {
+                Some(Inst::Jump { edge })
+            } else {
+                None
+            }
+        }
+        Inst::Branch {
+            cond,
+            mut then_edge,
+            mut else_edge,
+        } => {
+            let mut changed = thread_edge(function, &mut then_edge);
+            changed |= thread_edge(function, &mut else_edge);
+            if same_edge_payload(&then_edge, &else_edge) {
+                return Some(Inst::Jump { edge: then_edge });
+            }
+            changed.then_some(Inst::Branch {
+                cond,
+                then_edge,
+                else_edge,
+            })
+        }
+        Inst::Switch {
+            tag,
+            mut default_edge,
+            mut cases,
+        } => {
+            let mut changed = thread_edge(function, &mut default_edge);
+            for case in &mut cases {
+                changed |= thread_edge(function, &mut case.edge);
+            }
+
+            let old_len = cases.len();
+            let mut seen = HashSet::with_capacity(cases.len());
+            cases.retain(|case| {
+                seen.insert(case.value) && !same_edge_payload(&case.edge, &default_edge)
+            });
+            changed |= cases.len() != old_len;
+
+            if cases.is_empty() {
+                return Some(Inst::Jump { edge: default_edge });
+            }
+
+            changed.then_some(Inst::Switch {
+                tag,
+                default_edge,
+                cases,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn thread_edge(function: &Function, edge: &mut Edge) -> bool {
+    let original = edge.clone();
+    let mut candidate = edge.clone();
+    let incoming_effect = edge.effect;
+    let mut seen = Vec::<BlockId>::with_capacity(8);
+    let mut changed = false;
+
+    for _ in 0..8 {
+        if seen.contains(&candidate.target) {
+            return false;
+        }
+        seen.push(candidate.target);
+
+        let Some(next) = thread_edge_once(function, &candidate, incoming_effect) else {
+            break;
+        };
+        candidate = next;
+        changed = true;
+    }
+
+    if changed
+        && (candidate.target != original.target || candidate.args != original.args)
+    {
+        *edge = candidate;
+        true
+    } else {
+        false
+    }
+}
+
+fn thread_edge_once(function: &Function, incoming: &Edge, effect: crate::wren_ir::EffectId) -> Option<Edge> {
+    if incoming.target == function.entry {
+        return None;
+    }
+    let block = function.block(incoming.target)?;
+    if block.insts.len() != 1 {
+        return None;
+    }
+    let node = function.node(block.insts[0])?;
+    let Inst::Jump { edge: outgoing } = &node.kind else {
+        return None;
+    };
+
+    let mut args = outgoing.args.clone();
+    for arg in &mut args {
+        let Some(value) = function.value(*arg) else {
+            continue;
+        };
+        let ValueDef::BlockParam(owner, index) = value.def else {
+            continue;
+        };
+        if owner == block.id {
+            *arg = *incoming.args.get(index as usize)?;
+        }
+    }
+
+    Some(Edge {
+        target: outgoing.target,
+        args,
+        effect,
+    })
+}
+
+fn compute_reachable(function: &Function) -> Vec<bool> {
+    let mut reachable = vec![false; function.blocks.len()];
+    let mut stack = Vec::new();
+    if (function.entry.0 as usize) < reachable.len() {
+        stack.push(function.entry);
+    }
+
+    while let Some(block_id) = stack.pop() {
+        let block_ix = block_id.0 as usize;
+        if block_ix >= reachable.len() || reachable[block_ix] {
+            continue;
+        }
+        reachable[block_ix] = true;
+
+        let Some(block) = function.block(block_id) else {
+            continue;
+        };
+        let Some(term) = block.insts.last().and_then(|id| function.node(*id)) else {
+            continue;
+        };
+        for edge in term.kind.edges() {
+            let target_ix = edge.target.0 as usize;
+            if target_ix < reachable.len() && !reachable[target_ix] {
+                stack.push(edge.target);
+            }
+        }
+    }
+
+    reachable
+}
+
+fn live_node_bitmap(function: &Function) -> Vec<bool> {
+    let mut live = vec![false; function.nodes.len()];
+    for block in &function.blocks {
+        for id in block.insts.iter().copied() {
+            if let Some(slot) = live.get_mut(id.0 as usize) {
+                *slot = true;
+            }
+        }
+    }
+    live
 }
 
 /// Global copy propagation / RAUW for `Move`.
@@ -470,7 +1476,6 @@ impl FunctionOptimization for CopyPropagation {
         let mut alias: Vec<ValueId> = (0..value_count)
             .map(|index| ValueId(index as u32))
             .collect();
-
         let live = live_instruction_ids(function);
 
         for id in live.iter().copied() {
@@ -481,33 +1486,81 @@ impl FunctionOptimization for CopyPropagation {
             let [result] = node.results.as_slice() else {
                 continue;
             };
-
-            let Some(source_ty) = function.value(*source).map(|value| &value.ty) else {
-                continue;
-            };
-            let Some(result_ty) = function.value(*result).map(|value| &value.ty) else {
-                continue;
-            };
-
-            // `Move` is not a representation conversion. If malformed IR ever
-            // violates this, do not silently erase the type boundary.
-            if source_ty == result_ty {
+            if can_substitute(function, *source, *result) {
                 alias[result.0 as usize] = *source;
             }
         }
 
-        // Compress all move chains before touching uses.
-        for index in 0..alias.len() {
-            let value = ValueId(index as u32);
-            alias[index] = canonical_alias(&alias, value);
+        compress_aliases(&mut alias);
+
+        // A block parameter fed by the same SSA value on every reachable edge is
+        // an identity phi. Self-fed backedges are ignored, which also catches the
+        // common loop-invariant parameter pattern.
+        let reachable = compute_reachable(function);
+        let mut candidate = vec![None; value_count];
+        let mut conflict = vec![false; value_count];
+        for _ in 0..4 {
+            candidate.fill(None);
+            conflict.fill(false);
+
+            for (block_ix, block) in function.blocks.iter().enumerate() {
+                if !reachable.get(block_ix).copied().unwrap_or(false) {
+                    continue;
+                }
+                for id in block.insts.iter().copied() {
+                    for edge in function.nodes[id.0 as usize].kind.edges() {
+                        let Some(target) = function.block(edge.target) else {
+                            continue;
+                        };
+                        for (&param, &arg) in target.params.iter().zip(&edge.args) {
+                            let p = param.0 as usize;
+                            if p >= value_count || conflict[p] {
+                                continue;
+                            }
+                            let arg = canonical_alias(&alias, arg);
+                            if arg == param {
+                                continue;
+                            }
+                            match candidate[p] {
+                                None => candidate[p] = Some(arg),
+                                Some(previous) if previous == arg => {}
+                                Some(_) => conflict[p] = true,
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut added = false;
+            for index in 0..value_count {
+                if conflict[index] || alias[index] != ValueId(index as u32) {
+                    continue;
+                }
+                let Some(source) = candidate[index] else {
+                    continue;
+                };
+                let result = ValueId(index as u32);
+                if matches!(function.values[index].def, ValueDef::BlockParam(_, _))
+                    && can_substitute(function, source, result)
+                {
+                    alias[index] = source;
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+            compress_aliases(&mut alias);
         }
 
+        compress_aliases(&mut alias);
         let mut changed = false;
 
         for id in live.iter().copied() {
             let node = &mut function.nodes[id.0 as usize];
             node.kind.for_each_operand_mut(|operand| {
-                let canonical = canonical_alias(&alias, *operand);
+                let index = operand.0 as usize;
+                let canonical = alias.get(index).copied().unwrap_or(*operand);
                 if canonical != *operand {
                     *operand = canonical;
                     changed = true;
@@ -517,7 +1570,10 @@ impl FunctionOptimization for CopyPropagation {
 
         for deopt in &mut function.deopts {
             for slot in &mut deopt.snapshot.slots {
-                let canonical = canonical_alias(&alias, slot.value);
+                let canonical = alias
+                    .get(slot.value.0 as usize)
+                    .copied()
+                    .unwrap_or(slot.value);
                 if canonical != slot.value {
                     slot.value = canonical;
                     changed = true;
@@ -525,7 +1581,10 @@ impl FunctionOptimization for CopyPropagation {
             }
             for frame in &mut deopt.snapshot.inlined_frames {
                 for slot in &mut frame.slots {
-                    let canonical = canonical_alias(&alias, slot.value);
+                    let canonical = alias
+                        .get(slot.value.0 as usize)
+                        .copied()
+                        .unwrap_or(slot.value);
                     if canonical != slot.value {
                         slot.value = canonical;
                         changed = true;
@@ -543,7 +1602,12 @@ impl FunctionOptimization for CopyPropagation {
             let [result] = node.results.as_slice() else {
                 continue;
             };
-            if canonical_alias(&alias, *result) != *result {
+            if alias
+                .get(result.0 as usize)
+                .copied()
+                .unwrap_or(*result)
+                != *result
+            {
                 removable[id.0 as usize] = true;
             }
         }
@@ -563,11 +1627,33 @@ impl FunctionOptimization for CopyPropagation {
     }
 }
 
+fn can_substitute(function: &Function, source: ValueId, result: ValueId) -> bool {
+    let Some(source_ty) = function.value(source).map(|value| &value.ty) else {
+        return false;
+    };
+    let Some(result_ty) = function.value(result).map(|value| &value.ty) else {
+        return false;
+    };
+
+    if source_ty == result_ty {
+        return true;
+    }
+    if source_ty.is_internal_representation() || result_ty.is_internal_representation() {
+        return false;
+    }
+    result_ty.accepts(source_ty)
+}
+
+fn compress_aliases(alias: &mut [ValueId]) {
+    for index in 0..alias.len() {
+        let value = ValueId(index as u32);
+        let canonical = canonical_alias(alias, value);
+        alias[index] = canonical;
+    }
+}
+
 fn canonical_alias(alias: &[ValueId], start: ValueId) -> ValueId {
     let mut current = start;
-
-    // SSA move chains are acyclic. The bound makes this helper robust against
-    // malformed input without allocating a visited set in this hot compile path.
     for _ in 0..=alias.len() {
         let Some(next) = alias.get(current.0 as usize).copied() else {
             return current;
@@ -577,9 +1663,6 @@ fn canonical_alias(alias: &[ValueId], start: ValueId) -> ValueId {
         }
         current = next;
     }
-
-    // A cycle means malformed SSA. Refuse to propagate through it rather than
-    // detaching a move whose replacement cannot be proven canonical.
     start
 }
 

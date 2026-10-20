@@ -28,6 +28,7 @@
 //!   -> tokenizer/parser
 //!   -> AST
 //!   -> Wren HIR
+//!   -> HIR optimization passes
 //!   -> register bytecode
 //!   -> interpreter
 //! ```
@@ -44,6 +45,9 @@ pub mod wren_ir;
 pub mod wren_lowerer;
 pub mod wren_trace_ir;
 pub mod wren_tracing_jit;
+pub mod wren_ir_optimizer;
+pub mod wren_ir_optimizing;
+pub mod wren_pipeline;
 
 use std::env;
 use std::ffi::OsStr;
@@ -140,10 +144,10 @@ fn run() -> u8 {
     };
 
     // -------------------------------------------------------------------------
-    // Backend: HIR -> register bytecode
+    // Compilation pipeline: HIR -> optimizations -> register bytecode
     // -------------------------------------------------------------------------
 
-    let bytecode = match wren_bytecodecompiler::compile_program(&hir) {
+    let bytecode = match wren_pipeline::compile_program(&mut hir) {
         Ok(program) => program,
         Err(error) => {
             eprintln!("bytecode compilation error: {error}");
