@@ -64,7 +64,7 @@ use crate::wren_ir::{
 use crate::wren_trace_ir::{
     verify_trace, ExitReason, ExitTarget, FrameDisposition, FrameSlot,
     SnapshotValue, SideExit, SideExitId, Trace, TraceAnchor, TraceClass,
-    TraceConstant, TraceId, TraceInst, TraceKind, TraceLocation, TraceOptimizer,
+    TraceConstant, TraceId, TraceInst, TraceKind, TraceLocation,
     TraceRep, TraceSwitchGuard, TraceTerminator, TraceType, TraceValueId,
     TraceValueOrigin,
 };
@@ -2144,7 +2144,7 @@ impl<'a> TraceRecorder<'a> {
         prune_dead_snapshot_writes(program, &mut trace);
 
         if self.options.optimize_trace_ir {
-            TraceOptimizer::default().optimize(&mut trace).map_err(|errors| {
+            crate::wren_trace_ir_optimizing::optimization_passes().optimize_trace(&mut trace).map_err(|errors| {
                 RecordOutcome::Fatal(TracingJitError::TraceVerification(
                     errors.into_iter().map(|error| error.to_string()).collect(),
                 ))
@@ -2695,6 +2695,15 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 }
             }
 
+            let mut preheader_nodes = vec![false; self.trace.nodes.len()];
+            for &id in &self.trace.preheader {
+                preheader_nodes[id] = true;
+                let node = &self.trace.nodes[id];
+                if !matches!(node.kind, TraceInst::Nop) {
+                    state.lower_node(node)?;
+                }
+            }
+
             // Mirror the old B3 backend exactly: loop-carried values are mutable
             // frontend variables. Cranelift's frontend SSA builder inserts and
             // wires the required block parameters itself when `use_var` sees a
@@ -2750,7 +2759,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
             state.native_budget_remaining = budget_var.map(|variable| state.builder.use_var(variable));
 
             for node in &self.trace.nodes {
-                if !matches!(node.kind, TraceInst::Nop) {
+                if !preheader_nodes[node.id] && !matches!(node.kind, TraceInst::Nop) {
                     state.lower_node(node)?;
                 }
             }
@@ -2856,7 +2865,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
             .define_function(function, context)
             .map_err(|error| TracingJitError::CraneliftLowering {
                 trace: trace_id,
-                message: format!("native code generation failed: {error}"),
+                message: format!("native code generation failed: {error:?}"),
             })?;
 
         let disassembly = if self.options.cranelift_dump_disassembly {
@@ -2978,7 +2987,7 @@ impl CraneliftLoweringState<'_, '_> {
                     "instruction result {value:?} requested before producer was lowered"
                 )));
             }
-            TraceValueOrigin::LoopPhi { .. } => {
+            TraceValueOrigin::LoopPhi { .. } | TraceValueOrigin::LoopTemporary => {
                 return Err(self.error(format!(
                     "loop value {value:?} has no Cranelift block parameter"
                 )));
@@ -4982,6 +4991,67 @@ impl TracingJit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_passes_preserve_native_loop_exits_and_budget_reentry() {
+        unsafe extern "C" fn unexpected_runtime(
+            _: *mut TraceActivation, _: u32, _: u32, _: u32,
+        ) -> u32 { TRACE_RESULT_RUNTIME }
+
+        for tagged in [false, true] {
+            let original = crate::wren_trace_ir_optimizing::tests::loop_trace(tagged);
+            let mut optimized = original.clone();
+            crate::wren_trace_ir_optimizing::optimization_passes()
+                .optimize_trace(&mut optimized).unwrap();
+            assert_eq!(optimized.stats.pre_eliminated, 1);
+            for budget in [0, 2] {
+                let mut outputs = Vec::new();
+                for trace in [&original, &optimized] {
+                    let mut jit = TracingJit::new(TracingJitOptions {
+                        native_loop_iteration_budget: budget,
+                        ..Default::default()
+                    });
+                    let compiled = jit.compile_trace(trace)
+                        .unwrap_or_else(|error| panic!("tagged={tagged}, budget={budget}, stats={:?}: {error}", trace.stats));
+                    let mut general = [RegisterWord(0); 8];
+                    general[1] = RegisterWord(10);
+                    let mut activation = TraceActivation::new(TraceActivationInputs {
+                        general: general.as_mut_ptr(),
+                        arguments: std::ptr::null_mut(),
+                        returns: std::ptr::null_mut(),
+                        special: std::ptr::null_mut(),
+                        runtime: std::ptr::null_mut(),
+                        execute: unexpected_runtime,
+                    });
+                    activation.current_links = compiled.native_links.as_ptr();
+                    if tagged {
+                        // Failed entry specialization must leave all VM state intact.
+                        general[0] = RegisterWord(TAG_TRUE);
+                        let before = general.map(|v| v.0);
+                        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                        assert_eq!(general.map(|v| v.0), before);
+                        general[0] = RegisterWord(0.0f64.to_bits());
+                    }
+                    let mut snapshots = Vec::new();
+                    // Finite test bound also catches a broken loop-carried PRE value.
+                    for _ in 0..6 {
+                        activation.reset_result();
+                        let result = unsafe { (compiled.entry)(&mut activation) };
+                        assert_eq!(result, TRACE_RESULT_SIDE_EXIT);
+                        snapshots.push(general.map(|v| v.0));
+                        let counter = if tagged { f64::from_bits(general[0].0) as u64 }
+                            else { general[0].0 };
+                        if counter == 6 { break; }
+                    }
+                    let last = snapshots.last().unwrap();
+                    assert_eq!(last[2..6], [10, 10, 12, 22]);
+                    assert_eq!(snapshots.len(), if budget == 0 { 1 } else { 3 });
+                    outputs.push(snapshots);
+                }
+                assert_eq!(outputs[0], outputs[1], "tagged={tagged}, budget={budget}");
+            }
+        }
+    }
 
     #[test]
     fn nan_box_helpers_match_runtime_layout() {

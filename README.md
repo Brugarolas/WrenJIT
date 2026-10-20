@@ -22,6 +22,35 @@ stage. Bytecode lowering has its own options, configurable through
 after HIR optimization. `wren_bytecodecompiler` remains the direct backend API
 for callers that already prepared their HIR.
 
+Trace compilation has the same split: `wren_trace_ir_optimizer.rs` owns the
+extensible, verified pass runner, while `wren_trace_ir_optimizing.rs` owns the
+default list and transforms. The recorder runs this list for root and side
+traces before Cranelift lowering when `optimize_trace_ir` is enabled.
+
+The default sequence preserves numeric representation specialization, then runs
+GVN, LICM, PRE and another GVN cleanup. GVN reuses pure scalar expressions;
+LICM moves safe invariant computations into the native preheader. PRE uses the
+loop's entry/backedge join: `e(phi(initial, next))` becomes
+`phi(e(initial), e(next))` when `e(next)` is already computed in the body. It is
+loop-edge PRE for this linear Trace IR, not arbitrary-CFG PRE. Loads, runtime
+effects, checked operations and trapping integer division are excluded from
+code motion; runtime calls also reset GVN availability.
+
+```rust,ignore
+use wren_trace_ir_optimizer::Optimize;
+use wren_trace_ir_optimizing::{GlobalValueNumbering, LoopInvariantCodeMotion};
+
+Optimize::new()
+    .with_pass(GlobalValueNumbering)
+    .with_pass(LoopInvariantCodeMotion)
+    .optimize_trace(&mut trace)?;
+```
+
+Add default passes in `wren_trace_ir_optimizing::optimization_passes()`, or append
+custom implementations of `TraceOptimization` with `.with_pass(...)`.
+`TraceStats` exposes `gvn_eliminated`, `licm_hoisted` and `pre_eliminated`.
+The old `wren_trace_ir::TraceOptimizer` API remains available for compatibility.
+
 Run performance workloads with an optimized build:
 
 ```powershell

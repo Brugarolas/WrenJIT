@@ -44,6 +44,8 @@ pub mod wren_interpreter;
 pub mod wren_ir;
 pub mod wren_lowerer;
 pub mod wren_trace_ir;
+pub mod wren_trace_ir_optimizer;
+pub mod wren_trace_ir_optimizing;
 pub mod wren_tracing_jit;
 pub mod wren_ir_optimizer;
 pub mod wren_ir_optimizing;

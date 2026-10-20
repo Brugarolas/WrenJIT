@@ -23,7 +23,7 @@ impl TraceLocation {
 pub enum FrameSlot { General(Reg), Argument(ArgReg), Return(ReturnReg), Special(SpecialReg) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TraceRep { Tagged, Int32, UInt32, F64, Bool, HeapHandle, RawPtr }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TraceType { Any, Null, Bool, Num, Int32, UInt32, F64 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TraceClass { Builtin(BuiltinId) }
@@ -50,13 +50,16 @@ pub enum TraceValueOrigin {
     /// invariant loop inputs that would otherwise repeat GuardF64/GuardInt32/GuardUInt32.
     GuardedEntry { value: TraceValueId, exit: SideExitId },
     Constant(TraceConstant),
-    InstResult { node: usize }, LoopPhi { slot: FrameSlot }, Alias(TraceValueId),
+    InstResult { node: usize }, LoopPhi { slot: FrameSlot },
+    /// Optimizer-created loop state without an architectural register slot.
+    LoopTemporary,
+    Alias(TraceValueId),
 }
 #[derive(Clone, Debug)]
 pub struct TraceValue { pub id: TraceValueId, pub ty: TraceType, pub rep: TraceRep, pub origin: TraceValueOrigin }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TraceSwitchGuard { Case(i64), Default { excluded: Vec<i64> } }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TraceInst {
     Nop,
     Copy { value: TraceValueId },
@@ -91,7 +94,7 @@ pub enum TraceInst {
     ReadBarrier { value: TraceValueId },
 }
 impl TraceInst {
-    fn visit_operands(&mut self, mut f: impl FnMut(&mut TraceValueId)) {
+    pub fn visit_operands(&mut self, mut f: impl FnMut(&mut TraceValueId)) {
         use TraceInst::*;
         match self {
             Nop | LoadFrameSlot { .. } | Runtime { .. } => {},
@@ -112,7 +115,23 @@ impl TraceInst {
     pub fn replace_operand(&mut self, from: TraceValueId, to: TraceValueId) {
         self.visit_operands(|v| if *v == from { *v = to });
     }
-    fn exit(&self) -> Option<SideExitId> {
+    /// Pure, total operations that can execute before any body guard.
+    /// Integer division/remainder may trap; loads, guards and barriers observe
+    /// runtime state and must remain at their original execution point.
+    pub fn is_speculatable(&self) -> bool {
+        use TraceInst::*;
+        matches!(self,
+            Copy { .. } | Reinterpret { .. } | IntUnary { .. }
+            | IntBinary { op: IntBinOp::Add | IntBinOp::Sub | IntBinOp::Mul
+                | IntBinOp::BitAnd | IntBinOp::BitOr | IntBinOp::BitXor
+                | IntBinOp::Shl | IntBinOp::ShrU | IntBinOp::Sar, .. }
+            | F64Unary { .. } | F64Binary { .. } | IntCompare { .. }
+            | F64Compare { .. } | RefEq { .. } | IsNull { .. } | Select { .. }
+            | BoxInt32 { .. } | BoxUInt32 { .. } | BoxF64 { .. }
+            | Int32ToF64 { .. } | UInt32ToF64 { .. })
+    }
+
+    pub fn exit(&self) -> Option<SideExitId> {
         use TraceInst::*;
         match self {
             GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
@@ -178,10 +197,16 @@ pub struct TraceStats {
     pub eliminated_boxes: usize,
     pub eliminated_copies: usize,
     pub pruned_snapshot_writes: usize,
+    pub gvn_eliminated: usize,
+    pub licm_hoisted: usize,
+    pub pre_eliminated: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Trace {
     pub id: TraceId, pub anchor: TraceAnchor, pub values: Vec<TraceValue>, pub nodes: Vec<TraceNode>,
+    /// Stable node IDs executed once, in this order, before initializing loop phis.
+    /// All other nodes execute in arena order in the trace body.
+    pub preheader: Vec<usize>,
     pub exits: Vec<SideExit>, pub loop_phis: Vec<LoopPhi>,
     /// Synthetic side exit used by the native-loop execution budget. It resumes
     /// at the trace anchor with the end-of-iteration architectural state.
@@ -209,7 +234,7 @@ pub struct TraceBuilder {
 }
 impl TraceBuilder {
     pub fn new(id: TraceId, anchor: TraceAnchor) -> Self {
-        Self { source: anchor.location, trace: Trace { id, anchor, values: vec![], nodes: vec![], exits: vec![],
+        Self { source: anchor.location, trace: Trace { id, anchor, values: vec![], nodes: vec![], preheader: vec![], exits: vec![],
             loop_phis: vec![], native_budget_exit: None, terminator: TraceTerminator::Unreachable, stats: TraceStats::default() },
             slots: HashMap::new(), dirty: vec![], memory_epoch: false }
     }
@@ -358,54 +383,59 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
     let mut available = vec![false; t.values.len()];
     for (index, value) in t.values.iter().enumerate() {
         if value.id.0 as usize != index { errors.push("noncanonical value ID".into()); }
-        available[index] = matches!(&value.origin, TraceValueOrigin::EntrySlot { .. } | TraceValueOrigin::Constant(_) | TraceValueOrigin::LoopPhi { .. });
-    }
-    // Guarded entries execute in the native preheader, after ordinary entry loads
-    // and before the loop. Their source therefore must itself be preheader-safe.
-    for (index, value) in t.values.iter().enumerate() {
-        if let TraceValueOrigin::GuardedEntry { value: source, .. } = &value.origin {
-            let source = t.canonical_value(*source);
-            if available.get(source.0 as usize).copied().unwrap_or(false)
-                && t.value(source).is_some_and(|v| v.rep == TraceRep::Tagged)
-                && matches!(value.rep, TraceRep::F64 | TraceRep::Int32 | TraceRep::UInt32)
-            {
-                available[index] = true;
-            } else {
-                errors.push("invalid guarded entry value".into());
+        available[index] = matches!(value.origin,
+            TraceValueOrigin::EntrySlot { .. } | TraceValueOrigin::Constant(_));
+        if let TraceValueOrigin::Alias(_) = value.origin {
+            if t.value(t.canonical_value(value.id)).is_none_or(|v| matches!(v.origin, TraceValueOrigin::Alias(_))) {
+                errors.push("cyclic or invalid value alias".into());
             }
-        }
-    }
-    let check_exit = |id: SideExitId, available: &[bool], errors: &mut Vec<String>| {
-        if let Some(exit) = t.exits.get(id.0 as usize) {
-            for frame in &exit.frames { for write in &frame.writes {
-                if let SnapshotValue::Value(v) = write.value {
-                    if !available.get(v.0 as usize).copied().unwrap_or(false) { errors.push(format!("exit {id:?} uses unavailable value {v:?}")); }
-                }
-            }}
-        } else { errors.push(format!("unknown exit {id:?}")); }
-    };
-    for value in &t.values {
-        if let TraceValueOrigin::GuardedEntry { exit, .. } = &value.origin {
-            check_exit(*exit, &available, &mut errors);
         }
     }
     for (index, node) in t.nodes.iter().enumerate() {
         if node.id != index { errors.push("noncanonical node ID".into()); }
+    }
+    let is_available = |v: TraceValueId, available: &[bool]| {
+        available.get(t.canonical_value(v).0 as usize).copied().unwrap_or(false)
+    };
+    let check_exit = |id: SideExitId, available: &[bool], errors: &mut Vec<String>| {
+        if let Some(exit) = t.exits.get(id.0 as usize) {
+            for frame in &exit.frames { for write in &frame.writes {
+                if let SnapshotValue::Value(v) = write.value {
+                    if !is_available(v, available) { errors.push(format!("exit {id:?} uses unavailable value {v:?}")); }
+                }
+            }}
+        } else { errors.push(format!("unknown exit {id:?}")); }
+    };
+    // Entry guards and snapshots cannot depend on loop-body values or phis.
+    for (index, value) in t.values.iter().enumerate() {
+        if let TraceValueOrigin::GuardedEntry { value: source, exit } = value.origin {
+            if is_available(source, &available)
+                && t.value(t.canonical_value(source)).is_some_and(|v| v.rep == TraceRep::Tagged)
+                && matches!(value.rep, TraceRep::F64 | TraceRep::Int32 | TraceRep::UInt32)
+            {
+                check_exit(exit, &available, &mut errors);
+                available[index] = true;
+            } else { errors.push("invalid guarded entry value".into()); }
+        }
+    }
+    let check_node = |index: usize, available: &mut [bool], errors: &mut Vec<String>| {
+        let node = &t.nodes[index];
         node.kind.clone().visit_operands(|v| {
-            if !available.get(v.0 as usize).copied().unwrap_or(false) { errors.push(format!("node {index} uses unavailable value {v:?}")); }
+            if !is_available(*v, available) { errors.push(format!("node {index} uses unavailable value {v:?}")); }
         });
-        if let Some(exit) = node.kind.exit() { check_exit(exit, &available, &mut errors); }
+        if let Some(exit) = node.kind.exit() { check_exit(exit, available, errors); }
         for result in &node.results {
             if let Some(v) = t.value(*result) {
                 match &v.origin {
-                    TraceValueOrigin::InstResult { node } if *node == index => {
-                        available[result.0 as usize] = true;
+                    TraceValueOrigin::InstResult { node: producer } if *producer == index => {
+                        // A dead producer must not make an uncomputed value usable.
+                        available[result.0 as usize] = !matches!(node.kind, TraceInst::Nop);
                     }
                     TraceValueOrigin::Alias(target) => {
-                        let target = t.canonical_value(*target);
-                        if available.get(target.0 as usize).copied().unwrap_or(false) {
-                            available[result.0 as usize] = true;
-                        } else {
+                        if !matches!(node.kind, TraceInst::Nop) {
+                            errors.push("aliased result still has a live producer".into());
+                        }
+                        if !is_available(*target, available) {
                             errors.push("aliased result targets unavailable value".into());
                         }
                     }
@@ -413,23 +443,45 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
                 }
             } else { errors.push("unknown result".into()); }
         }
+    };
+    let mut preheader = vec![false; t.nodes.len()];
+    for &id in &t.preheader {
+        let Some(node) = t.nodes.get(id) else {
+            errors.push("unknown preheader node".into());
+            continue;
+        };
+        if std::mem::replace(&mut preheader[id], true) { errors.push("duplicate preheader node".into()); }
+        if !node.kind.is_speculatable() && !matches!(node.kind, TraceInst::Nop) {
+            errors.push("preheader operation may have effects or trap".into());
+        }
+        check_node(id, &mut available, &mut errors);
+    }
+    // Check all initial values before publishing any loop parameters. This
+    // rejects body-only initializers even when the backedge could supply them.
+    let mut phi_values = HashSet::new();
+    for phi in &t.loop_phis {
+        let initial_ok = is_available(phi.initial, &available)
+            && t.value(t.canonical_value(phi.initial)).is_some_and(|v| {
+                v.rep == phi.rep || (phi.entry_exit.is_some() && v.rep == TraceRep::Tagged
+                    && matches!(phi.rep, TraceRep::F64 | TraceRep::Int32 | TraceRep::UInt32))
+            });
+        let value_ok = t.value(phi.value).is_some_and(|v| v.rep == phi.rep
+            && matches!(v.origin, TraceValueOrigin::LoopPhi { .. } | TraceValueOrigin::LoopTemporary));
+        if !initial_ok || !value_ok || !phi_values.insert(phi.value) {
+            errors.push("invalid loop phi entry".into());
+        }
+        if let Some(exit) = phi.entry_exit { check_exit(exit, &available, &mut errors); }
     }
     for phi in &t.loop_phis {
-        let initial_ok = t.value(phi.initial).is_some_and(|v| {
-            available[v.id.0 as usize]
-                && (v.rep == phi.rep
-                    || (phi.entry_exit.is_some()
-                        && v.rep == TraceRep::Tagged
-                        && matches!(phi.rep, TraceRep::F64 | TraceRep::Int32 | TraceRep::UInt32)))
-        });
-        let backedge_ok = phi.backedge.and_then(|v| t.value(v)).is_some_and(|v| {
-            v.rep == phi.rep && available[v.id.0 as usize]
-        });
-        if !initial_ok || !backedge_ok {
-            errors.push("invalid loop phi".into());
-        }
-        if let Some(exit) = phi.entry_exit {
-            check_exit(exit, &available, &mut errors);
+        if let Some(slot) = available.get_mut(phi.value.0 as usize) { *slot = true; }
+    }
+    for (index, _) in t.nodes.iter().enumerate() {
+        if !preheader[index] { check_node(index, &mut available, &mut errors); }
+    }
+    for phi in &t.loop_phis {
+        if !phi.backedge.is_some_and(|v| is_available(v, &available)
+            && t.value(t.canonical_value(v)).is_some_and(|v| v.rep == phi.rep)) {
+            errors.push("invalid loop phi backedge".into());
         }
     }
     if let Some(id) = t.native_budget_exit {
@@ -446,476 +498,8 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
     if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
-/// Wren-specific trace canonicalization performed before native Cranelift lowering.
-///
-/// The highest-value transformation is representation promotion for loop-carried
-/// Wren numbers:
-///
-/// ```text
-/// Tagged phi -> GuardF64 -> arithmetic -> BoxF64 -> Tagged backedge
-/// ```
-///
-/// becomes:
-///
-/// ```text
-/// entry: GuardF64 once
-/// loop:  F64 phi -> arithmetic -> F64 backedge
-/// ```
-///
-/// Side exits retain their original architectural representation and therefore
-/// re-box only on cold exit blocks.
-#[derive(Default)]
-pub struct TraceOptimizer;
-
-impl TraceOptimizer {
-    /// Full optimizer, including loop-carried representation promotion.
-    /// Retained for backends that have validated raw F64/Int32/UInt32 loop phis.
-    pub fn optimize(&self, trace: &mut Trace) -> Result<(), Vec<String>> {
-        self.optimize_impl(trace, true)
-    }
-
-    /// Conservative optimizer used by the Cranelift stabilization tier.
-    ///
-    /// Loop-carried values remain in their architectural representation across
-    /// the backedge. Arithmetic still unboxes to native F64/Int32 inside the
-    /// iteration, but the loop block itself does not change a Tagged register
-    /// into a raw native block parameter.
-    pub fn optimize_conservative(&self, trace: &mut Trace) -> Result<(), Vec<String>> {
-        self.optimize_impl(trace, false)
-    }
-
-    fn optimize_impl(
-        &self,
-        trace: &mut Trace,
-        promote_loop_representations: bool,
-    ) -> Result<(), Vec<String>> {
-        verify_trace(trace)?;
-
-        // Runtime calls are synchronization boundaries. Representation promotion
-        // is intentionally restricted to pure native loops for now.
-        let has_runtime = trace.nodes.iter().any(|node| matches!(&node.kind, TraceInst::Runtime { .. }));
-
-        self.cancel_box_guard_pairs(trace);
-        if !has_runtime {
-            self.hoist_invariant_numeric_guards(trace);
-            if promote_loop_representations {
-                self.promote_loop_representations(trace);
-            }
-            self.cancel_box_guard_pairs(trace);
-        }
-        self.remove_trivial_copies(trace);
-        self.remove_dead_box_nodes(trace);
-        self.canonicalize_references(trace);
-
-        verify_trace(trace)
-    }
-
-    fn producer(trace: &Trace, value: TraceValueId) -> Option<(usize, TraceInst)> {
-        let value = trace.canonical_value(value);
-        let node = match &trace.value(value)?.origin {
-            TraceValueOrigin::InstResult { node } => *node,
-            _ => return None,
-        };
-        Some((node, trace.nodes.get(node)?.kind.clone()))
-    }
-
-    fn alias_value(trace: &mut Trace, from: TraceValueId, to: TraceValueId) {
-        let to = trace.canonical_value(to);
-        if from == to { return; }
-        if let Some(value) = trace.value_mut(from) {
-            value.origin = TraceValueOrigin::Alias(to);
-        }
-        for node in &mut trace.nodes {
-            node.kind.replace_operand(from, to);
-        }
-        for exit in &mut trace.exits {
-            for frame in &mut exit.frames {
-                for write in &mut frame.writes {
-                    if write.value == SnapshotValue::Value(from) {
-                        write.value = SnapshotValue::Value(to);
-                    }
-                }
-            }
-        }
-        for phi in &mut trace.loop_phis {
-            if phi.initial == from { phi.initial = to; }
-            if phi.backedge == Some(from) { phi.backedge = Some(to); }
-        }
-    }
-
-    fn cancel_box_guard_pairs(&self, trace: &mut Trace) {
-        // Iterate to a small fixed point because eliminating one pair can expose
-        // another around a loop backedge.
-        for _ in 0..4 {
-            let mut changed = false;
-            for index in 0..trace.nodes.len() {
-                let kind = trace.nodes[index].kind.clone();
-                let Some(result) = trace.nodes[index].results.first().copied() else { continue; };
-                match kind {
-                    TraceInst::GuardF64 { value, .. } => {
-                        if let Some((_, producer)) = Self::producer(trace, value) {
-                            match producer {
-                                TraceInst::BoxF64 { value: raw } => {
-                                    Self::alias_value(trace, result, raw);
-                                    trace.nodes[index].kind = TraceInst::Nop;
-                                    trace.stats.eliminated_guards += 1;
-                                    changed = true;
-                                }
-                                TraceInst::BoxInt32 { value: raw } => {
-                                    trace.nodes[index].kind = TraceInst::Int32ToF64 { value: raw };
-                                    trace.stats.eliminated_guards += 1;
-                                    changed = true;
-                                }
-                                TraceInst::BoxUInt32 { value: raw } => {
-                                    trace.nodes[index].kind = TraceInst::UInt32ToF64 { value: raw };
-                                    trace.stats.eliminated_guards += 1;
-                                    changed = true;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    TraceInst::GuardInt32 { value, .. } => {
-                        if let Some((_, TraceInst::BoxInt32 { value: raw })) = Self::producer(trace, value) {
-                            Self::alias_value(trace, result, raw);
-                            trace.nodes[index].kind = TraceInst::Nop;
-                            trace.stats.eliminated_guards += 1;
-                            changed = true;
-                        }
-                    }
-                    TraceInst::GuardUInt32 { value, .. } => {
-                        if let Some((_, TraceInst::BoxUInt32 { value: raw })) = Self::producer(trace, value) {
-                            Self::alias_value(trace, result, raw);
-                            trace.nodes[index].kind = TraceInst::Nop;
-                            trace.stats.eliminated_guards += 1;
-                            changed = true;
-                        }
-                    }
-                    TraceInst::BoxF64 { value } => {
-                        if let Some((_, TraceInst::GuardF64 { value: tagged, .. })) = Self::producer(trace, value) {
-                            Self::alias_value(trace, result, tagged);
-                            trace.nodes[index].kind = TraceInst::Nop;
-                            trace.stats.eliminated_boxes += 1;
-                            changed = true;
-                        }
-                    }
-                    TraceInst::BoxInt32 { value } => {
-                        if let Some((_, TraceInst::GuardInt32 { value: tagged, .. })) = Self::producer(trace, value) {
-                            Self::alias_value(trace, result, tagged);
-                            trace.nodes[index].kind = TraceInst::Nop;
-                            trace.stats.eliminated_boxes += 1;
-                            changed = true;
-                        }
-                    }
-                    TraceInst::BoxUInt32 { value } => {
-                        if let Some((_, TraceInst::GuardUInt32 { value: tagged, .. })) = Self::producer(trace, value) {
-                            Self::alias_value(trace, result, tagged);
-                            trace.nodes[index].kind = TraceInst::Nop;
-                            trace.stats.eliminated_boxes += 1;
-                            changed = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if !changed { break; }
-        }
-    }
-
-    fn hoist_invariant_numeric_guards(&self, trace: &mut Trace) {
-        #[derive(Clone, Copy)]
-        struct GuardCandidate {
-            node: usize,
-            result: TraceValueId,
-            source: TraceValueId,
-            rep: TraceRep,
-        }
-
-        let mut candidates = Vec::new();
-        for (node_index, node) in trace.nodes.iter().enumerate() {
-            let Some(result) = node.results.first().copied() else { continue; };
-            let (source, rep) = match &node.kind {
-                TraceInst::GuardF64 { value, .. } => (trace.canonical_value(*value), TraceRep::F64),
-                TraceInst::GuardInt32 { value, .. } => (trace.canonical_value(*value), TraceRep::Int32),
-                TraceInst::GuardUInt32 { value, .. } => (trace.canonical_value(*value), TraceRep::UInt32),
-                _ => continue,
-            };
-            let Some(source_value) = trace.value(source) else { continue; };
-            if !matches!(&source_value.origin, TraceValueOrigin::EntrySlot { frame, .. } if frame.0 == 0) {
-                continue;
-            }
-            if source_value.rep != TraceRep::Tagged { continue; }
-            candidates.push(GuardCandidate { node: node_index, result, source, rep });
-        }
-
-        let mut hoisted = HashMap::<(TraceValueId, TraceRep), TraceValueId>::new();
-        for candidate in candidates {
-            let key = (candidate.source, candidate.rep);
-            let guarded = if let Some(value) = hoisted.get(&key).copied() {
-                value
-            } else {
-                let exit = SideExitId(trace.exits.len() as u32);
-                trace.exits.push(SideExit {
-                    id: exit,
-                    target: ExitTarget::Interpreter(trace.anchor.location),
-                    frames: vec![FrameSnapshot {
-                        disposition: FrameDisposition::Existing { depth_from_top: 0 },
-                        writes: Vec::new(),
-                    }],
-                    linked_trace: None,
-                });
-                let id = TraceValueId(trace.values.len() as u32);
-                trace.values.push(TraceValue {
-                    id,
-                    ty: match candidate.rep {
-                        TraceRep::F64 => TraceType::F64,
-                        TraceRep::Int32 => TraceType::Int32,
-                        TraceRep::UInt32 => TraceType::UInt32,
-                        _ => unreachable!(),
-                    },
-                    rep: candidate.rep,
-                    origin: TraceValueOrigin::GuardedEntry {
-                        value: candidate.source,
-                        exit,
-                    },
-                });
-                hoisted.insert(key, id);
-                id
-            };
-
-            Self::alias_value(trace, candidate.result, guarded);
-            trace.nodes[candidate.node].kind = TraceInst::Nop;
-            trace.stats.eliminated_guards += 1;
-        }
-    }
-
-    fn promote_loop_representations(&self, trace: &mut Trace) {
-        #[derive(Clone, Copy)]
-        struct Candidate {
-            phi_index: usize,
-            phi_value: TraceValueId,
-            boxed_backedge: TraceValueId,
-            raw_backedge: TraceValueId,
-            rep: TraceRep,
-        }
-
-        let mut candidates = Vec::new();
-        for (phi_index, phi) in trace.loop_phis.iter().enumerate() {
-            if phi.rep != TraceRep::Tagged || phi.entry_exit.is_some() { continue; }
-            let Some(backedge) = phi.backedge.map(|v| trace.canonical_value(v)) else { continue; };
-            let Some((_, producer)) = Self::producer(trace, backedge) else { continue; };
-            let (raw_backedge, rep) = match producer {
-                TraceInst::BoxF64 { value } => (trace.canonical_value(value), TraceRep::F64),
-                TraceInst::BoxInt32 { value } => (trace.canonical_value(value), TraceRep::Int32),
-                TraceInst::BoxUInt32 { value } => (trace.canonical_value(value), TraceRep::UInt32),
-                _ => continue,
-            };
-            if trace.value(raw_backedge).map(|v| v.rep) != Some(rep) { continue; }
-
-            // Every hot-path use of the tagged phi must be the matching unbox
-            // guard. Snapshot uses are fine: they remember target_rep=Tagged and
-            // are re-boxed only when the side exit is actually taken.
-            let mut compatible = true;
-            for node in &trace.nodes {
-                let mut saw = false;
-                let mut cloned = node.kind.clone();
-                cloned.visit_operands(|operand| {
-                    if trace.canonical_value(*operand) == phi.value { saw = true; }
-                });
-                if !saw { continue; }
-                compatible &= match (&node.kind, rep) {
-                    (TraceInst::GuardF64 { value, .. }, TraceRep::F64) => trace.canonical_value(*value) == phi.value,
-                    (TraceInst::GuardInt32 { value, .. }, TraceRep::Int32) => trace.canonical_value(*value) == phi.value,
-                    (TraceInst::GuardUInt32 { value, .. }, TraceRep::UInt32) => trace.canonical_value(*value) == phi.value,
-                    _ => false,
-                };
-                if !compatible { break; }
-            }
-            if !compatible { continue; }
-
-            candidates.push(Candidate {
-                phi_index,
-                phi_value: phi.value,
-                boxed_backedge: backedge,
-                raw_backedge,
-                rep,
-            });
-        }
-
-        for candidate in candidates {
-            // A guard failure before the first native iteration has not mutated
-            // architectural state, so the correct resume point is simply the root
-            // trace header and no register reconstruction is required.
-            let entry_exit = SideExitId(trace.exits.len() as u32);
-            trace.exits.push(SideExit {
-                id: entry_exit,
-                target: ExitTarget::Interpreter(trace.anchor.location),
-                frames: vec![FrameSnapshot {
-                    disposition: FrameDisposition::Existing { depth_from_top: 0 },
-                    writes: Vec::new(),
-                }],
-                linked_trace: None,
-            });
-
-            {
-                let phi = &mut trace.loop_phis[candidate.phi_index];
-                phi.rep = candidate.rep;
-                phi.backedge = Some(candidate.raw_backedge);
-                phi.entry_exit = Some(entry_exit);
-            }
-            if let Some(value) = trace.value_mut(candidate.phi_value) {
-                value.rep = candidate.rep;
-                value.ty = match candidate.rep {
-                    TraceRep::F64 => TraceType::F64,
-                    TraceRep::Int32 => TraceType::Int32,
-                    TraceRep::UInt32 => TraceType::UInt32,
-                    _ => value.ty,
-                };
-            }
-
-            // Remove the per-iteration guard/unbox. The entry guard installed on
-            // the LoopPhi establishes the invariant once.
-            for index in 0..trace.nodes.len() {
-                let kind = trace.nodes[index].kind.clone();
-                let Some(result) = trace.nodes[index].results.first().copied() else { continue; };
-                let matches = match kind {
-                    TraceInst::GuardF64 { value, .. } if candidate.rep == TraceRep::F64 => {
-                        trace.canonical_value(value) == candidate.phi_value
-                    }
-                    TraceInst::GuardInt32 { value, .. } if candidate.rep == TraceRep::Int32 => {
-                        trace.canonical_value(value) == candidate.phi_value
-                    }
-                    TraceInst::GuardUInt32 { value, .. } if candidate.rep == TraceRep::UInt32 => {
-                        trace.canonical_value(value) == candidate.phi_value
-                    }
-                    _ => false,
-                };
-                if matches {
-                    Self::alias_value(trace, result, candidate.phi_value);
-                    trace.nodes[index].kind = TraceInst::Nop;
-                    trace.stats.eliminated_guards += 1;
-                }
-            }
-
-            // Any exit that used the boxed backedge can materialize the raw value
-            // directly into its original Tagged target representation.
-            let canonical_values: Vec<_> = (0..trace.values.len())
-                .map(|index| trace.canonical_value(TraceValueId(index as u32)))
-                .collect();
-            for exit in &mut trace.exits {
-                for frame in &mut exit.frames {
-                    for write in &mut frame.writes {
-                        if let SnapshotValue::Value(value) = write.value {
-                            if canonical_values[value.0 as usize] == candidate.boxed_backedge {
-                                write.value = SnapshotValue::Value(candidate.raw_backedge);
-                            }
-                        }
-                    }
-                }
-            }
-
-            match candidate.rep {
-                TraceRep::F64 => trace.stats.promoted_f64_loop_phis += 1,
-                TraceRep::Int32 => trace.stats.promoted_i32_loop_phis += 1,
-                TraceRep::UInt32 => trace.stats.promoted_u32_loop_phis += 1,
-                _ => {}
-            }
-        }
-    }
-
-    fn remove_trivial_copies(&self, trace: &mut Trace) {
-        for index in 0..trace.nodes.len() {
-            let kind = trace.nodes[index].kind.clone();
-            let Some(result) = trace.nodes[index].results.first().copied() else { continue; };
-            match kind {
-                TraceInst::Copy { value } => {
-                    let value = trace.canonical_value(value);
-                    if trace.value(value).map(|v| v.rep) == trace.value(result).map(|v| v.rep) {
-                        Self::alias_value(trace, result, value);
-                        trace.nodes[index].kind = TraceInst::Nop;
-                        trace.stats.eliminated_copies += 1;
-                    }
-                }
-                TraceInst::Reinterpret { value } => {
-                    let value = trace.canonical_value(value);
-                    if trace.value(value).map(|v| v.rep) == trace.value(result).map(|v| v.rep) {
-                        Self::alias_value(trace, result, value);
-                        trace.nodes[index].kind = TraceInst::Nop;
-                        trace.stats.eliminated_copies += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn used_values(trace: &Trace) -> HashSet<TraceValueId> {
-        let mut used = HashSet::new();
-        for node in &trace.nodes {
-            let mut kind = node.kind.clone();
-            kind.visit_operands(|value| { used.insert(trace.canonical_value(*value)); });
-        }
-        for exit in &trace.exits {
-            for frame in &exit.frames {
-                for write in &frame.writes {
-                    if let SnapshotValue::Value(value) = write.value {
-                        used.insert(trace.canonical_value(value));
-                    }
-                }
-            }
-        }
-        for phi in &trace.loop_phis {
-            used.insert(trace.canonical_value(phi.initial));
-            if let Some(backedge) = phi.backedge { used.insert(trace.canonical_value(backedge)); }
-        }
-        used
-    }
-
-    fn remove_dead_box_nodes(&self, trace: &mut Trace) {
-        let used = Self::used_values(trace);
-        let canonical_values: Vec<_> = (0..trace.values.len())
-            .map(|index| trace.canonical_value(TraceValueId(index as u32)))
-            .collect();
-        let mut eliminated_boxes = 0usize;
-        for node in &mut trace.nodes {
-            let Some(result) = node.results.first().copied() else { continue; };
-            if used.contains(&canonical_values[result.0 as usize]) { continue; }
-            if matches!(&node.kind, TraceInst::BoxF64 { .. } | TraceInst::BoxInt32 { .. } | TraceInst::BoxUInt32 { .. } | TraceInst::Copy { .. } | TraceInst::Reinterpret { .. }) {
-                if matches!(&node.kind, TraceInst::BoxF64 { .. } | TraceInst::BoxInt32 { .. } | TraceInst::BoxUInt32 { .. }) {
-                    eliminated_boxes += 1;
-                }
-                node.kind = TraceInst::Nop;
-            }
-        }
-        trace.stats.eliminated_boxes += eliminated_boxes;
-    }
-
-    fn canonicalize_references(&self, trace: &mut Trace) {
-        // Snapshot references are particularly important because Cranelift side-exit
-        // blocks materialize them out-of-line from the hot loop.
-        let aliases: Vec<_> = (0..trace.values.len())
-            .map(|index| {
-                let id = TraceValueId(index as u32);
-                (id, trace.canonical_value(id))
-            })
-            .collect();
-        for (from, to) in aliases {
-            if from == to { continue; }
-            for node in &mut trace.nodes { node.kind.replace_operand(from, to); }
-            for exit in &mut trace.exits {
-                for frame in &mut exit.frames {
-                    for write in &mut frame.writes {
-                        if write.value == SnapshotValue::Value(from) { write.value = SnapshotValue::Value(to); }
-                    }
-                }
-            }
-            for phi in &mut trace.loop_phis {
-                if phi.initial == from { phi.initial = to; }
-                if phi.backedge == Some(from) { phi.backedge = Some(to); }
-            }
-        }
-    }
-}
+// Compatibility for callers using the original optimizer path.
+pub use crate::wren_trace_ir_optimizer::TraceOptimizer;
 
 #[cfg(test)]
 mod optimizer_tests {
