@@ -7,7 +7,7 @@
 use crate::wren_interpreter::{
     num_to_u32, BuiltinClass, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
-use crate::wren_ir::{BuiltinId, MethodKind, MethodSymbol, PrimitiveId, Program};
+use crate::wren_ir::{Builder, BuiltinId, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,6 +30,7 @@ pub struct BuiltinManifest {
     bindings: Vec<PrimitiveBinding>,
     native_bindings: Vec<NativeBinding>,
     primitives: Vec<Option<BuiltinPrimitive>>,
+    list_remove: Option<(MethodSymbol, FuncId)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,6 +158,7 @@ enum BuiltinPrimitive {
     StringFromCodePoint,
 
     ListCount,
+    ListConcat,
     ListAdd,
     ListInsert,
     ListRemoveAt,
@@ -173,6 +175,7 @@ enum BuiltinPrimitive {
     MapSubscript,
     MapSubscriptSet,
     MapRemove,
+    MapClear,
     MapIterate,
     MapIteratorValue,
     MapToString,
@@ -289,6 +292,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let list = instance(BuiltinClass::List);
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::ListCount),
+        ("+", MethodKind::Method, 1, BuiltinPrimitive::ListConcat),
         ("add", MethodKind::Method, 1, BuiltinPrimitive::ListAdd),
         ("insert", MethodKind::Method, 2, BuiltinPrimitive::ListInsert),
         ("removeAt", MethodKind::Method, 1, BuiltinPrimitive::ListRemoveAt),
@@ -302,6 +306,41 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         manifest.register(program, list, name, kind, arity, op);
     }
     manifest.register(program, static_(BuiltinId::List), "filled", MethodKind::Method, 2, BuiltinPrimitive::ListFilled);
+    let remove = program.intern_method("remove", MethodKind::Method, 1);
+    let equals = program.intern_method("==", MethodKind::Method, 1);
+    let module = program.add_module("<core:list>", 0);
+    let mut b = Builder::new(program, module, "List.remove", FunctionKind::Method,
+        vec![Type::List(None), Type::Top], Type::Top);
+    let list = b.param(0);
+    let value = b.param(1);
+    let header = b.new_block(&[]);
+    let index = b.add_block_param(header, Type::Int32);
+    let body = b.new_block(&[]);
+    let found = b.new_block(&[]);
+    let advance = b.new_block(&[]);
+    let missing = b.new_block(&[]);
+    let zero = b.const_i32(0);
+    b.jump(header, vec![zero]);
+    b.position_at(header);
+    let len = b.emit1(Inst::ListLen { list }, Type::Int32);
+    let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+    b.branch(more, body, vec![], missing, vec![]);
+    b.position_at(body);
+    let item = b.emit1(Inst::ListGet { list, index }, Type::Top);
+    // Dispatch == normally: user-defined equality can execute Wren and trigger GC.
+    let equal = b.invoke(item, equals, vec![value]);
+    b.branch(equal, found, vec![], advance, vec![]);
+    b.position_at(found);
+    let removed = b.emit1(Inst::ListRemoveAt { list, index }, Type::Top);
+    b.ret(removed);
+    b.position_at(advance);
+    let one = b.const_i32(1);
+    let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+    b.jump(header, vec![next]);
+    b.position_at(missing);
+    let null = b.const_null();
+    b.ret(null);
+    manifest.list_remove = Some((remove, b.finish()));
 
     // Map.
     let map = instance(BuiltinClass::Map);
@@ -311,6 +350,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("[]", MethodKind::SubscriptGetter, 1, BuiltinPrimitive::MapSubscript),
         ("[]=", MethodKind::SubscriptSetter, 2, BuiltinPrimitive::MapSubscriptSet),
         ("remove", MethodKind::Method, 1, BuiltinPrimitive::MapRemove),
+        ("clear", MethodKind::Method, 0, BuiltinPrimitive::MapClear),
         ("iterate", MethodKind::Method, 1, BuiltinPrimitive::MapIterate),
         ("iteratorValue", MethodKind::Method, 1, BuiltinPrimitive::MapIteratorValue),
         ("toString", MethodKind::Getter, 0, BuiltinPrimitive::MapToString),
@@ -382,6 +422,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
 
 /// Connects the already-reserved manifest to a concrete interpreter.
 pub fn install_vm_builtins(interpreter: &mut Interpreter<'_>, manifest: &BuiltinManifest) {
+    if let Some((method, function)) = manifest.list_remove {
+        interpreter.bind_builtin_function(BuiltinClass::List, method, function);
+    }
     for binding in manifest.bindings() {
         match binding.target {
             BuiltinTarget::Instance(class) => {
@@ -669,6 +712,21 @@ fn execute_primitive(
         }
 
         ListCount => Ok(Value::from_num(context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))? as f64)),
+        ListConcat => {
+            let rhs = argument(args, 0)?;
+            let left_len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            let right_len = context.list_len(rhs).ok_or_else(|| RuntimeError::new("List.+ expects List"))?;
+            let capacity = left_len.checked_add(right_len)
+                .ok_or_else(|| RuntimeError::new("concatenated list is too large"))?;
+            let mut values = Vec::with_capacity(capacity);
+            for (list, len) in [(this, left_len), (rhs, right_len)] {
+                for index in 0..len {
+                    values.push(context.list_get(list, index)
+                        .ok_or_else(|| RuntimeError::new("list index out of bounds"))?);
+                }
+            }
+            Ok(context.allocate_list(values))
+        }
         ListAdd => context.list_push(this, argument(args,0)?),
         ListInsert => {
             let index = integer(argument(args,0)?, "index")?;
@@ -724,6 +782,7 @@ fn execute_primitive(
         MapSubscript => context.map_get(this, argument(args,0)?),
         MapSubscriptSet => context.map_set(this, argument(args,0)?, argument(args,1)?),
         MapRemove => context.map_remove(this, argument(args,0)?),
+        MapClear => { context.map_clear(this)?; Ok(Value::NULL) }
         MapIterate => {
             let len = context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))?;
             let next = if argument(args,0)?.is_null() { 0 } else { integer(argument(args,0)?, "iterator")? + 1 };

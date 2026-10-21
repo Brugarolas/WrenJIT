@@ -22,6 +22,41 @@ stage. Bytecode lowering has its own options, configurable through
 after HIR optimization. `wren_bytecodecompiler` remains the direct backend API
 for callers that already prepared their HIR.
 
+### List and string concatenation
+
+`list.remove(value)` removes and returns the first matching element, or returns
+`null` without modifying the list if no match exists. Matching dispatches the
+element's `==` operator, including user-defined equality; strings compare by
+contents. `removeAt(index)` remains the index-based alternative.
+
+`List + List` returns a new list containing the left elements followed by the
+right elements. Neither operand is modified; nested objects remain shared
+(a shallow copy). Empty operands and concatenation of a list with itself are
+supported. `String + String` concatenates strings, including Unicode text.
+Both operators require the right operand to have the same type as the receiver.
+These heap-allocating operations currently execute in the interpreter, not as
+direct native JIT instructions.
+
+```wren
+var combined = ["a", "b", "c"] + ["d", "e", "f"]
+System.print(combined) // [a, b, c, d, e, f]
+System.print("hello" + " world") // hello world
+```
+
+### Map removal and clearing
+
+`map.remove(key)` removes the key and returns its stored value, or `null` if the
+key was absent. A key whose stored value is `null` is still removed.
+`map.clear()` removes all entries in place and returns `null`. All aliases see
+the emptied map, which can immediately be reused.
+
+```wren
+var capitals = {"Georgia": "Atlanta"}
+System.print(capitals.remove("Georgia")) // Atlanta
+capitals.clear()
+System.print(capitals.count) // 0
+```
+
 ### Ranges and list slices
 
 Numeric `from..to` ranges include the endpoint; `from...to` ranges exclude it.

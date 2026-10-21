@@ -1243,6 +1243,13 @@ impl HostContext<'_> {
         }
     }
 
+    pub fn map_clear(&mut self, value: Value) -> Result<(), RuntimeError> {
+        match self.heap.get_mut(value) {
+            Some(HeapObject::Map(map)) => { map.entries.clear(); Ok(()) }
+            _ => Err(RuntimeError::new("receiver is not a Map")),
+        }
+    }
+
     pub fn map_contains_key(&self, value: Value, key: Value) -> Result<bool, RuntimeError> {
         let key = self.map_key(key)?;
         match self.heap.get(value) {
@@ -2907,6 +2914,16 @@ impl<'p> Interpreter<'p> {
         for function in &mut self.inline_caches {
             for cache in function { *cache = InlineCacheState::default(); }
         }
+    }
+
+    pub fn bind_builtin_function(&mut self, class: BuiltinClass, method: MethodSymbol, function: FuncId) {
+        let function = *self.prepared.function_by_id.get(&function)
+            .expect("builtin function must exist in the compiled program");
+        self.invalidate_method_traces();
+        let slot = self.builtin_methods.get_mut(class as usize)
+            .and_then(|table| table.get_mut(method.0 as usize))
+            .expect("builtin method must exist in the compiled program");
+        *slot = Some(CallTarget::Bytecode(function));
     }
 
     pub fn bind_builtin_primitive(&mut self, class: BuiltinClass, method: MethodSymbol, primitive: PrimitiveId) {
@@ -5997,6 +6014,216 @@ mod tests {
                 assert!(stats.native_iterations > 400,
                     "{expression}, optimize={optimize_trace_ir}: {stats:?}");
             }
+        }
+    }
+
+    #[test]
+    fn source_map_remove_returns_the_stored_value() {
+        for (source, expected) in [
+            (r#"var capitals = {"Georgia": "Atlanta", "Idaho": "Boise"}
+                var removed = capitals.remove("Georgia")
+                return removed + ":" + capitals.count.toString + ":" + capitals.containsKey("Georgia").toString"#,
+                "Atlanta:1:false"),
+            (r#"var capitals = {"Georgia": null}
+                var removed = capitals.remove("Georgia")
+                return removed.toString + ":" + capitals.count.toString + ":" + capitals.containsKey("Georgia").toString"#,
+                "null:0:false"),
+            (r#"var capitals = {"Georgia": "Atlanta"}
+                var removed = capitals.remove("Idaho")
+                return removed.toString + ":" + capitals.count.toString"#, "null:1"),
+            (r#"var capitals = {}
+                return capitals.remove("Georgia").toString"#, "null"),
+            (r#"var value = [1]
+                var map = {"key": value}
+                var removed = map.remove("key")
+                removed.add(2)
+                System.gc()
+                return value.toString + ":" + map.count.toString"#, "[1, 2]:0"),
+        ] {
+            let (program, entry, manifest) = compile_local_wren(source);
+            for jit_enabled in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+                vm.run_module(entry).unwrap_or_else(|error| panic!("{source}: {error:?}"));
+                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let context = HostContext { heap: &mut vm.heap };
+                assert_eq!(context.format_value(value), expected, "{source}, jit={jit_enabled}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_map_clear_empties_aliases_and_allows_reuse() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var capitals = {"Georgia": "Atlanta", "Idaho": null, "Maine": [1, 2]}
+            var alias = capitals
+            var result = capitals.clear()
+            if (result != null) return -1
+            if (capitals.count != 0) return -2
+            if (alias.count != 0) return -3
+            if (capitals.containsKey("Georgia")) return -4
+            if (capitals.containsKey("Idaho")) return -5
+            if (capitals.containsKey("Maine")) return -6
+            if (capitals["Georgia"] != null) return -7
+            capitals.clear()
+            System.gc()
+            capitals["Georgia"] = "Atlanta"
+            if (alias["Georgia"] != "Atlanta") return -8
+            if (alias.remove("Georgia") != "Atlanta") return -9
+            if (capitals.count != 0) return -10
+            var empty = {}
+            empty.clear()
+            return empty.count + 42
+        "#);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 42.0, "jit={jit_enabled}");
+        }
+    }
+
+    #[test]
+    fn source_list_remove_returns_first_match_or_null() {
+        for (source, expected) in [
+            (r#"var xs = ["a", "b", "c", "d"]
+                var removed = xs.remove("a")
+                return removed + xs.toString"#, "a[b, c, d]"),
+            (r#"var xs = [1, 2, 1]
+                var removed = xs.remove(1)
+                return removed.toString + xs.toString"#, "1[2, 1]"),
+            (r#"var xs = [1, 2, 3]
+                var removed = xs.remove(3)
+                return removed.toString + xs.toString"#, "3[1, 2]"),
+            (r#"var xs = ["a"]
+                var removed = xs.remove("not found")
+                return removed.toString + xs.toString"#, "null[a]"),
+            (r#"var xs = []
+                return xs.remove(1).toString + xs.toString"#, "null[]"),
+            (r#"var xs = [false, null, true]
+                xs.remove(null)
+                xs.remove(true)
+                return xs.toString"#, "[false]"),
+            (r#"var xs = [0, 1]
+                xs.remove(-0)
+                return xs.toString"#, "[1]"),
+            (r#"var xs = [Num.nan, 1]
+                xs.remove(Num.nan)
+                return xs.count.toString"#, "2"),
+            (r#"var xs = ["a" + "b", "tail"]
+                xs.remove("ab")
+                return xs.toString"#, "[tail]"),
+            (r#"var item = [1]
+                var xs = [[1], item]
+                xs.remove(item)
+                return xs.count.toString"#, "1"),
+        ] {
+            let (program, entry, manifest) = compile_local_wren(source);
+            for jit_enabled in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+                vm.run_module(entry).unwrap_or_else(|error| panic!("{source}: {error:?}"));
+                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let context = HostContext { heap: &mut vm.heap };
+                assert_eq!(context.format_value(value), expected, "{source}, jit={jit_enabled}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_list_remove_dispatches_user_equality() {
+        let source = r#"
+            class Match {
+                construct new(value) { _value = value }
+                ==(other) {
+                    System.gc()
+                    return _value == other
+                }
+            }
+            var first = Match.new(1)
+            var second = Match.new(2)
+            var items = [first, second, Match.new(2)]
+            var removed = items.remove(2)
+            var result = items.count * 10
+            if (removed == 2) result = result + 1
+        "#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 21.0);
+        }
+    }
+
+    #[test]
+    fn source_list_and_string_concatenation() {
+        for (expression, expected) in [
+            ("[\"a\", \"b\", \"c\"] + [\"d\", \"e\", \"f\"]", "[a, b, c, d, e, f]"),
+            ("[] + []", "[]"),
+            ("[] + [1, null, true]", "[1, null, true]"),
+            ("[1, null, true] + []", "[1, null, true]"),
+            ("[1] + [2] + [3]", "[1, 2, 3]"),
+            ("[[1]] + [[2]]", "[[1], [2]]"),
+            ("\"hello\" + \" world\"", "hello world"),
+            ("\"\" + \"\"", ""),
+            ("\"\" + \"hello\"", "hello"),
+            ("\"hello\" + \"\"", "hello"),
+            ("\"a\" + \"b\" + \"c\"", "abc"),
+            ("\"\\u00e1\" + \"\\u03bb\"", "\u{e1}\u{3bb}"),
+        ] {
+            let (program, entry, manifest) = compile_wren_module(&format!("var result = {expression}\n"));
+            for jit_enabled in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+                vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
+                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let context = HostContext { heap: &mut vm.heap };
+                assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_list_concatenation_is_a_shallow_copy() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var left = [[1], 2]
+            var right = [3]
+            var combined = left + right
+            combined[1] = 99
+            combined[2] = 88
+            combined[0][0] = 5
+            combined.add(10)
+            var twice = right + right
+            twice[0] = 100
+            var empty = []
+            var copy = empty + empty
+            copy.add(7)
+            return left[0][0] + left[1] + right[0] + left.count + right.count + twice[1] + empty.count
+        "#);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 16.0);
+        }
+    }
+
+    #[test]
+    fn source_concatenation_rejects_wrong_operand_types() {
+        for (expression, expected) in [
+            ("[] + 1", "List.+ expects List"),
+            ("[] + null", "List.+ expects List"),
+            ("[] + \"text\"", "List.+ expects List"),
+            ("\"text\" + []", "String.+ expects String"),
+            ("\"text\" + 1", "String.+ expects String"),
+            ("\"text\" + null", "String.+ expects String"),
+        ] {
+            let (program, entry, manifest) = compile_wren_module(&format!("{expression}\n"));
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(None);
+            let error = vm.run_module(entry).err().expect(expression);
+            assert!(error.message.contains(expected), "{expression}: {error:?}");
         }
     }
 
