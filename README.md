@@ -136,9 +136,26 @@ Remove-Item Env:WREN_JIT_STATS
 `WREN_JIT_EVENTS=1` also logs recording/compilation events. `WREN_NO_JIT=1`
 selects this project's interpreter for a comparison without native traces.
 
-The tracing tier currently specializes numeric operations on local registers.
-Unsupported operations, including unsigned bitwise methods and module variable
-accesses, fall back to the interpreter.
+The tracing tier specializes numeric operations on local registers, including
+arithmetic, comparisons, unsigned bitwise methods, and floating remainder
+(`%` and the typed `FRem` bytecode).
+
+Numeric getters `abs`, `floor`, `ceil`, and `sqrt` lower to native Cranelift
+operations. `round`, `sin`, `cos`, `tan`, `log`, and `exp` use scalar-only native
+helpers with the same Rust `f64` semantics as the interpreter. Remainder also
+uses a scalar helper, preserving signed zero, NaN, infinity, and division-by-zero
+behavior without approximating it as `a - trunc(a / b) * b`. These helpers
+neither reenter the interpreter nor allocate or access the GC heap.
+`isNan`, `isInfinity`, and `isInteger` lower to native comparisons and selection;
+infinities and NaN are not integers. Num specialization requires the host to
+confirm the standard builtin implementation and guards receivers as numbers.
+All these operations work with the default `no_runtime_calls_in_native_trace`
+restriction; pure scalar math helpers are not VM runtime calls.
+
+Heap operations such as range creation and list slicing still require the
+interpreter. The optional synchronized runtime bridge can execute other
+bytecodes from a trace when `no_runtime_calls_in_native_trace` is false, but it
+is not direct native lowering and remains disabled by default.
 
 The performance fixes cover three cases:
 

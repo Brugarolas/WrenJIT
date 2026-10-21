@@ -191,6 +191,25 @@ fn state(vm: &mut Interpreter<'_>) -> String {
 }
 
 #[test]
+fn floating_remainder_executes_without_interpreter_callbacks() {
+    let program = program_for(Opcode::FRem);
+    for lhs in [-0.0, 0.0, -7.5, 7.5, f64::MAX, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        for rhs in [-0.0, 0.0, -2.0, 2.0, f64::INFINITY, f64::NAN] {
+            let mut native = setup(&program, Opcode::FRem);
+            native.trace_write_slot(FrameSlot::General(Reg(1)), f64_word(lhs)).unwrap();
+            native.trace_write_slot(FrameSlot::General(Reg(2)), f64_word(rhs)).unwrap();
+            let mut jit = TracingJit::new(TracingJitOptions::default());
+            jit.execute_one_for_test(&mut native).unwrap();
+            assert_eq!(jit.stats().native_entries, 1);
+            let actual = f64::from_bits(native.trace_read_slot(FrameSlot::General(Reg(0))).unwrap().0);
+            let expected = lhs % rhs;
+            assert!(if expected.is_nan() { actual.is_nan() }
+                else { actual.to_bits() == expected.to_bits() }, "{lhs:?} % {rhs:?}: {actual:?}");
+        }
+    }
+}
+
+#[test]
 fn all_122_opcodes_execute_in_native_traces_like_the_interpreter() {
     let mut count = 0;
     for raw in 0..=u8::MAX {

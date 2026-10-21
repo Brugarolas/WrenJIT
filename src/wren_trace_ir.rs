@@ -59,6 +59,8 @@ pub enum TraceValueOrigin {
 pub struct TraceValue { pub id: TraceValueId, pub ty: TraceType, pub rep: TraceRep, pub origin: TraceValueOrigin }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TraceSwitchGuard { Case(i64), Default { excluded: Vec<i64> } }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TraceMathOp { Abs, Floor, Ceil, Sqrt, Round, Sin, Cos, Tan, Log, Exp }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TraceInst {
     Nop,
@@ -82,6 +84,7 @@ pub enum TraceInst {
     IntBinary { op: IntBinOp, lhs: TraceValueId, rhs: TraceValueId },
     IntBinaryChecked { op: IntBinOp, lhs: TraceValueId, rhs: TraceValueId, exit: SideExitId },
     F64Unary { op: F64UnaryOp, value: TraceValueId },
+    F64Math { op: TraceMathOp, value: TraceValueId },
     F64Binary { op: F64BinOp, lhs: TraceValueId, rhs: TraceValueId },
     IntCompare { op: CmpKind, lhs: TraceValueId, rhs: TraceValueId },
     F64Compare { op: CmpKind, lhs: TraceValueId, rhs: TraceValueId },
@@ -101,7 +104,7 @@ impl TraceInst {
             Copy { value } | Reinterpret { value } | CommitFrameSlot { value, .. } | GuardTruthy { value, .. }
             | GuardFalsey { value, .. } | GuardNotNull { value, .. } | GuardF64 { value, .. }
             | GuardInt32 { value, .. } | GuardUInt32 { value, .. } | GuardType { value, .. } | IntUnary { value, .. }
-            | F64Unary { value, .. } | IsNull { value } | BoxInt32 { value } | BoxUInt32 { value } | BoxF64 { value }
+            | F64Unary { value, .. } | F64Math { value, .. } | IsNull { value } | BoxInt32 { value } | BoxUInt32 { value } | BoxF64 { value }
             | Int32ToF64 { value } | UInt32ToF64 { value } | F64ToInt32 { value, .. } | TaggedToHeapHandle { value, .. }
             | ReadBarrier { value } => f(value),
             GuardBounds { index, length, .. } => { f(index); f(length); },
@@ -125,7 +128,7 @@ impl TraceInst {
             | IntBinary { op: IntBinOp::Add | IntBinOp::Sub | IntBinOp::Mul
                 | IntBinOp::BitAnd | IntBinOp::BitOr | IntBinOp::BitXor
                 | IntBinOp::Shl | IntBinOp::ShrU | IntBinOp::Sar, .. }
-            | F64Unary { .. } | F64Binary { .. } | IntCompare { .. }
+            | F64Unary { .. } | F64Math { .. } | F64Binary { .. } | IntCompare { .. }
             | F64Compare { .. } | RefEq { .. } | IsNull { .. } | Select { .. }
             | BoxInt32 { .. } | BoxUInt32 { .. } | BoxF64 { .. }
             | Int32ToF64 { .. } | UInt32ToF64 { .. })

@@ -65,7 +65,7 @@ use crate::wren_trace_ir::{
     verify_trace, ExitReason, ExitTarget, FrameDisposition, FrameSlot,
     SnapshotValue, SideExit, SideExitId, Trace, TraceAnchor, TraceClass,
     TraceConstant, TraceId, TraceInst, TraceKind, TraceLocation,
-    TraceRep, TraceSwitchGuard, TraceTerminator, TraceType, TraceValueId,
+    TraceRep, TraceSwitchGuard, TraceMathOp, TraceTerminator, TraceType, TraceValueId,
     TraceValueOrigin,
 };
 
@@ -138,6 +138,15 @@ fn num_word(value: f64) -> RegisterWord {
         value.to_bits()
     })
 }
+
+// Scalar-only helpers: these cannot allocate, access VM state or trigger GC.
+extern "C" fn native_frem(lhs: f64, rhs: f64) -> f64 { lhs % rhs }
+extern "C" fn native_round(value: f64) -> f64 { value.round() }
+extern "C" fn native_sin(value: f64) -> f64 { value.sin() }
+extern "C" fn native_cos(value: f64) -> f64 { value.cos() }
+extern "C" fn native_tan(value: f64) -> f64 { value.tan() }
+extern "C" fn native_log(value: f64) -> f64 { value.ln() }
+extern "C" fn native_exp(value: f64) -> f64 { value.exp() }
 
 // =============================================================================
 // Native trace ABI
@@ -906,8 +915,10 @@ impl<'a> TraceRecorder<'a> {
         };
         // Arithmetic stays in f64, while Wren bitwise operators use the exact
         // unsigned-u32 coercion domain. Out-of-domain values side-exit to baseline.
-        if !matches!(name, "+" | "-" | "*" | "/" | "<" | "<=" | ">" | ">=" | "==" | "!="
-            | "~" | "&" | "|" | "^" | "<<" | ">>") { return Ok(false); }
+        if !matches!(name, "+" | "-" | "*" | "/" | "%" | "<" | "<=" | ">" | ">=" | "==" | "!="
+            | "~" | "&" | "|" | "^" | "<<" | ">>"
+            | "abs" | "floor" | "ceil" | "sqrt" | "round" | "sin" | "cos" | "tan" | "log" | "exp"
+            | "isNan" | "isInfinity" | "isInteger") { return Ok(false); }
 
         let receiver_word = runtime
             .trace_read_slot(FrameSlot::General(Reg(op.b)))
@@ -926,6 +937,56 @@ impl<'a> TraceRecorder<'a> {
         let resume = op.location.pc;
 
         match (signature.kind, signature.arity, name) {
+            (MethodKind::Getter, 0, "abs" | "floor" | "ceil" | "sqrt" | "round"
+                | "sin" | "cos" | "tan" | "log" | "exp") => {
+                let math_op = match name {
+                    "abs" => TraceMathOp::Abs,
+                    "floor" => TraceMathOp::Floor,
+                    "ceil" => TraceMathOp::Ceil,
+                    "sqrt" => TraceMathOp::Sqrt,
+                    "round" => TraceMathOp::Round,
+                    "sin" => TraceMathOp::Sin,
+                    "cos" => TraceMathOp::Cos,
+                    "tan" => TraceMathOp::Tan,
+                    "log" => TraceMathOp::Log,
+                    "exp" => TraceMathOp::Exp,
+                    _ => unreachable!(),
+                };
+                let value = self.num_to_f64_guard(builder, receiver, resume);
+                let raw = builder.emit1(TraceInst::F64Math { op: math_op, value }, TraceType::F64, TraceRep::F64);
+                let boxed = builder.emit1(TraceInst::BoxF64 { value: raw }, TraceType::Num, TraceRep::Tagged);
+                self.write_gpr(builder, op.a, boxed);
+                return Ok(true);
+            }
+            (MethodKind::Getter, 0, "isNan" | "isInfinity" | "isInteger") => {
+                let raw = self.num_to_f64_guard(builder, receiver, resume);
+                let condition = if name == "isNan" {
+                    builder.emit1(TraceInst::F64Compare { op: CmpKind::Ne, lhs: raw, rhs: raw },
+                        TraceType::Bool, TraceRep::Bool)
+                } else {
+                    let abs = builder.emit1(TraceInst::F64Math { op: TraceMathOp::Abs, value: raw },
+                        TraceType::F64, TraceRep::F64);
+                    let infinity = builder.constant(TraceConstant::F64Bits(f64::INFINITY.to_bits()));
+                    if name == "isInfinity" {
+                        builder.emit1(TraceInst::F64Compare { op: CmpKind::Eq, lhs: abs, rhs: infinity },
+                            TraceType::Bool, TraceRep::Bool)
+                    } else {
+                        let finite = builder.emit1(TraceInst::F64Compare { op: CmpKind::Lt, lhs: abs, rhs: infinity },
+                            TraceType::Bool, TraceRep::Bool);
+                        let floor = builder.emit1(TraceInst::F64Math { op: TraceMathOp::Floor, value: raw },
+                            TraceType::F64, TraceRep::F64);
+                        let integral = builder.emit1(TraceInst::F64Compare { op: CmpKind::Eq, lhs: raw, rhs: floor },
+                            TraceType::Bool, TraceRep::Bool);
+                        let false_value = builder.emit1(TraceInst::F64Compare { op: CmpKind::Lt, lhs: raw, rhs: raw },
+                            TraceType::Bool, TraceRep::Bool);
+                        builder.emit1(TraceInst::Select { condition: finite, if_true: integral, if_false: false_value },
+                            TraceType::Bool, TraceRep::Bool)
+                    }
+                };
+                let boxed = self.tagged_bool(builder, condition);
+                self.write_gpr(builder, op.a, boxed);
+                return Ok(true);
+            }
             // Unary numeric methods.
             (MethodKind::Method, 0, "-") => {
                 let raw = self.num_to_f64_guard(builder, receiver, resume);
@@ -985,7 +1046,7 @@ impl<'a> TraceRecorder<'a> {
         )?;
 
         match name {
-            "+" | "-" | "*" | "/" => {
+            "+" | "-" | "*" | "/" | "%" => {
                 // Wren-visible Num is semantically f64. Keep dynamic Invoke
                 // specialization in that representation until the Cranelift tier
                 // is proven correct with mixed Tagged/Int32 loop-carried values.
@@ -997,6 +1058,7 @@ impl<'a> TraceRecorder<'a> {
                     "-" => F64BinOp::Sub,
                     "*" => F64BinOp::Mul,
                     "/" => F64BinOp::Div,
+                    "%" => F64BinOp::Rem,
                     _ => unreachable!(),
                 };
                 let raw = builder.emit1(
@@ -1068,9 +1130,6 @@ impl<'a> TraceRecorder<'a> {
                 Ok(true)
             }
 
-            // `%` is intentionally not emitted yet. Native floating remainder
-            // has target-specific corner semantics; using a runtime helper later
-            // is safer than silently changing Wren's floating remainder.
             _ => Ok(false),
         }
     }
@@ -1606,7 +1665,7 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
-            FAdd | FSub | FMul | FDiv => {
+            FAdd | FSub | FMul | FDiv | FRem => {
                 let lhs = self.read_gpr(
                     builder,
                     op.b,
@@ -1624,6 +1683,7 @@ impl<'a> TraceRecorder<'a> {
                     FSub => F64BinOp::Sub,
                     FMul => F64BinOp::Mul,
                     FDiv => F64BinOp::Div,
+                    FRem => F64BinOp::Rem,
                     _ => unreachable!(),
                 };
                 let result = builder.emit1(
@@ -1634,8 +1694,6 @@ impl<'a> TraceRecorder<'a> {
                 self.write_gpr(builder, op.a, result);
                 Ok(ExpectedStep::Exact(next))
             }
-
-            FRem => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
 
             ICmpEq | ICmpNe | ICmpLt | ICmpLe | ICmpGt | ICmpGe => {
                 let lhs = self.read_gpr(
@@ -3546,6 +3604,16 @@ impl CraneliftLoweringState<'_, '_> {
         Ok(())
     }
 
+    fn call_scalar_helper(&mut self, address: usize, args: &[Value]) -> Value {
+        let mut signature = Signature::new(self.builder.func.signature.call_conv);
+        signature.params.extend(args.iter().map(|_| AbiParam::new(types::F64)));
+        signature.returns.push(AbiParam::new(types::F64));
+        let signature = self.builder.import_signature(signature);
+        let callee = self.builder.ins().iconst(self.pointer_type, address as i64);
+        let call = self.builder.ins().call_indirect(signature, callee, args);
+        self.builder.inst_results(call)[0]
+    }
+
     fn lower_node(
         &mut self,
         node: &crate::wren_trace_ir::TraceNode,
@@ -3913,6 +3981,29 @@ impl CraneliftLoweringState<'_, '_> {
                 self.cache_value(one_result(node)?, result);
             }
 
+            F64Math { op, value } => {
+                let value = self.lower_value(*value)?;
+                let result = match op {
+                    TraceMathOp::Abs => self.builder.ins().fabs(value),
+                    TraceMathOp::Floor => self.builder.ins().floor(value),
+                    TraceMathOp::Ceil => self.builder.ins().ceil(value),
+                    TraceMathOp::Sqrt => self.builder.ins().sqrt(value),
+                    _ => {
+                        let helper: extern "C" fn(f64) -> f64 = match op {
+                            TraceMathOp::Round => native_round,
+                            TraceMathOp::Sin => native_sin,
+                            TraceMathOp::Cos => native_cos,
+                            TraceMathOp::Tan => native_tan,
+                            TraceMathOp::Log => native_log,
+                            TraceMathOp::Exp => native_exp,
+                            _ => unreachable!(),
+                        };
+                        self.call_scalar_helper(helper as usize, &[value])
+                    }
+                };
+                self.cache_value(one_result(node)?, result);
+            }
+
             F64Binary { op, lhs, rhs } => {
                 let lhs = self.lower_value(*lhs)?;
                 let rhs = self.lower_value(*rhs)?;
@@ -3922,7 +4013,7 @@ impl CraneliftLoweringState<'_, '_> {
                     F64BinOp::Mul => self.builder.ins().fmul(lhs, rhs),
                     F64BinOp::Div => self.builder.ins().fdiv(lhs, rhs),
                     F64BinOp::Rem => {
-                        return Err(self.error("floating remainder helper is not enabled"));
+                        self.call_scalar_helper(native_frem as *const () as usize, &[lhs, rhs])
                     }
                 };
                 self.cache_value(one_result(node)?, result);
@@ -4991,6 +5082,69 @@ impl TracingJit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_math_matches_rust_including_ieee_edge_cases() {
+        unsafe extern "C" fn unexpected_runtime(
+            _: *mut TraceActivation, _: u32, _: u32, _: u32,
+        ) -> u32 { TRACE_RESULT_RUNTIME }
+
+        let inputs = [
+            -0.0, 0.0, -0.5, 0.5, -1.5, 1.5, -2.5, 2.5,
+            f64::MIN_POSITIVE, f64::from_bits(1), -f64::from_bits(1),
+            f64::MAX, -f64::MAX, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+        ];
+        for math_op in [
+            TraceMathOp::Abs, TraceMathOp::Floor, TraceMathOp::Ceil, TraceMathOp::Sqrt,
+            TraceMathOp::Round, TraceMathOp::Sin, TraceMathOp::Cos, TraceMathOp::Tan,
+            TraceMathOp::Log, TraceMathOp::Exp,
+        ] {
+            for optimize in [false, true] {
+                let location = TraceLocation::new(FuncId(0), BytecodePc(0));
+                let mut builder = crate::wren_trace_ir::TraceBuilder::new(
+                    TraceId(0), TraceAnchor { kind: TraceKind::Side, location });
+                let value = builder.read_slot(FrameSlot::General(Reg(0)), TraceType::F64, TraceRep::F64);
+                let result = builder.emit1(TraceInst::F64Math { op: math_op, value },
+                    TraceType::F64, TraceRep::F64);
+                builder.write_slot(FrameSlot::General(Reg(1)), result);
+                let exit = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(1));
+                builder.set_terminator(TraceTerminator::Exit(exit));
+                let mut trace = builder.finish().unwrap();
+                if optimize {
+                    crate::wren_trace_ir_optimizing::optimization_passes().optimize_trace(&mut trace).unwrap();
+                }
+                let mut jit = TracingJit::new(TracingJitOptions::default());
+                let compiled = jit.compile_trace(&trace).unwrap();
+                for input in inputs {
+                    let expected = match math_op {
+                        TraceMathOp::Abs => input.abs(),
+                        TraceMathOp::Floor => input.floor(),
+                        TraceMathOp::Ceil => input.ceil(),
+                        TraceMathOp::Sqrt => input.sqrt(),
+                        TraceMathOp::Round => input.round(),
+                        TraceMathOp::Sin => input.sin(),
+                        TraceMathOp::Cos => input.cos(),
+                        TraceMathOp::Tan => input.tan(),
+                        TraceMathOp::Log => input.ln(),
+                        TraceMathOp::Exp => input.exp(),
+                    };
+                    let mut general = [RegisterWord(input.to_bits()), RegisterWord(0)];
+                    let mut activation = TraceActivation::new(TraceActivationInputs {
+                        general: general.as_mut_ptr(),
+                        arguments: std::ptr::null_mut(), returns: std::ptr::null_mut(),
+                        special: std::ptr::null_mut(), runtime: std::ptr::null_mut(),
+                        execute: unexpected_runtime,
+                    });
+                    activation.current_links = compiled.native_links.as_ptr();
+                    assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    let actual = f64::from_bits(general[1].0);
+                    assert!(if expected.is_nan() { actual.is_nan() }
+                        else { actual.to_bits() == expected.to_bits() },
+                        "{math_op:?}({input:?}), optimize={optimize}: {actual:?} != {expected:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn trace_passes_preserve_native_loop_exits_and_budget_reentry() {

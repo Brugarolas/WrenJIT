@@ -5737,7 +5737,7 @@ impl TraceRuntime for Interpreter<'_> {
         let Some(CallTarget::Primitive(primitive)) = self.builtin_methods[BuiltinClass::Num as usize][cache.method.0 as usize] else { return false; };
         let Some(signature) = self.program.metadata.method(cache.method) else { return false; };
         let name = self.program.metadata.string(signature.name).unwrap_or("");
-        signature.kind == crate::wren_ir::MethodKind::Method
+        matches!(signature.kind, crate::wren_ir::MethodKind::Method | crate::wren_ir::MethodKind::Getter)
             && self.host.standard_numeric_method(primitive, name, signature.arity)
     }
 
@@ -5946,6 +5946,58 @@ mod tests {
 
     fn source_result(vm: &Interpreter<'_>) -> f64 {
         vm.modules.last().unwrap().variables.last().unwrap().as_num().unwrap()
+    }
+
+    #[test]
+    fn jit_numeric_math_getters_and_remainder_stay_in_native_loops() {
+        for expression in [
+            "x.abs", "x.floor", "x.ceil", "x.sqrt", "x.round",
+            "x.sin", "x.cos", "x.tan", "x.log", "x.exp", "x % 3.25",
+            "x.isNan", "x.isInfinity", "x.isInteger",
+            "i.isInteger", "(i - 256).isInteger",
+            "(x / 0).isInfinity", "(0 / 0 + x).isNan",
+            "(x / 0).isInteger", "(0 / 0 + x).isInteger",
+        ] {
+            let boolean = expression.contains(".is");
+            let accumulation = if boolean {
+                "if (value) { total = total + 1 }"
+            } else {
+                "total = total + value"
+            };
+            let source = format!(r#"
+                var i = 0
+                var total = 0
+                while (i < 512) {{
+                    var x = (i - 16.5) / 8
+                    var value = {expression}
+                    {accumulation}
+                    i = i + 1
+                }}
+                return total
+            "#);
+            let (program, entry, manifest) = compile_local_wren(&source);
+            let mut baseline = source_vm(&program, &manifest);
+            baseline.set_jit_options(None);
+            baseline.run_module(entry).unwrap();
+            let expected = source_result(&baseline);
+            for optimize_trace_ir in [false, true] {
+                let mut native = source_vm(&program, &manifest);
+                native.set_jit_options(Some(TracingJitOptions {
+                    hot_loop_threshold: 2,
+                    optimize_trace_ir,
+                    no_runtime_calls_in_native_trace: true,
+                    ..Default::default()
+                }));
+                native.run_module(entry).unwrap();
+                let actual = source_result(&native);
+                assert!(if expected.is_nan() { actual.is_nan() }
+                    else { actual.to_bits() == expected.to_bits() },
+                    "{expression}, optimize={optimize_trace_ir}: {actual:?} != {expected:?}");
+                let stats = native.jit_stats().unwrap();
+                assert!(stats.native_iterations > 400,
+                    "{expression}, optimize={optimize_trace_ir}: {stats:?}");
+            }
+        }
     }
 
     #[test]

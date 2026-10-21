@@ -107,6 +107,8 @@ enum BuiltinPrimitive {
     NumMul,
     NumDiv,
     NumMod,
+    NumInclusiveRange,
+    NumExclusiveRange,
     NumLt,
     NumLe,
     NumGt,
@@ -238,6 +240,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("!=", BuiltinPrimitive::NumNe), ("&", BuiltinPrimitive::NumBitAnd),
         ("|", BuiltinPrimitive::NumBitOr), ("^", BuiltinPrimitive::NumBitXor),
         ("<<", BuiltinPrimitive::NumShl), (">>", BuiltinPrimitive::NumShr),
+        ("..", BuiltinPrimitive::NumInclusiveRange),
+        ("...", BuiltinPrimitive::NumExclusiveRange),
     ] {
         manifest.register(program, n, name, MethodKind::Method, 1, op);
     }
@@ -441,6 +445,19 @@ impl Host for BuiltinHost {
                 | (Some(NumBitXor), "^", 1)
                 | (Some(NumShl), "<<", 1)
                 | (Some(NumShr), ">>", 1)
+                | (Some(NumAbs), "abs", 0)
+                | (Some(NumFloor), "floor", 0)
+                | (Some(NumCeil), "ceil", 0)
+                | (Some(NumSqrt), "sqrt", 0)
+                | (Some(NumRound), "round", 0)
+                | (Some(NumSin), "sin", 0)
+                | (Some(NumCos), "cos", 0)
+                | (Some(NumTan), "tan", 0)
+                | (Some(NumLog), "log", 0)
+                | (Some(NumExp), "exp", 0)
+                | (Some(NumIsNan), "isNan", 0)
+                | (Some(NumIsInfinity), "isInfinity", 0)
+                | (Some(NumIsInteger), "isInteger", 0)
         )
     }
 
@@ -497,6 +514,42 @@ fn normalized_index(index: i64, len: usize) -> Result<usize, RuntimeError> {
     }
 }
 
+fn slice_bounds(
+    from: f64,
+    to: f64,
+    inclusive: bool,
+    len: usize,
+) -> Result<(usize, usize, bool), RuntimeError> {
+    let length = len as f64;
+    // Wren permits an empty copy at the end, including copies of an empty list.
+    if from == length && to == if inclusive { -1.0 } else { length } {
+        return Ok((0, 0, false));
+    }
+    if !from.is_finite() || from.fract() != 0.0 {
+        return Err(RuntimeError::new("range start must be an integer"));
+    }
+    let start = if from < 0.0 { length + from } else { from };
+    if start < 0.0 || start >= length {
+        return Err(RuntimeError::new("range start out of bounds"));
+    }
+    if !to.is_finite() || to.fract() != 0.0 {
+        return Err(RuntimeError::new("range end must be an integer"));
+    }
+    let mut end = if to < 0.0 { length + to } else { to };
+    if !inclusive {
+        if start == end {
+            return Ok((start as usize, 0, false));
+        }
+        end += if end >= start { -1.0 } else { 1.0 };
+    }
+    if end < 0.0 || end >= length {
+        return Err(RuntimeError::new("range end out of bounds"));
+    }
+    let start = start as usize;
+    let end = end as usize;
+    Ok((start, start.abs_diff(end) + 1, end < start))
+}
+
 fn execute_primitive(
     op: BuiltinPrimitive,
     context: &mut HostContext<'_>,
@@ -521,6 +574,11 @@ fn execute_primitive(
         NumMul => Ok(Value::from_num(num(this, "receiver")? * num(argument(args, 0)?, "argument")?)),
         NumDiv => Ok(Value::from_num(num(this, "receiver")? / num(argument(args, 0)?, "argument")?)),
         NumMod => Ok(Value::from_num(num(this, "receiver")? % num(argument(args, 0)?, "argument")?)),
+        NumInclusiveRange | NumExclusiveRange => {
+            let from = num(this, "range start")?;
+            let to = num(argument(args, 0)?, "range end")?;
+            Ok(context.allocate_range(from, to, matches!(op, NumInclusiveRange)))
+        }
         NumLt => Ok(Value::from_bool(num(this, "receiver")? < num(argument(args, 0)?, "argument")?)),
         NumLe => Ok(Value::from_bool(num(this, "receiver")? <= num(argument(args, 0)?, "argument")?)),
         NumGt => Ok(Value::from_bool(num(this, "receiver")? > num(argument(args, 0)?, "argument")?)),
@@ -626,7 +684,18 @@ fn execute_primitive(
         ListClear => { context.list_clear(this)?; Ok(Value::NULL) }
         ListSubscript => {
             let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
-            let index = normalized_index(integer(argument(args,0)?, "index")?, len)?;
+            let subscript = argument(args, 0)?;
+            if let Some((from, to, inclusive)) = context.range_parts(subscript) {
+                let (start, count, reverse) = slice_bounds(from, to, inclusive, len)?;
+                let mut values = Vec::with_capacity(count);
+                for offset in 0..count {
+                    let index = if reverse { start - offset } else { start + offset };
+                    values.push(context.list_get(this, index)
+                        .ok_or_else(|| RuntimeError::new("list index out of bounds"))?);
+                }
+                return Ok(context.allocate_list(values));
+            }
+            let index = normalized_index(integer(subscript, "index")?, len)?;
             context.list_get(this,index).ok_or_else(|| RuntimeError::new("list index out of bounds"))
         }
         ListSubscriptSet => {
