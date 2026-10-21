@@ -294,13 +294,14 @@ pub enum BuiltinId {
     Fiber = 10,
     System = 11,
     Date = 12,
+    Random = 13,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
-        Self::Fiber, Self::System, Self::Date,
+        Self::Fiber, Self::System, Self::Date, Self::Random,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -310,6 +311,7 @@ impl BuiltinId {
             Self::List => "List", Self::Map => "Map", Self::Range => "Range",
             Self::Fn => "Fn", Self::Fiber => "Fiber", Self::System => "System",
             Self::Date => "Date",
+            Self::Random => "Random",
         }
     }
     #[inline] pub const fn index(self) -> usize { self as usize }

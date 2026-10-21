@@ -22,6 +22,28 @@ stage. Bytecode lowering has its own options, configurable through
 after HIR optimization. `wren_bytecodecompiler` remains the direct backend API
 for callers that already prepared their HIR.
 
+### Random numbers and collection getters
+
+`Random` is available as a core global (no import required):
+
+```wren
+var random = Random.new()
+System.print(random.int(3, 10)) // Integer in [3, 10).
+System.print(random.int(4))     // Integer in [0, 4).
+```
+
+Each instance has independent SplitMix64 state, seeded from the standard
+library's randomized hash seed. This is a non-cryptographic generator.
+Integer sampling uses rejection to avoid modulo bias. Bounds must be finite,
+exact integers between -9007199254740991 and 9007199254740991, and the upper
+bound must be greater than the lower bound. Random operations execute in the
+interpreter; they are not native JIT intrinsics.
+
+Getters use no parentheses: `"string".count`, `(1..10).count`, `(1..10).min`,
+`1.23.sin`, and `[1, 2, 3].isEmpty`. Range `count` counts unit-step iteration
+in either direction, respecting inclusive/exclusive endpoints. `isEmpty` is
+also available on strings, maps, and map-key views.
+
 ### List and string concatenation
 
 `list.remove(value)` removes and returns the first matching element, or returns
@@ -44,6 +66,21 @@ System.print("hello" + " world") // hello world
 ```
 
 ### Map removal and clearing
+
+Iterating a map yields entry objects with read-only `key` and `value` getters.
+`map.keys` returns a live iterable view of its keys, with a `count` getter.
+Iteration order is unspecified; do not structurally modify the map during
+iteration. Entries retain the key/value pair captured when they were produced,
+and may be retained after the map is cleared.
+
+```wren
+for (entry in birds) {
+  System.print("The state bird of %(entry.key) is %(entry.value)")
+}
+for (state in birds.keys) {
+  System.print("The state bird of %(state) is " + birds[state])
+}
+```
 
 `map.remove(key)` removes the key and returns its stored value, or `null` if the
 key was absent. A key whose stored value is `null` is still removed.

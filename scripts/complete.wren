@@ -91,7 +91,37 @@ System.print(capitals.containsKey("Idaho"))   //> false
 capitals.remove("Maine")
 System.print(capitals.containsKey("Maine")) //> false
 
-System.print(capitals.remove("Georgia")) //> Atlanta
+System.print(capitals.remove("Georgia")) //> null
 
 capitals.clear()
 System.print(capitals.count) //> 0
+
+var birds = {
+    "Arizona": "Cactus wren",
+    "Hawaii": "Nēnē",
+    "Ohio": "Northern Cardinal"
+}
+
+System.print("***** Iteration with entries over a map! *****")
+for (bird in birds) {
+    System.print("The state bird of %(bird.key) is %(bird.value)")
+}
+
+System.print("***** Iteration with keys over a map! *****")
+for (state in birds.keys) {
+    System.print("The state bird of %(state) is " + birds[state])
+}
+
+System.print("***** Random! *****")
+
+var random = Random.new()
+System.print(random.int(3, 10))
+System.print(random.int(4))
+
+System.print("***** Getters! *****")
+
+System.print("string".count)    //> 6
+System.print((1..10).count)     //> 10
+System.print((1..10).min)       //> 1
+System.print(1.23.sin)          //> 0.9424888019317
+System.print([1, 2, 3].isEmpty) //> false

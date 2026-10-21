@@ -243,9 +243,12 @@ struct WrenMap {
 
 #[derive(Debug)]
 enum HeapObject {
+    Random { state: u64 },
     String(Arc<[u8]>),
     List(Vec<Value>),
     Map(WrenMap),
+    MapEntry { key: Value, value: Value },
+    MapKeys { map: Value },
     Range {
         from: f64,
         to: f64,
@@ -510,6 +513,17 @@ unsafe fn trace_map(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     }
 }
 
+unsafe fn trace_map_view(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    match &unsafe { managed_object(object) }.object {
+        HeapObject::MapEntry { key, value } => {
+            visit_value(*key, visitor);
+            visit_value(*value, visitor);
+        }
+        HeapObject::MapKeys { map } => visit_value(*map, visitor),
+        _ => {}
+    }
+}
+
 unsafe fn trace_cell(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     let managed = unsafe { managed_object(object) };
     if let HeapObject::Cell(value) = &managed.object {
@@ -619,12 +633,14 @@ macro_rules! gc_descriptor {
 
 gc_descriptor!(GC_STRING, "Wren.String", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANGE, "Wren.Range", GcTraceLayout::Leaf);
+gc_descriptor!(GC_RANDOM, "Wren.Random", GcTraceLayout::Leaf);
 gc_descriptor!(GC_CLASS, "Wren.Class", GcTraceLayout::Leaf);
 gc_descriptor!(GC_BUILTIN_CLASS, "Wren.BuiltinClass", GcTraceLayout::Leaf);
 gc_descriptor!(GC_FOREIGN, "Wren.Foreign", GcTraceLayout::Leaf);
 gc_descriptor!(GC_MODULE, "Wren.Module", GcTraceLayout::Leaf);
 gc_descriptor!(GC_LIST, "Wren.List", GcTraceLayout::Custom(trace_list));
 gc_descriptor!(GC_MAP, "Wren.Map", GcTraceLayout::Custom(trace_map));
+gc_descriptor!(GC_MAP_VIEW, "Wren.MapView", GcTraceLayout::Custom(trace_map_view));
 gc_descriptor!(GC_CELL, "Wren.Cell", GcTraceLayout::Custom(trace_cell));
 gc_descriptor!(GC_CLOSURE, "Wren.Closure", GcTraceLayout::Custom(trace_closure));
 gc_descriptor!(GC_INSTANCE, "Wren.Instance", GcTraceLayout::Custom(trace_instance));
@@ -633,9 +649,11 @@ gc_descriptor!(GC_FIBER, "Wren.Fiber", GcTraceLayout::Custom(trace_fiber));
 #[inline(always)]
 fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
     match object {
+        HeapObject::Random { .. } => &GC_RANDOM,
         HeapObject::String(_) => &GC_STRING,
         HeapObject::List(_) => &GC_LIST,
         HeapObject::Map(_) => &GC_MAP,
+        HeapObject::MapEntry { .. } | HeapObject::MapKeys { .. } => &GC_MAP_VIEW,
         HeapObject::Range { .. } => &GC_RANGE,
         HeapObject::Cell(_) => &GC_CELL,
         HeapObject::Closure { .. } => &GC_CLOSURE,
@@ -735,6 +753,11 @@ fn push_value_handle(value: Value, roots: &mut Vec<u32>) {
 
 fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
     match object {
+        HeapObject::MapEntry { key, value } => {
+            push_value_handle(*key, roots);
+            push_value_handle(*value, roots);
+        }
+        HeapObject::MapKeys { map } => push_value_handle(*map, roots),
         HeapObject::List(values) => {
             for &value in values { push_value_handle(value, roots); }
         }
@@ -798,6 +821,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
             }
         }
         HeapObject::String(_)
+        | HeapObject::Random { .. }
         | HeapObject::Range { .. }
         | HeapObject::ClassObject { .. }
         | HeapObject::BuiltinClass { .. }
@@ -1116,6 +1140,23 @@ impl HostContext<'_> {
         self.heap.alloc(HeapObject::Range { from, to, inclusive })
     }
 
+    pub fn allocate_random(&mut self, state: u64) -> Value {
+        self.heap.alloc(HeapObject::Random { state })
+    }
+
+    pub fn random_u64(&mut self, random: Value) -> Result<u64, RuntimeError> {
+        let state = match self.heap.get_mut(random) {
+            Some(HeapObject::Random { state }) => state,
+            _ => return Err(RuntimeError::new("receiver is not Random")),
+        };
+        // SplitMix64: per-instance state; wrapping arithmetic is intentional.
+        *state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut value = *state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+        Ok(value ^ (value >> 31))
+    }
+
     #[inline]
     pub fn list_len(&self, value: Value) -> Option<usize> {
         match self.heap.get(value) { Some(HeapObject::List(list)) => Some(list.len()), _ => None }
@@ -1258,23 +1299,45 @@ impl HostContext<'_> {
         }
     }
 
-    pub fn map_nth_key(&self, value: Value, index: usize) -> Result<Value, RuntimeError> {
+    pub fn map_nth_key(&mut self, value: Value, index: usize) -> Result<Value, RuntimeError> {
         let map = match self.heap.get(value) {
             Some(HeapObject::Map(map)) => map,
             _ => return Err(RuntimeError::new("receiver is not a Map")),
         };
-        let key = map.entries.keys().nth(index).ok_or_else(|| RuntimeError::new("map iterator out of range"))?;
+        let key = map.entries.keys().nth(index).cloned().ok_or_else(|| RuntimeError::new("map iterator out of range"))?;
         Ok(match key {
             MapKey::Null => Value::NULL,
-            MapKey::Bool(value) => Value::from_bool(*value),
-            MapKey::Num(bits) => Value::from_num(f64::from_bits(*bits)),
-            MapKey::String(bytes) => {
-                // Keys own Arc bytes; allocate a Wren string handle for the exposed key.
-                // This is a cold iterator path and avoids retaining internal map keys as handles.
-                return Err(RuntimeError::new(format!("string map-key iteration requires key materialization: {}", String::from_utf8_lossy(bytes))));
-            }
-            MapKey::Object(handle) => Value::from_heap(*handle),
+            MapKey::Bool(value) => Value::from_bool(value),
+            MapKey::Num(bits) => Value::from_num(f64::from_bits(bits)),
+            MapKey::String(bytes) => self.allocate_bytes(bytes),
+            MapKey::Object(handle) => Value::from_heap(handle),
         })
+    }
+
+    pub fn map_nth_entry(&mut self, map: Value, index: usize) -> Result<Value, RuntimeError> {
+        let value = self.map_nth_value(map, index)?;
+        let value = self.root(value);
+        let key = self.map_nth_key(map, index)?;
+        Ok(self.heap.alloc(HeapObject::MapEntry { key, value: value.value() }))
+    }
+
+    pub fn map_keys(&mut self, map: Value) -> Result<Value, RuntimeError> {
+        self.map_len(map).ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
+        Ok(self.heap.alloc(HeapObject::MapKeys { map }))
+    }
+
+    pub fn map_keys_source(&self, value: Value) -> Result<Value, RuntimeError> {
+        match self.heap.get(value) {
+            Some(HeapObject::MapKeys { map }) => Ok(*map),
+            _ => Err(RuntimeError::new("receiver is not a map keys view")),
+        }
+    }
+
+    pub fn map_entry_parts(&self, entry: Value) -> Result<(Value, Value), RuntimeError> {
+        match self.heap.get(entry) {
+            Some(HeapObject::MapEntry { key, value }) => Ok((*key, *value)),
+            _ => Err(RuntimeError::new("receiver is not a map entry")),
+        }
     }
 
     pub fn map_nth_value(&self, value: Value, index: usize) -> Result<Value, RuntimeError> {
@@ -1305,6 +1368,7 @@ impl HostContext<'_> {
         }
         let Some(handle) = value.heap_handle() else { return format!("{value:?}"); };
         match self.heap.get(value) {
+            Some(HeapObject::Random { .. }) => "<random>".to_owned(),
             Some(HeapObject::String(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
             Some(HeapObject::List(values)) => {
                 if !seen.insert(handle) { return "[...]".to_owned(); }
@@ -1322,6 +1386,13 @@ impl HostContext<'_> {
                 let op = if *inclusive { ".." } else { "..." };
                 format!("{from}{op}{to}")
             }
+            Some(HeapObject::MapEntry { key, value }) => {
+                if !seen.insert(handle) { return "<map entry ...>".to_owned(); }
+                let text = format!("{}: {}", self.format_value_inner(*key, seen), self.format_value_inner(*value, seen));
+                seen.remove(&handle);
+                text
+            }
+            Some(HeapObject::MapKeys { .. }) => "<map keys>".to_owned(),
             Some(HeapObject::Closure { .. }) => "<fn>".to_owned(),
             Some(HeapObject::ClassObject { class_slot }) => format!("<class#{class_slot}>"),
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
@@ -2118,9 +2189,12 @@ pub enum BuiltinClass {
     Range,
     Closure,
     Fiber,
+    MapEntry,
+    MapKeys,
+    Random,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 9;
+const BUILTIN_CLASS_COUNT: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -2134,12 +2208,18 @@ const CLASS_KIND_CORE_STATIC: u64 = 5 << 56;
 #[inline(always)]
 fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
     Some(match object {
+        HeapObject::Random { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Random as u64),
         HeapObject::String(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::String as u64),
         HeapObject::List(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::List as u64),
         HeapObject::Map(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Map as u64),
+        HeapObject::MapEntry { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::MapEntry as u64),
+        HeapObject::MapKeys { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::MapKeys as u64),
         HeapObject::Range { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Range as u64),
         HeapObject::Closure { .. } =>
@@ -5721,9 +5801,12 @@ impl Interpreter<'_> {
         if let Some(boolean) = value.as_bool() { return boolean.to_string(); }
         if let Some(number) = value.as_num() { return number.to_string(); }
         match self.heap.get(value) {
+            Some(HeapObject::Random { .. }) => "<random>".into(),
             Some(HeapObject::String(string)) => String::from_utf8_lossy(string).into_owned(),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
             Some(HeapObject::Map(map)) => format!("<map:{}>", map.entries.len()),
+            Some(HeapObject::MapEntry { .. }) => "<map entry>".into(),
+            Some(HeapObject::MapKeys { .. }) => "<map keys>".into(),
             Some(HeapObject::Range { from, to, inclusive }) => format!("{}{}{}", from, if *inclusive { ".." } else { "..." }, to),
             Some(HeapObject::Closure { function_index, .. }) => format!("<closure {:?}>", self.prepared.functions[*function_index as usize].id),
             Some(HeapObject::ClassObject { class_slot }) => self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("<class>").to_owned(),
@@ -6014,6 +6097,194 @@ mod tests {
                 assert!(stats.native_iterations > 400,
                     "{expression}, optimize={optimize_trace_ir}: {stats:?}");
             }
+        }
+    }
+
+    #[test]
+    fn source_random_int_respects_bounds_and_survives_gc() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var random = Random.new()
+            var other = Random.new()
+            var seen = [false, false, false, false]
+            var i = 0
+            while (i < 2000) {
+                var value = random.int(3, 10)
+                if (!value.isInteger || value < 3 || value >= 10) return -1
+                var small = random.int(4)
+                if (!small.isInteger || small < 0 || small >= 4) return -2
+                seen[small] = true
+                var negative = other.int(-10, -3)
+                if (negative < -10 || negative >= -3) return -3
+                if (random.int(-1, 0) != -1) return -4
+                if (random.int(1) != 0) return -5
+                var wide = random.int(-9007199254740991, 9007199254740991)
+                if (!wide.isInteger || wide < -9007199254740991 || wide >= 9007199254740991) return -6
+                i = i + 1
+            }
+            System.gc()
+            if (random.int(1) != 0) return -7
+            for (found in seen) {
+                if (!found) return -8
+            }
+            return 42
+        "#);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 42.0);
+        }
+    }
+
+    #[test]
+    fn source_random_rejects_invalid_bounds() {
+        for (expression, expected) in [
+            ("random.int(0)", "upper bound must be greater"),
+            ("random.int(-4)", "upper bound must be greater"),
+            ("random.int(3, 3)", "upper bound must be greater"),
+            ("random.int(10, 3)", "upper bound must be greater"),
+            ("random.int(1.5)", "safe finite integers"),
+            ("random.int(Num.infinity)", "safe finite integers"),
+            ("random.int(Num.nan)", "safe finite integers"),
+            ("random.int(9007199254740992)", "safe finite integers"),
+            ("random.int(null)", "upper bound must be a Num"),
+            ("random.int(\"4\", 5)", "lower bound must be a Num"),
+        ] {
+            let (program, entry, manifest) = compile_wren_module(
+                &format!("var random = Random.new()\n{expression}\n"));
+            let mut vm = source_vm(&program, &manifest);
+            let error = vm.run_module(entry).err().expect(expression);
+            assert!(error.message.contains(expected), "{expression}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn source_collection_getters_require_no_parentheses() {
+        for (expression, expected) in [
+            ("\"string\".count", "6"),
+            ("(1..10).count", "10"),
+            ("(1...10).count", "9"),
+            ("(10..1).count", "10"),
+            ("(10...1).count", "9"),
+            ("(2..2).count", "1"),
+            ("(2...2).count", "0"),
+            ("(0.5..2.75).count", "3"),
+            ("(0.5...2.75).count", "3"),
+            ("(1..10).min", "1"),
+            ("[1, 2, 3].isEmpty", "false"),
+            ("[].isEmpty", "true"),
+            ("\"\".isEmpty", "true"),
+            ("\"a\".isEmpty", "false"),
+            ("{}.isEmpty", "true"),
+            ("{\"a\": null}.isEmpty", "false"),
+            ("{}.keys.isEmpty", "true"),
+        ] {
+            let (program, entry, manifest) = compile_wren_module(&format!("var result = {expression}\n"));
+            let mut vm = source_vm(&program, &manifest);
+            vm.run_module(entry).unwrap();
+            let value = *vm.modules.last().unwrap().variables.last().unwrap();
+            let context = HostContext { heap: &mut vm.heap };
+            assert_eq!(context.format_value(value), expected, "{expression}");
+        }
+        let (program, entry, manifest) = compile_wren_module("var result = 1.23.sin\n");
+        let mut vm = source_vm(&program, &manifest);
+        vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&vm), 1.23f64.sin());
+    }
+
+    #[test]
+    fn source_map_entries_and_keys_iterate_with_matching_values() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var birds = {"Georgia": "Brown Thrasher", "Idaho": "Mountain Bluebird"}
+            var entries = 0
+            for (bird in birds) {
+                if (birds[bird.key] != bird.value) return -1
+                var sentence = "The state bird of %(bird.key) is %(bird.value)"
+                if (sentence.count == 0) return -2
+                entries = entries + 1
+            }
+            var keys = 0
+            for (state in birds.keys) {
+                if (!birds.containsKey(state)) return -3
+                var sentence = "The state bird of %(state) is " + birds[state]
+                if (sentence.count == 0) return -4
+                keys = keys + 1
+            }
+            for (entry in {}) return -5
+            for (key in {}.keys) return -6
+            return entries * 10 + keys
+        "#);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 22.0);
+        }
+    }
+
+    #[test]
+    fn source_map_keys_are_live_and_entries_survive_collection() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var map = {"Georgia": [1], "Idaho": [2]}
+            var keys = map.keys
+            var saved = []
+            for (entry in map) saved.add(entry)
+            map.clear()
+            if (keys.count != 0) return -1
+            map["Maine"] = [3]
+            System.gc()
+            var visits = 0
+            for (key in keys) {
+                if (key != "Maine") return -2
+                visits = visits + 1
+            }
+            var sum = 0
+            for (entry in saved) {
+                System.gc()
+                if (entry.key != "Georgia" && entry.key != "Idaho") return -3
+                sum = sum + entry.value[0]
+            }
+            var detached = {"kept": [4]}.keys
+            System.gc()
+            for (key in detached) {
+                if (key != "kept") return -4
+                sum = sum + 4
+            }
+            return sum * 10 + visits
+        "#);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 71.0);
+        }
+    }
+
+    #[test]
+    fn source_map_iteration_supports_non_string_keys_and_invalid_iterators() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var object = [1]
+            var map = {null: 1, true: 2, 3: 4}
+            map[object] = 8
+            var sum = 0
+            for (entry in map) {
+                if (map[entry.key] != entry.value) return -1
+                sum = sum + entry.value
+            }
+            for (key in map.keys) sum = sum + map[key]
+            return sum
+        "#);
+        let mut vm = source_vm(&program, &manifest);
+        vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&vm), 30.0);
+        for expression in [
+            r#"({"key": 1}).iteratorValue(5)"#,
+            r#"({"key": 1}).keys.iteratorValue(-1)"#,
+        ] {
+            let (program, entry, manifest) = compile_wren_module(&format!("{expression}\n"));
+            let mut vm = source_vm(&program, &manifest);
+            let error = vm.run_module(entry).err().expect(expression);
+            assert!(error.message.contains("map iterator out of range"), "{error:?}");
         }
     }
 

@@ -10,6 +10,7 @@ use crate::wren_interpreter::{
 use crate::wren_ir::{Builder, BuiltinId, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
 use std::io::{self, Write};
+use std::hash::BuildHasher;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug)]
@@ -93,6 +94,13 @@ impl BuiltinManifest {
 
 #[derive(Clone, Copy, Debug)]
 enum BuiltinPrimitive {
+    RandomNew,
+    RandomInt,
+    RangeCount,
+    ListIsEmpty,
+    MapIsEmpty,
+    StringIsEmpty,
+    MapKeysIsEmpty,
     ObjectEq,
     ObjectNe,
     ObjectToString,
@@ -178,6 +186,12 @@ enum BuiltinPrimitive {
     MapClear,
     MapIterate,
     MapIteratorValue,
+    MapKeys,
+    MapKeysCount,
+    MapKeysIterate,
+    MapKeysIteratorValue,
+    MapEntryKey,
+    MapEntryValue,
     MapToString,
 
     RangeFrom,
@@ -220,6 +234,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::Range,
         BuiltinClass::Closure,
         BuiltinClass::Fiber,
+        BuiltinClass::MapEntry,
+        BuiltinClass::MapKeys,
+        BuiltinClass::Random,
     ] {
         manifest.register(program, instance(class), "==", MethodKind::Method, 1, BuiltinPrimitive::ObjectEq);
         manifest.register(program, instance(class), "!=", MethodKind::Method, 1, BuiltinPrimitive::ObjectNe);
@@ -272,6 +289,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let st = instance(BuiltinClass::String);
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::StringCount),
+        ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::StringIsEmpty),
         ("+", MethodKind::Method, 1, BuiltinPrimitive::StringAdd),
         ("==", MethodKind::Method, 1, BuiltinPrimitive::StringEq),
         ("!=", MethodKind::Method, 1, BuiltinPrimitive::StringNe),
@@ -292,6 +310,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let list = instance(BuiltinClass::List);
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::ListCount),
+        ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::ListIsEmpty),
         ("+", MethodKind::Method, 1, BuiltinPrimitive::ListConcat),
         ("add", MethodKind::Method, 1, BuiltinPrimitive::ListAdd),
         ("insert", MethodKind::Method, 2, BuiltinPrimitive::ListInsert),
@@ -346,6 +365,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let map = instance(BuiltinClass::Map);
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::MapCount),
+        ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::MapIsEmpty),
         ("containsKey", MethodKind::Method, 1, BuiltinPrimitive::MapContainsKey),
         ("[]", MethodKind::SubscriptGetter, 1, BuiltinPrimitive::MapSubscript),
         ("[]=", MethodKind::SubscriptSetter, 2, BuiltinPrimitive::MapSubscriptSet),
@@ -353,15 +373,28 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("clear", MethodKind::Method, 0, BuiltinPrimitive::MapClear),
         ("iterate", MethodKind::Method, 1, BuiltinPrimitive::MapIterate),
         ("iteratorValue", MethodKind::Method, 1, BuiltinPrimitive::MapIteratorValue),
+        ("keys", MethodKind::Getter, 0, BuiltinPrimitive::MapKeys),
         ("toString", MethodKind::Getter, 0, BuiltinPrimitive::MapToString),
     ] {
         manifest.register(program, map, name, kind, arity, op);
     }
 
+    for (name, kind, arity, op) in [
+        ("count", MethodKind::Getter, 0, BuiltinPrimitive::MapKeysCount),
+        ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::MapKeysIsEmpty),
+        ("iterate", MethodKind::Method, 1, BuiltinPrimitive::MapKeysIterate),
+        ("iteratorValue", MethodKind::Method, 1, BuiltinPrimitive::MapKeysIteratorValue),
+    ] {
+        manifest.register(program, instance(BuiltinClass::MapKeys), name, kind, arity, op);
+    }
+    manifest.register(program, instance(BuiltinClass::MapEntry), "key", MethodKind::Getter, 0, BuiltinPrimitive::MapEntryKey);
+    manifest.register(program, instance(BuiltinClass::MapEntry), "value", MethodKind::Getter, 0, BuiltinPrimitive::MapEntryValue);
+
     // Range.
     let range = instance(BuiltinClass::Range);
     for (name, kind, arity, op) in [
         ("from", MethodKind::Getter, 0, BuiltinPrimitive::RangeFrom),
+        ("count", MethodKind::Getter, 0, BuiltinPrimitive::RangeCount),
         ("to", MethodKind::Getter, 0, BuiltinPrimitive::RangeTo),
         ("min", MethodKind::Getter, 0, BuiltinPrimitive::RangeMin),
         ("max", MethodKind::Getter, 0, BuiltinPrimitive::RangeMax),
@@ -416,6 +449,11 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register(program, date, "now", MethodKind::Getter, 0, BuiltinPrimitive::DateNow);
     manifest.register(program, date, "nowMs", MethodKind::Getter, 0, BuiltinPrimitive::DateNowMs);
     manifest.register(program, date, "sleep", MethodKind::Method, 1, BuiltinPrimitive::DateSleep);
+
+    manifest.register(program, static_(BuiltinId::Random), "new", MethodKind::Method, 0, BuiltinPrimitive::RandomNew);
+    for arity in [1, 2] {
+        manifest.register(program, instance(BuiltinClass::Random), "int", MethodKind::Method, arity, BuiltinPrimitive::RandomInt);
+    }
 
     manifest
 }
@@ -603,6 +641,53 @@ fn execute_primitive(
 
     let this = receiver(args)?;
     match op {
+        RandomNew => {
+            let seed = std::collections::hash_map::RandomState::new().hash_one(());
+            Ok(context.allocate_random(seed))
+        }
+        RandomInt => {
+            let (from, to) = if args.len() == 2 {
+                (0.0, num(argument(args, 0)?, "upper bound")?)
+            } else {
+                (num(argument(args, 0)?, "lower bound")?, num(argument(args, 1)?, "upper bound")?)
+            };
+            const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+            for bound in [from, to] {
+                if !bound.is_finite() || bound.fract() != 0.0 || bound.abs() > MAX_SAFE_INTEGER {
+                    return Err(RuntimeError::new("Random.int bounds must be safe finite integers"));
+                }
+            }
+            if from >= to {
+                return Err(RuntimeError::new("Random.int upper bound must be greater than lower bound"));
+            }
+            let lower = from as i64;
+            let width = (to as i64 - lower) as u64;
+            // Rejection avoids the bias of reducing every u64 modulo width.
+            let threshold = width.wrapping_neg() % width;
+            loop {
+                let value = context.random_u64(this)?;
+                if value >= threshold {
+                    return Ok(Value::from_num((lower + (value % width) as i64) as f64));
+                }
+            }
+        }
+        RangeCount => {
+            let (from, to, inclusive) = context.range_parts(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not Range"))?;
+            let distance = (to - from).abs();
+            Ok(Value::from_num(if inclusive { distance.floor() + 1.0 } else { distance.ceil() }))
+        }
+        ListIsEmpty => Ok(Value::from_bool(context.list_len(this)
+            .ok_or_else(|| RuntimeError::new("receiver is not List"))? == 0)),
+        MapIsEmpty => Ok(Value::from_bool(context.map_len(this)
+            .ok_or_else(|| RuntimeError::new("receiver is not Map"))? == 0)),
+        StringIsEmpty => Ok(Value::from_bool(context.string_bytes(this)
+            .ok_or_else(|| RuntimeError::new("receiver is not String"))?.is_empty())),
+        MapKeysIsEmpty => {
+            let map = context.map_keys_source(this)?;
+            Ok(Value::from_bool(context.map_len(map)
+                .ok_or_else(|| RuntimeError::new("receiver is not Map"))? == 0))
+        }
         ObjectEq => Ok(Value::from_bool(this.raw_bits() == argument(args, 0)?.raw_bits())),
         ObjectNe => Ok(Value::from_bool(this.raw_bits() != argument(args, 0)?.raw_bits())),
         ObjectToString | BoolToString | NullToString | NumToString | ListToString | MapToString | RangeToString => {
@@ -783,12 +868,24 @@ fn execute_primitive(
         MapSubscriptSet => context.map_set(this, argument(args,0)?, argument(args,1)?),
         MapRemove => context.map_remove(this, argument(args,0)?),
         MapClear => { context.map_clear(this)?; Ok(Value::NULL) }
-        MapIterate => {
-            let len = context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))?;
+        MapIterate | MapKeysIterate => {
+            let map = if matches!(op, MapKeysIterate) { context.map_keys_source(this)? } else { this };
+            let len = context.map_len(map).ok_or_else(|| RuntimeError::new("receiver is not Map"))?;
             let next = if argument(args,0)?.is_null() { 0 } else { integer(argument(args,0)?, "iterator")? + 1 };
             Ok(if next >= 0 && (next as usize) < len { Value::from_num(next as f64) } else { Value::FALSE })
         }
-        MapIteratorValue => context.map_nth_value(this, integer(argument(args,0)?, "iterator")? as usize),
+        MapIteratorValue => context.map_nth_entry(this, integer(argument(args,0)?, "iterator")? as usize),
+        MapKeys => context.map_keys(this),
+        MapKeysCount => {
+            let map = context.map_keys_source(this)?;
+            Ok(Value::from_num(context.map_len(map).ok_or_else(|| RuntimeError::new("receiver is not Map"))? as f64))
+        }
+        MapKeysIteratorValue => {
+            let map = context.map_keys_source(this)?;
+            context.map_nth_key(map, integer(argument(args,0)?, "iterator")? as usize)
+        }
+        MapEntryKey => Ok(context.map_entry_parts(this)?.0),
+        MapEntryValue => Ok(context.map_entry_parts(this)?.1),
 
         RangeFrom => Ok(Value::from_num(context.range_parts(this).ok_or_else(|| RuntimeError::new("receiver is not Range"))?.0)),
         RangeTo => Ok(Value::from_num(context.range_parts(this).ok_or_else(|| RuntimeError::new("receiver is not Range"))?.1)),
