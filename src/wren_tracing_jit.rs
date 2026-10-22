@@ -49,7 +49,7 @@ use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
 use std::mem::offset_of;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use cranelift::codegen::ir::{Type as ClifType, UserFuncName};
 use cranelift::jit::{JITBuilder, JITModule};
@@ -192,13 +192,15 @@ pub enum TraceHeapKind {
 /// `address` is the moving MMTk object address and is rewritten by GC through the
 /// existing precise handle slot. `data` points only at stable external allocations
 /// (Box/Vec/Arc payloads), never into the moving GC object. `len` is the logical
-/// length used by fast paths. All fields are atomics so the GC/handle machinery can retain its
+/// length used by fast paths. `receiver_class` is the immutable semantic class key
+/// (zero means no Wren class). All fields are atomics so the GC/handle machinery can retain its
 /// existing shared handle-table representation.
 #[repr(C)]
 pub struct TraceHeapEntry {
     pub(crate) address: AtomicUsize,
     pub(crate) next_free: AtomicU32,
     pub(crate) kind: AtomicU32,
+    pub(crate) receiver_class: AtomicU64,
     pub(crate) data: AtomicUsize,
     pub(crate) len: AtomicUsize,
 }
@@ -209,6 +211,7 @@ impl TraceHeapEntry {
             address: AtomicUsize::new(0),
             next_free: AtomicU32::new(free_none),
             kind: AtomicU32::new(TraceHeapKind::Invalid as u32),
+            receiver_class: AtomicU64::new(0),
             data: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
         }
@@ -217,6 +220,7 @@ impl TraceHeapEntry {
     #[inline]
     pub(crate) fn clear_jit_view(&self) {
         self.kind.store(TraceHeapKind::Invalid as u32, Ordering::Relaxed);
+        self.receiver_class.store(0, Ordering::Relaxed);
         self.data.store(0, Ordering::Relaxed);
         self.len.store(0, Ordering::Relaxed);
     }
@@ -367,6 +371,13 @@ pub trait TraceRuntime {
     /// standard semantics. A method name alone is insufficient for host bindings.
     fn trace_standard_numeric_method(&self, _function: FuncId, _cache: u32) -> bool { false }
 
+    /// Resolve a GuardClass descriptor to stable runtime receiver-class keys.
+    fn trace_class_guard(&self, _function: FuncId, _guard: u32) -> Option<Vec<u64>> { None }
+    fn trace_receiver_class(&self, _value: RegisterWord) -> Option<u64> { None }
+    fn trace_is_loop_header(&self, _location: TraceLocation) -> bool { false }
+    /// Field slots are relocated when a class is linked to its superclass.
+    fn trace_field_slot(&self, _location: TraceLocation, local_slot: u32) -> u32 { local_slot }
+
     fn trace_current_location(&self) -> TraceLocation;
 
     fn trace_read_slot(&self, slot: FrameSlot) -> Result<RegisterWord, Self::RuntimeError>;
@@ -452,6 +463,8 @@ impl NativeOptLevel {
 pub struct TracingJitOptions {
     /// Number of visits to a loop header before starting a recording.
     pub hot_loop_threshold: u32,
+    /// Visits to a function entry/call continuation before recording. Zero disables this tier.
+    pub hot_entry_threshold: u32,
     /// Hard recorder limit for one loop iteration.
     pub max_trace_steps: usize,
     /// Repeated recording/lowering failures before a loop is permanently ignored.
@@ -482,6 +495,7 @@ impl Default for TracingJitOptions {
     fn default() -> Self {
         Self {
             hot_loop_threshold: 64,
+            hot_entry_threshold: 64,
             max_trace_steps: 4096,
             max_failures_before_blacklist: 8,
             hot_side_exit_threshold: 32,
@@ -506,6 +520,10 @@ impl Default for TracingJitOptions {
 #[derive(Clone, Debug, Default)]
 pub struct TracingJitStats {
     pub loop_header_hits: u64,
+    pub entry_hits: u64,
+    pub entry_traces_compiled: u64,
+    pub entry_native_entries: u64,
+    pub blacklisted_entries: u64,
     pub recordings_started: u64,
     pub recordings_succeeded: u64,
     pub recordings_aborted: u64,
@@ -781,6 +799,7 @@ struct TraceRecorder<'a> {
 #[derive(Clone, Copy)]
 enum RecordingMode {
     RootLoop,
+    Entry,
     Side { close_at: TraceLocation, link_to: TraceId },
 }
 
@@ -1814,11 +1833,22 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
-            GuardClass => self.runtime_leaf(
-                op,
-                builder,
-                &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
-            ),
+            GuardClass => {
+                let classes = runtime.trace_class_guard(op.location.function, op.x)
+                    .ok_or(RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                let physical = runtime.trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                if !runtime.trace_receiver_class(physical).is_some_and(|class| classes.contains(&class)) {
+                    return Err(RecordingAbort::GuardFailedWhileRecording);
+                }
+                let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                // Replay the guard on failure so the VM owns deoptimization.
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let result = builder.emit1(TraceInst::GuardClass { value, classes, exit },
+                    TraceType::Any, TraceRep::Tagged);
+                self.write_gpr(builder, op.a, result);
+                Ok(ExpectedStep::Exact(next))
+            }
 
             Bailout => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
 
@@ -2134,7 +2164,7 @@ impl<'a> TraceRecorder<'a> {
                 let object = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
                 let result = builder.emit1(
-                    TraceInst::HeapLoadField { object, slot: op.x, exit },
+                    TraceInst::HeapLoadField { object, slot: runtime.trace_field_slot(op.location, op.x), exit },
                     TraceType::Any,
                     TraceRep::Tagged,
                 );
@@ -2146,7 +2176,8 @@ impl<'a> TraceRecorder<'a> {
                 let object = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
-                builder.emit0(TraceInst::HeapStoreField { object, value, slot: op.x, exit });
+                builder.emit0(TraceInst::HeapStoreField {
+                    object, value, slot: runtime.trace_field_slot(op.location, op.x), exit });
                 Ok(ExpectedStep::Exact(next))
             }
 
@@ -2429,6 +2460,7 @@ impl<'a> TraceRecorder<'a> {
 
         let (kind, close_at) = match mode {
             RecordingMode::RootLoop => (TraceKind::Loop, self.anchor),
+            RecordingMode::Entry => (TraceKind::Entry, self.anchor),
             RecordingMode::Side { close_at, .. } => (TraceKind::Side, close_at),
         };
         if close_at.function != self.anchor.function {
@@ -2449,6 +2481,7 @@ impl<'a> TraceRecorder<'a> {
 
         loop {
             if steps >= self.options.max_trace_steps {
+                if matches!(mode, RecordingMode::Entry) { break; }
                 return Err(RecordOutcome::Abort(RecordingAbort::TraceTooLong));
             }
 
@@ -2457,6 +2490,9 @@ impl<'a> TraceRecorder<'a> {
                 return Err(RecordOutcome::Abort(RecordingAbort::LeftFunction));
             }
 
+            if matches!(mode, RecordingMode::Entry) && runtime.trace_is_loop_header(location) {
+                break;
+            }
             if steps > 0 && location == close_at {
                 break;
             }
@@ -2475,9 +2511,23 @@ impl<'a> TraceRecorder<'a> {
 
             let op = decode_at(program, location).map_err(RecordOutcome::Fatal)?;
 
-            let expected = self
-                .translate_op(runtime, program, function, &op, &mut builder)
-                .map_err(RecordOutcome::Abort)?;
+            let expected = if matches!(mode, RecordingMode::Entry) {
+                // A boundary may be discovered after speculative guards have been
+                // emitted. Preserve only the completed prefix and do not execute
+                // the boundary instruction while recording.
+                let checkpoint = builder.clone();
+                match self.translate_native(runtime, program, function, &op, &mut builder) {
+                    Ok(step @ ExpectedStep::Exact(next)) if next.pc.0 > location.pc.0
+                        && !visited.contains(&next) => step,
+                    Ok(_) | Err(_) => {
+                        builder = checkpoint;
+                        break;
+                    }
+                }
+            } else {
+                self.translate_op(runtime, program, function, &op, &mut builder)
+                    .map_err(RecordOutcome::Abort)?
+            };
 
             let step = runtime
                 .trace_execute_unfused_step()
@@ -2543,6 +2593,11 @@ impl<'a> TraceRecorder<'a> {
         }
 
         let side_terminal_exit = match mode {
+            RecordingMode::Entry => {
+                let exit = builder.add_side_exit(ExitReason::GuardValue, runtime.trace_current_location().pc);
+                builder.set_terminator(TraceTerminator::Exit(exit));
+                None
+            }
             RecordingMode::RootLoop => {
                 if !builder.has_runtime_calls() {
                     self.install_loop_phis(&mut builder).map_err(RecordOutcome::Abort)?;
@@ -4013,6 +4068,19 @@ impl CraneliftLoweringState<'_, '_> {
         expected: TraceHeapKind,
         exit: SideExitId,
     ) -> Result<(Value, Value), TracingJitError> {
+        let (entry, address) = self.guard_live_heap_entry(tagged, exit)?;
+        let kind = self.builder.ins().load(
+            types::I32, Self::trusted_mem(), entry, offset_of!(TraceHeapEntry, kind) as i32);
+        let matches_kind = self.builder.ins().icmp_imm_u(IntCC::Equal, kind, expected as i64);
+        let matches_kind = self.bool32(matches_kind);
+        let wrong_kind = self.bool_not(matches_kind);
+        self.emit_side_exit(exit, wrong_kind)?;
+        Ok((entry, address))
+    }
+
+    fn guard_live_heap_entry(&mut self, tagged: Value, exit: SideExitId)
+        -> Result<(Value, Value), TracingJitError>
+    {
         let heap_mask = self.builder.ins().iconst(types::I64, TAG_HEAP_MASK as i64);
         let heap_tag = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
         let masked = self.builder.ins().band(tagged, heap_mask);
@@ -4065,20 +4133,6 @@ impl CraneliftLoweringState<'_, '_> {
         let dead = self.builder.ins().icmp_imm_u(IntCC::Equal, address, 0);
         let dead = self.bool32(dead);
         self.emit_side_exit(exit, dead)?;
-
-        let kind = self.builder.ins().load(
-            types::I32,
-            Self::trusted_mem(),
-            entry,
-            offset_of!(TraceHeapEntry, kind) as i32,
-        );
-        let matches_kind = self
-            .builder
-            .ins()
-            .icmp_imm_u(IntCC::Equal, kind, expected as i64);
-        let matches_kind = self.bool32(matches_kind);
-        let wrong_kind = self.bool_not(matches_kind);
-        self.emit_side_exit(exit, wrong_kind)?;
 
         Ok((entry, address))
     }
@@ -4453,6 +4507,23 @@ impl CraneliftLoweringState<'_, '_> {
                 if let Some(result) = node.results.first().copied() {
                     self.cache_value(result, value);
                 }
+            }
+
+            GuardClass { value, classes, exit } => {
+                let value = self.lower_value(*value)?;
+                let (entry, _) = self.guard_live_heap_entry(value, *exit)?;
+                let class = self.builder.ins().load(types::I64, Self::trusted_mem(),
+                    entry, offset_of!(TraceHeapEntry, receiver_class) as i32);
+                let mut matches = self.builder.ins().iconst(types::I32, 0);
+                for &expected in classes {
+                    let expected = self.builder.ins().iconst(types::I64, expected as i64);
+                    let equal = self.builder.ins().icmp(IntCC::Equal, class, expected);
+                    let equal = self.bool32(equal);
+                    matches = self.bool_or(matches, equal);
+                }
+                let failure = self.bool_not(matches);
+                self.emit_side_exit(*exit, failure)?;
+                self.cache_value(one_result(node)?, value);
             }
 
             IntUnary { op, value } => {
@@ -4933,6 +5004,7 @@ pub struct TracingJit {
     options: TracingJitOptions,
     backend: Option<CraneliftBackend>,
     loops: HashMap<LoopKey, LoopState>,
+    entries: HashMap<TraceLocation, LoopState>,
     traces: Vec<Option<CompiledTrace>>,
     /// Dense tables consumed by the generated native dispatcher. They may move
     /// while compiling new traces, but no compilation occurs during one native
@@ -4987,6 +5059,7 @@ impl TracingJit {
             options,
             backend: None,
             loops: HashMap::new(),
+            entries: HashMap::new(),
             traces: Vec::new(),
             entry_table: Vec::new(),
             link_table_ptrs: Vec::new(),
@@ -5073,6 +5146,77 @@ impl TracingJit {
     pub fn disassembly(&self, id: TraceId) -> Option<String> {
         self.compiled(id)
             .and_then(|compiled| compiled.debug_text.clone())
+    }
+
+    /// Record a bounded acyclic path. Recording executes the prefix once, so
+    /// newly compiled entries are first used on a subsequent visit.
+    pub fn on_entry<R: TraceRuntime>(&mut self, runtime: &mut R)
+        -> Result<JitAction, TracingJitError>
+    {
+        if self.options.hot_entry_threshold == 0 { return Ok(JitAction::Interpreted); }
+        let location = runtime.trace_current_location();
+        self.stats.entry_hits += 1;
+        let state = self.entries.entry(location).or_default();
+        if state.blacklisted { return Ok(JitAction::Blacklisted); }
+        if let Some(trace) = state.trace { return self.enter_compiled(runtime, trace); }
+        state.hotness = state.hotness.saturating_add(1);
+        if state.hotness < self.options.hot_entry_threshold.max(state.retry_after) {
+            return Ok(JitAction::Interpreted);
+        }
+        let id = TraceId(self.next_trace_id);
+        self.next_trace_id = self.next_trace_id.wrapping_add(1);
+        self.stats.recordings_started += 1;
+        let recorder = TraceRecorder::new(&self.options, id, location);
+        let result = match recorder.record_impl(runtime, RecordingMode::Entry) {
+            Ok(trace) => {
+                self.stats.recordings_succeeded += 1;
+                self.stats.recorded_bytecodes += trace.stats.recorded_bytecodes as u64;
+                self.stats.pruned_snapshot_writes += trace.stats.pruned_snapshot_writes as u64;
+                self.stats.eliminated_trace_guards += trace.stats.eliminated_guards as u64;
+                self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
+                self.stats.eliminated_trace_copies += trace.stats.eliminated_copies as u64;
+                self.compile_trace(&trace).map_err(|error| error.to_string())
+            }
+            Err(RecordOutcome::Abort(reason)) => Err(reason.to_string()),
+            Err(RecordOutcome::Fatal(error)) => return Err(error),
+        };
+        match result {
+            Ok(compiled) => {
+                self.insert_compiled(id, compiled);
+                self.entries.get_mut(&location).unwrap().trace = Some(id);
+                self.stats.traces_compiled += 1;
+                self.stats.entry_traces_compiled += 1;
+                if jit_events_enabled() {
+                    eprintln!("[wren-jit] compiled entry {:?} at {:?}:{}", id, location.function, location.pc.0);
+                }
+                Ok(JitAction::Compiled { trace: id })
+            }
+            Err(reason) => {
+                self.stats.recordings_aborted += 1;
+                self.stats.last_abort = Some(reason.clone());
+                let state = self.entries.get_mut(&location).unwrap();
+                state.failures = state.failures.saturating_add(1);
+                state.hotness = 0;
+                state.retry_after = self.options.hot_entry_threshold.max(state.retry_after)
+                    .saturating_mul(2);
+                if state.failures >= self.options.max_failures_before_blacklist {
+                    state.blacklisted = true;
+                    self.stats.blacklisted_entries += 1;
+                }
+                if jit_events_enabled() {
+                    eprintln!("[wren-jit] entry abort {:?}:{}: {}", location.function, location.pc.0, reason);
+                }
+                Ok(JitAction::RecordingAborted { reason })
+            }
+        }
+    }
+
+    pub(crate) fn entry_trace(&self, location: TraceLocation) -> Option<TraceId> {
+        self.entries.get(&location).and_then(|state| state.trace)
+    }
+
+    pub(crate) fn entry_blacklisted(&self, location: TraceLocation) -> bool {
+        self.entries.get(&location).is_some_and(|state| state.blacklisted)
     }
 
     /// Called when baseline execution arrives at a known loop header.
@@ -5289,6 +5433,9 @@ impl TracingJit {
                 .dispatcher;
 
             self.stats.native_entries = self.stats.native_entries.saturating_add(1);
+            if matches!(self.compiled(trace_id).unwrap().trace.anchor.kind, TraceKind::Entry) {
+                self.stats.entry_native_entries += 1;
+            }
             let result = unsafe { dispatcher(&mut activation) };
             let producer = TraceId(activation.next_trace);
 
@@ -5464,7 +5611,9 @@ impl TracingJit {
         // the mutable side-exit accounting scope.
         let hot_side_exit_threshold = self.options.hot_side_exit_threshold.max(1);
         let cooldown_threshold = hot_side_exit_threshold.min(u16::MAX as u32) as u16;
-        let budget_tracking = self.options.native_loop_iteration_budget != 0;
+        let is_entry = self.compiled(trace_id)
+            .is_some_and(|compiled| matches!(compiled.trace.anchor.kind, TraceKind::Entry));
+        let budget_tracking = !is_entry && self.options.native_loop_iteration_budget != 0;
 
         // Update mutable exit accounting first, but do not clone the exit plan.
         // The old implementation cloned two Vecs on every side exit. A nested
@@ -5534,7 +5683,7 @@ impl TracingJit {
             // A repeatedly short exit is precisely where a side trace can remove
             // the native -> baseline -> native transition. Give trace-tree formation
             // priority over cooldown once the exit itself is hot.
-            let side_trace_candidate = watchdog_anchor.is_none()
+            let side_trace_candidate = !is_entry && watchdog_anchor.is_none()
                 && tree_depth < MAX_SIDE_TRACE_DEPTH
                 && matches!(target, ExitTarget::Interpreter(_))
                 && hits >= hot_side_exit_threshold
@@ -5621,7 +5770,7 @@ impl TracingJit {
                 // stitch it immediately. This removes the manager/baseline round
                 // trip for common trace-tree edges.
                 let hits = self.exit_hits(trace_id, plan_id).unwrap_or(0);
-                if hits >= hot_side_exit_threshold {
+                if !is_entry && hits >= hot_side_exit_threshold {
                     let child = self
                         .loops
                         .get(&LoopKey { location })

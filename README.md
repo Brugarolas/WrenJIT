@@ -251,6 +251,33 @@ Remove-Item Env:WREN_JIT_STATS
 `WREN_JIT_EVENTS=1` also logs recording/compilation events. `WREN_NO_JIT=1`
 selects this project's interpreter for a comparison without native traces.
 
+The JIT also records hot function entries and continuations after calls. The
+default `hot_entry_threshold` is 64 visits; setting it to zero disables this tier
+without changing loop tracing. The CLI exposes this comparison as
+`WREN_NO_ENTRY_JIT=1`. `WREN_NO_JIT` takes precedence over that switch.
+
+Entry traces compile bounded acyclic paths and return to the interpreter before
+calls, returns, unsupported runtime operations or loop headers. Numeric builtin
+invocations with native lowering can remain inside the trace. Recording executes
+the path once; compiled code starts on subsequent visits, preserving effects.
+Branch/type mismatches restore the snapshot at the exact bytecode boundary.
+Entry traces have separate hotness and failure backoff and do not use the loop
+tier's short-iteration cooldown or loop side-trace recording policy.
+`entry_traces_compiled` and `entry_native_entries` expose their activity in
+`WREN_JIT_STATS`; `native_iterations` still counts native loop iterations only.
+
+`GuardClass` lowers to heap-tag validation and comparisons against `ReceiverClass`
+in the stable handle sidecar, with no interpreter callback. Class IDs are resolved
+to runtime slots at recording time; class objects, instances, foreign objects and
+class sets retain the interpreter's guard semantics. GC preserves this class key
+when moving objects, and reclaiming a handle clears it before reuse. Native field
+accesses use the slots relocated when the declaring class is linked.
+
+Use `scripts/jit_entries.wren` to compare repeated calls to a loop-free arithmetic
+method with the entry tier enabled, disabled, and with `WREN_NO_JIT=1`.
+Run the dedicated regressions with `cargo test jit_entry_` and
+`cargo test native_class_guards` (also supported with `--release`).
+
 The tracing tier specializes numeric operations on local registers, including
 arithmetic, comparisons, unsigned bitwise methods, and floating remainder
 (`%` and the typed `FRem` bytecode).

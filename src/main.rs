@@ -177,6 +177,11 @@ fn run() -> u8 {
     // execution has no environment lookup in the hot path.
     if env::var_os("WREN_NO_JIT").is_some() {
         interpreter.set_jit_options(None);
+    } else if env::var_os("WREN_NO_ENTRY_JIT").is_some() {
+        interpreter.set_jit_options(Some(wren_tracing_jit::TracingJitOptions {
+            hot_entry_threshold: 0,
+            ..Default::default()
+        }));
     }
 
     let execution = interpreter.run_module(lowered_module.entry);

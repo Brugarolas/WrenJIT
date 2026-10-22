@@ -83,6 +83,8 @@ pub enum TraceInst {
     GuardEq { lhs: TraceValueId, rhs: TraceValueId, exit: SideExitId },
     GuardSwitch { tag: TraceValueId, observed: TraceSwitchGuard, exit: SideExitId },
     GuardType { value: TraceValueId, expected: TraceType, exit: SideExitId },
+    /// Runtime class keys in the stable heap sidecar (independent of Rust layout).
+    GuardClass { value: TraceValueId, classes: Vec<u64>, exit: SideExitId },
     IntUnary { op: IntUnaryOp, value: TraceValueId },
     IntBinary { op: IntBinOp, lhs: TraceValueId, rhs: TraceValueId },
     IntBinaryChecked { op: IntBinOp, lhs: TraceValueId, rhs: TraceValueId, exit: SideExitId },
@@ -115,7 +117,7 @@ impl TraceInst {
             Nop | LoadFrameSlot { .. } | Runtime { .. } => {},
             Copy { value } | Reinterpret { value } | CommitFrameSlot { value, .. } | GuardTruthy { value, .. }
             | GuardFalsey { value, .. } | GuardNotNull { value, .. } | GuardF64 { value, .. }
-            | GuardInt32 { value, .. } | GuardUInt32 { value, .. } | GuardType { value, .. } | IntUnary { value, .. }
+            | GuardInt32 { value, .. } | GuardUInt32 { value, .. } | GuardType { value, .. } | GuardClass { value, .. } | IntUnary { value, .. }
             | F64Unary { value, .. } | F64Math { value, .. } | IsNull { value } | BoxInt32 { value } | BoxUInt32 { value } | BoxF64 { value }
             | Int32ToF64 { value } | UInt32ToF64 { value } | F64ToInt32 { value, .. } | TaggedToHeapHandle { value, .. }
             | ReadBarrier { value }
@@ -159,7 +161,7 @@ impl TraceInst {
         use TraceInst::*;
         match self {
             GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
-            | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. } | GuardType { exit, .. }
+            | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. } | GuardType { exit, .. } | GuardClass { exit, .. }
             | GuardBounds { exit, .. } | GuardSwitch { exit, .. } | GuardEq { exit, .. }
             | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. }
             | HeapLoadField { exit, .. } | HeapStoreField { exit, .. }
@@ -209,7 +211,7 @@ pub struct LoopPhi {
     pub entry_exit: Option<SideExitId>,
 }
 #[derive(Clone, Copy, Debug)]
-pub enum TraceKind { Loop, Side }
+pub enum TraceKind { Loop, Side, Entry }
 #[derive(Clone, Debug)]
 pub struct TraceAnchor { pub kind: TraceKind, pub location: TraceLocation }
 #[derive(Clone, Debug)]

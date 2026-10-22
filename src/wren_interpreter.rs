@@ -477,6 +477,7 @@ impl HandleTable {
 
     #[inline(always)]
     fn refresh_entry(entry: &HandleEntry, object: &HeapObject) {
+        entry.receiver_class.store(heap_object_receiver_class(object).map_or(0, |class| class.0), Ordering::Relaxed);
         let (kind, data, len) = match object {
             HeapObject::String(bytes) => (
                 TraceHeapKind::String,
@@ -565,7 +566,6 @@ fn handles() -> &'static HandleTable {
 #[repr(C)]
 struct ManagedObject {
     handle: u32,
-    receiver_class: Option<ReceiverClass>,
     object: HeapObject,
 }
 
@@ -1083,7 +1083,6 @@ impl Heap {
         // returns the new MMTk object.
         self.allocation_roots.prepare(&object);
         let handle = handles().allocate_handle();
-        let receiver_class = heap_object_receiver_class(&object);
         let descriptor = descriptor_for(&object);
         let external = external_bytes_for(&object);
         let gc_object = unsafe {
@@ -1095,7 +1094,6 @@ impl Heap {
                 gc_object.payload().cast::<ManagedObject>(),
                 ManagedObject {
                     handle,
-                    receiver_class,
                     object,
                 },
             );
@@ -1133,8 +1131,9 @@ impl Heap {
 
     #[inline(always)]
     fn receiver_class(&self, value: Value) -> Option<ReceiverClass> {
-        let object = self.object(value)?;
-        unsafe { managed_object(object).receiver_class }
+        let entry = handles().existing_entry(value.heap_handle()?)?;
+        let class = entry.receiver_class.load(Ordering::Relaxed);
+        (class != 0).then_some(ReceiverClass(class))
     }
 
     #[inline(always)]
@@ -1804,6 +1803,11 @@ impl PreparedSwitch {
 
 struct PreparedFunction {
     handlers: Vec<Handler>,
+    /// Entry hooks wrap only function entries and discovered runtime continuations.
+    jit_entry_handlers: Vec<Option<Handler>>,
+    jit_entry_traces: Vec<u32>,
+    jit_entry_disabled: Vec<bool>,
+    jit_loop_headers: HashSet<u32>,
     ops: Vec<PreparedOp>,
     original_ops: Vec<PreparedOp>,
     call_args: Vec<Reg>,
@@ -1876,6 +1880,25 @@ struct TempOp {
     raw_len: u32,
     args_offset: u32,
     gc_map: u32,
+}
+
+impl PreparedFunction {
+    fn set_handler(&mut self, index: usize, handler: Handler) {
+        if let Some(original) = &mut self.jit_entry_handlers[index] {
+            *original = handler;
+        } else {
+            self.handlers[index] = handler;
+        }
+    }
+
+    fn install_entry_hook(&mut self, index: usize) {
+        if index < self.handlers.len() && self.jit_entry_handlers[index].is_none()
+            && self.handlers[index] as usize != h_unreachable_fused as Handler as usize
+        {
+            self.jit_entry_handlers[index] = Some(self.handlers[index]);
+            self.handlers[index] = h_jit_entry;
+        }
+    }
 }
 
 impl PreparedProgram {
@@ -2120,6 +2143,27 @@ impl PreparedProgram {
             if let Ok(target) = map_word_target(resume.pc.0) { target_ops.insert(target); }
         }
 
+        let mut jit_loop_headers = HashSet::new();
+        for (index, op) in ops.iter().enumerate() {
+            let mut add = |target: u32| {
+                if target <= index as u32 { jit_loop_headers.insert(target); }
+            };
+            match temps[index].opcode {
+                Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue => add(op.x),
+                Opcode::Switch => match &switches[op.x as usize] {
+                    PreparedSwitch::Linear { default_target, cases }
+                    | PreparedSwitch::Binary { default_target, cases } => {
+                        add(*default_target);
+                        for &(_, target) in cases { add(target); }
+                    }
+                    PreparedSwitch::Dense { default_target, targets, .. } => {
+                        add(*default_target);
+                        for &target in targets { add(target); }
+                    }
+                },
+                _ => {},
+            }
+        }
         let original_ops = ops.clone();
         let field_access_ops: Vec<u32> = temps
             .iter()
@@ -2150,6 +2194,11 @@ impl PreparedProgram {
         let op_count = ops.len();
         let jit_disabled_headers = vec![0; op_count];
         let jit_trace_headers = vec![NO_INDEX; op_count];
+        let mut jit_entry_handlers = vec![None; op_count];
+        if op_count != 0 {
+            jit_entry_handlers[0] = Some(handlers[0]);
+            handlers[0] = h_jit_entry;
+        }
 
         // FrameLayout bindings are immutable. Decode their tiny IncomingSource
         // enum once so every call can copy receiver/arguments straight into the
@@ -2217,6 +2266,10 @@ impl PreparedProgram {
 
         Ok(PreparedFunction {
             handlers,
+            jit_entry_handlers,
+            jit_entry_traces: vec![NO_INDEX; op_count],
+            jit_entry_disabled: vec![false; op_count],
+            jit_loop_headers,
             ops,
             original_ops,
             call_args,
@@ -3239,6 +3292,8 @@ impl<'p> Interpreter<'p> {
         for function in &mut self.prepared.functions {
             function.jit_disabled_headers.fill(0);
             function.jit_trace_headers.fill(NO_INDEX);
+            function.jit_entry_traces.fill(NO_INDEX);
+            function.jit_entry_disabled.fill(false);
         }
         self.jit = options.map(|options| Box::new(TracingJit::new(options)));
     }
@@ -3254,10 +3309,12 @@ impl<'p> Interpreter<'p> {
         for function in &mut self.prepared.functions {
             function.jit_disabled_headers.fill(0);
             function.jit_trace_headers.fill(NO_INDEX);
+            function.jit_entry_traces.fill(NO_INDEX);
+            function.jit_entry_disabled.fill(false);
             for op_index in std::mem::take(&mut function.quickened_numeric_ops) {
                 let index = op_index as usize;
                 if index < function.handlers.len() && index < function.ops.len() {
-                    function.handlers[index] = h_invoke;
+                    function.set_handler(index, h_invoke);
                     function.ops[index].flags = 0;
                 }
             }
@@ -3265,7 +3322,7 @@ impl<'p> Interpreter<'p> {
                 let index = op_index as usize;
                 if index < function.handlers.len() && index < function.ops.len() {
                     function.quick_invokes[index] = QuickInvokeSite::default();
-                    function.handlers[index] = h_invoke;
+                    function.set_handler(index, h_invoke);
                     function.ops[index].flags = 0;
                 }
             }
@@ -4151,6 +4208,11 @@ impl<'p> Interpreter<'p> {
         };
         if has_caller {
             self.refresh_hot_frame();
+            if self.jit.as_ref().is_some_and(|jit| jit.options().hot_entry_threshold != 0) {
+                let index = self.hot_pc as usize;
+                let function = self.current_frame().function as usize;
+                self.prepared.functions[function].install_entry_hook(index);
+            }
             return;
         }
 
@@ -4679,7 +4741,7 @@ impl Interpreter<'_> {
     fn receiver_class(&self, value: Value) -> Result<ReceiverClass, RuntimeError> {
         // Numbers dominate operator dispatch and are the cheapest tag to classify.
         // Test them first; null/bool remain two direct-word comparisons, while all
-        // Heap objects share the ReceiverClass cached in their managed payload.
+        // Heap objects share the ReceiverClass cached in their stable sidecar.
         if value.is_num() {
             return Ok(ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Num as u64));
         }
@@ -4947,7 +5009,7 @@ impl Interpreter<'_> {
             function.ops[index].y = rhs.0 as u32;
         }
         function.ops[index].flags = quick_flags;
-        function.handlers[index] = numeric_quick_handler(quick, quick_flags);
+        function.set_handler(index, numeric_quick_handler(quick, quick_flags));
         function.quickened_numeric_ops.push(op_index);
         true
     }
@@ -4966,7 +5028,7 @@ impl Interpreter<'_> {
         if function.ops[index].flags != 0 { return; }
 
         function.quick_invokes[index] = QuickInvokeSite { class, target };
-        function.handlers[index] = match target {
+        let handler = match target {
             CallTarget::Bytecode(_) => match function.ops[index].c {
                 0 => h_invoke_mono_bytecode_small::<0>,
                 1 => h_invoke_mono_bytecode_small::<1>,
@@ -4977,6 +5039,7 @@ impl Interpreter<'_> {
             },
             _ => h_invoke_mono,
         };
+        function.set_handler(index, handler);
         function.quickened_invoke_ops.push(op_index);
     }
 
@@ -4997,7 +5060,7 @@ impl Interpreter<'_> {
         let function = unsafe { self.prepared.functions.get_unchecked_mut(function_index) };
         if index < function.handlers.len() {
             function.quick_invokes[index] = QuickInvokeSite::default();
-            function.handlers[index] = h_invoke;
+            function.set_handler(index, h_invoke);
             function.ops[index].flags |= QUICK_GENERIC_DISABLED;
         }
     }
@@ -6051,6 +6114,60 @@ unsafe fn h_osr_point(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr; let (f,pc)=vm.current_location(op); match vm.host.osr_point(f,pc){Ok(())=>vm.advance(op),Err(e)=>vm.fail_at(op,e.message)}
 }
 
+/// Only entry points pay for tiering. Ordinary bytecode dispatch stays unchanged.
+unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
+    let function = vm.current_frame().function as usize;
+    let index = vm.hot_pc as usize;
+    if !vm.prepared.functions[function].jit_entry_disabled[index]
+        && vm.jit.as_ref().is_some_and(|jit| jit.options().hot_entry_threshold != 0)
+    {
+        let cached = vm.prepared.functions[function].jit_entry_traces[index];
+        let location = vm.trace_current_location();
+        let mut jit = vm.jit.take().unwrap();
+        let result = if cached == NO_INDEX { jit.on_entry(vm) }
+            else { jit.enter_trace(vm, TraceId(cached)) };
+        let discovered_boundary = matches!(&result, Ok(JitAction::Compiled { .. })
+            | Ok(JitAction::RecordingAborted { .. }) | Ok(JitAction::SideExit { .. }));
+        // Cache the original entry, never the trace that happened to produce an exit.
+        if cached == NO_INDEX {
+            vm.prepared.functions[function].jit_entry_traces[index] =
+                jit.entry_trace(location).map_or(NO_INDEX, |id| id.0);
+            vm.prepared.functions[function].jit_entry_disabled[index] = jit.entry_blacklisted(location);
+        }
+        vm.jit = Some(jit);
+        if let Err(error) = result { vm.fail(RuntimeError::new(error.to_string())); }
+        if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return; }
+
+        // A completed prefix hands off to a runtime operation. Discover its
+        // continuation without installing hooks after every numeric Invoke.
+        if discovered_boundary {
+            let current = vm.current_prepared().original_ops[vm.hot_pc as usize];
+            let opcode = vm.program.functions[vm.current_frame().function as usize]
+                .chunk.code[current.raw_pc as usize].opcode().unwrap();
+            if matches!(opcode, Opcode::Invoke | Opcode::InvokeSuper | Opcode::CallDirect
+                | Opcode::CallClosure | Opcode::CallPrimitive | Opcode::CallForeign)
+            {
+                let function = vm.current_frame().function as usize;
+                vm.prepared.functions[function].install_entry_hook(current.next as usize);
+            }
+        }
+    }
+    // Execute one baseline opcode even when a guard exits at the entry itself.
+    // This guarantees progress and avoids recursively entering the same trace.
+    let index = vm.hot_pc as usize;
+    let prepared = vm.current_prepared();
+    let handler = prepared.jit_entry_handlers[index].unwrap_or(prepared.handlers[index]);
+    // A trace may stop between two baseline-fused instructions (e.g. a
+    // LoadConst/Return pair or the recorder's step limit). Execute the logical
+    // boundary once; the fused predecessor has already been consumed.
+    if handler as usize == h_unreachable_fused as Handler as usize {
+        if let Err(error) = vm.trace_execute_unfused_step() { vm.fail(error); }
+        return;
+    }
+    let op = vm.hot_ops.add(index);
+    handler(vm, op);
+}
+
 unsafe fn h_guard_type(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr; let f=vm.current_frame().function as usize; let desc:&TypeGuardDescriptor=&vm.program.functions[f].chunk.type_guards[op.x as usize]; let src=vm.reg(op.b);
     if vm.type_matches(src,&desc.expected){vm.set_reg(op.a,src);vm.advance(op)}else{vm.deopt(op,op.y)}
@@ -6753,6 +6870,37 @@ impl TraceRuntime for Interpreter<'_> {
         TraceLocation::new(function.id, BytecodePc(pc))
     }
 
+    fn trace_class_guard(&self, function: FuncId, guard: u32) -> Option<Vec<u64>> {
+        let descriptor = self.program.function(function)?.chunk.class_guards.get(guard as usize)?;
+        let mut classes = Vec::new();
+        for (slot, class) in self.classes.iter().enumerate() {
+            if descriptor.expected.is_unknown() || descriptor.expected.contains(class.id) {
+                for kind in [CLASS_KIND_INSTANCE, CLASS_KIND_STATIC, CLASS_KIND_FOREIGN] {
+                    classes.push(kind | slot as u64);
+                }
+            }
+        }
+        Some(classes)
+    }
+
+    fn trace_receiver_class(&self, value: RegisterWord) -> Option<u64> {
+        self.heap.receiver_class(Value::from_word(value)).map(|class| class.0)
+    }
+
+    fn trace_is_loop_header(&self, location: TraceLocation) -> bool {
+        let prepared = self.current_prepared();
+        prepared.id == location.function && prepared.word_to_op.get(location.pc.0 as usize)
+            .is_some_and(|pc| prepared.jit_loop_headers.contains(pc))
+    }
+
+    fn trace_field_slot(&self, location: TraceLocation, local_slot: u32) -> u32 {
+        let prepared = self.current_prepared();
+        if prepared.id != location.function { return local_slot; }
+        prepared.word_to_op.get(location.pc.0 as usize)
+            .and_then(|index| prepared.ops.get(*index as usize))
+            .map_or(local_slot, |op| op.x)
+    }
+
     fn trace_read_slot(&self, slot: FrameSlot) -> Result<RegisterWord, RuntimeError> {
         let frame = self.current_frame();
         let banks = self.current_banks();
@@ -6796,10 +6944,11 @@ impl TraceRuntime for Interpreter<'_> {
         let function = self.current_frame().function;
         let mut op = self.current_prepared().original_ops[self.hot_pc as usize];
         let opcode = self.program.functions[function as usize].chunk.code[op.raw_pc as usize].opcode().unwrap();
-        if matches!(opcode, Opcode::Switch | Opcode::LoadModuleVar | Opcode::StoreModuleVar) {
-            // These handlers consume patched pointers, while original_ops keeps
-            // logical indices. Preserve the unfused continuation and copy only
-            // the pointer operands from the executable instruction.
+        if matches!(opcode, Opcode::Switch | Opcode::LoadModuleVar | Opcode::StoreModuleVar
+            | Opcode::LoadField | Opcode::StoreField) {
+            // These handlers consume patched pointers or relocated field slots,
+            // while original_ops keeps logical indices. Preserve the unfused
+            // continuation and copy operands from the executable instruction.
             let prepared_op = self.current_prepared().ops[self.hot_pc as usize];
             op.x = prepared_op.x;
             op.y = prepared_op.y;
@@ -6962,6 +7111,7 @@ mod tests {
     }
 
     include!("wren_class_tests.rs");
+    include!("wren_entry_jit_tests.rs");
 
     #[test]
     fn jit_numeric_math_getters_and_remainder_stay_in_native_loops() {

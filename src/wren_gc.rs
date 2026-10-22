@@ -19,7 +19,8 @@ use std::mem::{align_of, size_of};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{OnceLock};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 const WORD: usize = size_of::<usize>();

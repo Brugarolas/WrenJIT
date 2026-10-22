@@ -54,11 +54,11 @@ fn program_for(opcode: Opcode) -> BytecodeProgram {
     }
     program.metadata.foreign_functions.push(ForeignFunctionInfo { id: ForeignFnId(0), module: StringId(0), class: StringId(0), signature: MethodSymbol(0), is_static: false });
     let frame = FrameLayout { general_register_count: 8, parameters: vec![], captures: vec![], return_kind: RegisterKind::Value };
-    program.push_function(BytecodeFunction { id: FuncId(0), module: ModuleId(0), name: StringId(0), kind: FunctionKind::ModuleBody, field_owner: matches!(opcode, LoadField | StoreField).then_some(ClassId(0)), arity: 0, capture_count: 0, frame: frame.clone(), chunk }).unwrap();
+    program.push_function(BytecodeFunction { id: FuncId(0), module: ModuleId(0), name: StringId(0), kind: FunctionKind::ModuleBody, is_async: false, field_owner: matches!(opcode, LoadField | StoreField).then_some(ClassId(0)), arity: 0, capture_count: 0, frame: frame.clone(), chunk }).unwrap();
     let mut child = Assembler::new();
     child.emit_a(LoadTrue, 0);
     child.emit_a(Return, 0);
-    program.push_function(BytecodeFunction { id: FuncId(1), module: ModuleId(0), name: StringId(0), kind: FunctionKind::Closure, field_owner: None, arity: 0, capture_count: 0, frame, chunk: child.finish().unwrap() }).unwrap();
+    program.push_function(BytecodeFunction { id: FuncId(1), module: ModuleId(0), name: StringId(0), kind: FunctionKind::Closure, is_async: false, field_owner: None, arity: 0, capture_count: 0, frame, chunk: child.finish().unwrap() }).unwrap();
     program.rebuild_indexes().unwrap();
     program
 }
@@ -296,5 +296,64 @@ fn heap_reference_stores_use_the_native_barrier_path() {
         jit.execute_one_for_test(&mut native)
             .unwrap_or_else(|error| panic!("reference-store {opcode:?} fast path failed: {error}"));
         assert_eq!(state(&mut native), state(&mut baseline), "{opcode:?}");
+    }
+}
+
+#[test]
+fn native_class_guards_cover_class_sets_deopt_and_moving_gc() {
+    use crate::wren_trace_ir::TraceInst;
+    for mode in 0..3 {
+        let mut program = program_for(Opcode::GuardClass);
+        // Class IDs deliberately differ from runtime class slots.
+        program.metadata.classes[0].id = ClassId(11);
+        program.metadata.classes[1].id = ClassId(29);
+        program.metadata.classes[1].superclass = Some(ClassId(11));
+        program.functions[0].chunk.class_guards[0].expected = if mode == 2 {
+            ClassSet::new()
+        } else if mode == 0 {
+            ClassSet::singleton(ClassId(11))
+        } else {
+            ClassSet::from_iter([ClassId(11), ClassId(29)])
+        };
+        program.rebuild_indexes().unwrap();
+        let mut vm = setup(&program, Opcode::GuardClass);
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        jit.execute_one_for_test(&mut vm).unwrap();
+        let trace = jit.trace(TraceId(0)).unwrap();
+        assert!(trace.nodes.iter().any(|node| matches!(node.kind, TraceInst::GuardClass { .. })));
+        assert!(!trace.nodes.iter().any(|node| matches!(node.kind, TraceInst::Runtime { .. })));
+
+        let mut values = Vec::new();
+        for slot in 0..2 {
+            values.push((vm.heap.alloc(HeapObject::Instance {
+                class_slot: slot, fields: vec![Value::TRUE].into_boxed_slice(),
+            }), slot == 0 || mode != 0));
+            values.push((vm.classes[slot as usize].class_value, slot == 0 || mode != 0));
+            values.push((vm.heap.alloc(HeapObject::Foreign { class_slot: slot, bytes: vec![] }), slot == 0 || mode != 0));
+        }
+        values.extend([(Value::NULL, false), (Value::FALSE, false), (Value::from_num(3.0), false),
+            (vm.strings[1], false), (vm.heap.alloc(HeapObject::List(vec![])), false),
+            (vm.builtin_value(crate::wren_ir::BuiltinId::Num), false)]);
+        for &(value, _) in &values { vm.add_root(value); }
+        for _ in 0..3 {
+            vm.collect_garbage();
+            for &(value, matches) in &values {
+                vm.trace_set_location(TraceLocation::new(FuncId(0), BytecodePc(0))).unwrap();
+                vm.trace_write_slot(FrameSlot::General(Reg(1)), value.word()).unwrap();
+                vm.trace_write_slot(FrameSlot::General(Reg(0)), Value::FALSE.word()).unwrap();
+                jit.enter_trace(&mut vm, TraceId(0)).unwrap();
+                if matches {
+                    assert_eq!(vm.trace_current_location().pc, BytecodePc(3));
+                    assert_eq!(vm.trace_read_slot(FrameSlot::General(Reg(0))).unwrap(), value.word());
+                } else {
+                    // Failure leaves the input and destination untouched, and
+                    // resumes at the original bytecode guard for VM deopt.
+                    assert_eq!(vm.trace_current_location().pc, BytecodePc(0));
+                    assert_eq!(vm.trace_read_slot(FrameSlot::General(Reg(0))).unwrap(), Value::FALSE.word());
+                    vm.trace_execute_unfused_step().unwrap();
+                    assert_eq!(vm.trace_current_location().pc, BytecodePc(3));
+                }
+            }
+        }
     }
 }
