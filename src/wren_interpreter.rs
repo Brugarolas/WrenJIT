@@ -29,7 +29,11 @@ use crate::wren_gc::{
     RAW_CODEC as GC_RAW_CODEC,
 };
 use crate::wren_trace_ir::{FrameSlot, TraceConstant, TraceId, TraceLocation};
-use crate::wren_tracing_jit::{JitAction, TraceActivation, TraceActivationInputs, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats};
+use crate::wren_tracing_jit::{
+    JitAction, TraceActivation, TraceActivationInputs, TraceHeapEntry,
+    TraceHeapKind, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats,
+    TRACE_HEAP_CHUNK_BITS, TRACE_HEAP_CHUNK_MASK, TRACE_HEAP_CHUNK_SIZE,
+};
 
 use crate::wren_bytecode::{
     decode_bailout_reason, function_kind_uses_this, instruction_word_len,
@@ -254,7 +258,7 @@ enum HeapObject {
         to: f64,
         inclusive: bool,
     },
-    Cell(RegisterWord),
+    Cell(Box<RegisterWord>),
     Closure {
         function_index: u32,
         captures: Box<[RegisterWord]>,
@@ -295,26 +299,13 @@ enum HeapObject {
 // NaN-boxed Value in the VM.  This preserves the fast interpreter/JIT ABI while
 // still allowing StickyImmix to move objects.
 
-const HANDLE_CHUNK_BITS: u32 = 10;
-const HANDLE_CHUNK_SIZE: usize = 1usize << HANDLE_CHUNK_BITS;
-const HANDLE_CHUNK_MASK: u32 = (HANDLE_CHUNK_SIZE as u32) - 1;
+const HANDLE_CHUNK_BITS: u32 = TRACE_HEAP_CHUNK_BITS;
+const HANDLE_CHUNK_SIZE: usize = TRACE_HEAP_CHUNK_SIZE;
+const HANDLE_CHUNK_MASK: u32 = TRACE_HEAP_CHUNK_MASK;
 const MAX_HANDLE_CHUNKS: usize = 1 << 14; // 16,777,216 simultaneous handle IDs.
 const FREE_HANDLE_NONE: u32 = 0;
 
-struct HandleEntry {
-    address: AtomicUsize,
-    /// Intrusive Treiber free-list link encoded as handle+1; zero is None.
-    next_free: AtomicU32,
-}
-
-impl HandleEntry {
-    fn new() -> Self {
-        Self {
-            address: AtomicUsize::new(0),
-            next_free: AtomicU32::new(FREE_HANDLE_NONE),
-        }
-    }
-}
+type HandleEntry = TraceHeapEntry;
 
 struct HandleTable {
     chunks: Box<[AtomicPtr<HandleEntry>]>,
@@ -346,7 +337,7 @@ impl HandleTable {
             return current;
         }
         let chunk = (0..HANDLE_CHUNK_SIZE)
-            .map(|_| HandleEntry::new())
+            .map(|_| HandleEntry::new(FREE_HANDLE_NONE))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let slice = Box::leak(chunk);
@@ -406,11 +397,61 @@ impl HandleTable {
     }
 
     #[inline(always)]
-    fn publish(&self, handle: u32, object: GcObject) {
-        self.entry(handle)
-            .address
-            .store(object.address(), Ordering::Relaxed);
+    fn publish(&self, handle: u32, object: GcObject, heap_object: &HeapObject) {
+        let entry = self.entry(handle);
+        entry.address.store(object.address(), Ordering::Relaxed);
+        Self::refresh_entry(entry, heap_object);
         self.live.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    fn refresh(&self, handle: u32, object: &HeapObject) {
+        if let Some(entry) = self.existing_entry(handle) {
+            Self::refresh_entry(entry, object);
+        }
+    }
+
+    #[inline(always)]
+    fn refresh_entry(entry: &HandleEntry, object: &HeapObject) {
+        let (kind, data, len) = match object {
+            HeapObject::String(bytes) => (
+                TraceHeapKind::String,
+                bytes.as_ptr() as usize,
+                wren_code_point_count(bytes),
+            ),
+            HeapObject::List(values) => (
+                TraceHeapKind::List,
+                values.as_ptr() as usize,
+                values.len(),
+            ),
+            HeapObject::Map(map) => (
+                TraceHeapKind::Map,
+                0,
+                map.entries.len(),
+            ),
+            HeapObject::Cell(value) => (
+                TraceHeapKind::Cell,
+                (&**value as *const RegisterWord) as usize,
+                1,
+            ),
+            HeapObject::Instance { fields, .. } => (
+                TraceHeapKind::Instance,
+                fields.as_ptr() as usize,
+                fields.len(),
+            ),
+            _ => (TraceHeapKind::Invalid, 0, 0),
+        };
+        entry.data.store(data, Ordering::Relaxed);
+        entry.len.store(len, Ordering::Relaxed);
+        // Publish kind last so generated code never observes a partially refreshed view.
+        entry.kind.store(kind as u32, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn jit_chunks(&self) -> *const *mut TraceHeapEntry {
+        // AtomicPtr has pointer storage and each live handle's chunk is immutable
+        // after publication. Generated code only reads already-installed chunks.
+        self.chunks.as_ptr().cast::<*mut TraceHeapEntry>()
     }
 
     #[inline(always)]
@@ -424,6 +465,7 @@ impl HandleTable {
 
     fn release(&self, handle: u32) {
         let entry = self.entry(handle);
+        entry.clear_jit_view();
         entry.address.store(0, Ordering::Relaxed);
         self.live.fetch_sub(1, Ordering::Relaxed);
         loop {
@@ -529,7 +571,7 @@ unsafe fn trace_cell(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     if let HeapObject::Cell(value) = &managed.object {
         // Captured mutable Wren locals are semantic Values (the lowerer creates
         // cells as Type::Top), so a heap-tagged word here is always a real edge.
-        visit_word(*value, visitor);
+        visit_word(**value, visitor);
     }
 }
 
@@ -672,6 +714,7 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         HeapObject::String(bytes) => bytes.len(),
         HeapObject::List(values) => values.capacity() * std::mem::size_of::<Value>(),
         HeapObject::Map(map) => map.entries.capacity() * std::mem::size_of::<(MapKey, Value)>(),
+        HeapObject::Cell(_) => std::mem::size_of::<RegisterWord>(),
         HeapObject::Closure { captures, reference_indices, .. } => {
             captures.len() * std::mem::size_of::<RegisterWord>()
                 + reference_indices.len() * std::mem::size_of::<u16>()
@@ -767,7 +810,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
                 push_value_handle(value, roots);
             }
         }
-        HeapObject::Cell(word) => push_value_handle(Value::from_word(*word), roots),
+        HeapObject::Cell(word) => push_value_handle(Value::from_word(**word), roots),
         HeapObject::Closure {
             captures,
             reference_indices,
@@ -910,7 +953,7 @@ impl Heap {
                 },
             );
         }
-        handles().publish(handle, gc_object);
+        handles().publish(handle, gc_object, unsafe { &managed_object(gc_object).object });
         self.allocation_roots.clear();
         if external != 0 {
             unsafe { self.mutator.set_external_bytes(gc_object, external) };
@@ -945,6 +988,14 @@ impl Heap {
     fn receiver_class(&self, value: Value) -> Option<ReceiverClass> {
         let object = self.object(value)?;
         unsafe { managed_object(object).receiver_class }
+    }
+
+    #[inline(always)]
+    fn refresh_jit_view(&self, value: Value) {
+        let Some(handle) = value.heap_handle() else { return; };
+        if let Some(object) = self.get(value) {
+            handles().refresh(handle, object);
+        }
     }
 
     #[inline]
@@ -1192,6 +1243,7 @@ impl HostContext<'_> {
         if let Some(capacity) = resized {
             self.heap.set_external_bytes(value, capacity * std::mem::size_of::<Value>());
         }
+        self.heap.refresh_jit_view(value);
         Ok(item)
     }
 
@@ -1209,22 +1261,27 @@ impl HostContext<'_> {
         if let Some(capacity) = resized {
             self.heap.set_external_bytes(value, capacity * std::mem::size_of::<Value>());
         }
+        self.heap.refresh_jit_view(value);
         Ok(item)
     }
 
     pub fn list_remove_at(&mut self, value: Value, index: usize) -> Result<Value, RuntimeError> {
-        match self.heap.get_mut(value) {
-            Some(HeapObject::List(list)) if index < list.len() => Ok(list.remove(index)),
-            Some(HeapObject::List(_)) => Err(RuntimeError::new("list index out of bounds")),
-            _ => Err(RuntimeError::new("receiver is not a List")),
-        }
+        let removed = match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) if index < list.len() => list.remove(index),
+            Some(HeapObject::List(_)) => return Err(RuntimeError::new("list index out of bounds")),
+            _ => return Err(RuntimeError::new("receiver is not a List")),
+        };
+        self.heap.refresh_jit_view(value);
+        Ok(removed)
     }
 
     pub fn list_clear(&mut self, value: Value) -> Result<(), RuntimeError> {
         match self.heap.get_mut(value) {
-            Some(HeapObject::List(list)) => { list.clear(); Ok(()) }
-            _ => Err(RuntimeError::new("receiver is not a List")),
+            Some(HeapObject::List(list)) => list.clear(),
+            _ => return Err(RuntimeError::new("receiver is not a List")),
         }
+        self.heap.refresh_jit_view(value);
+        Ok(())
     }
 
     fn map_key(&self, value: Value) -> Result<MapKey, RuntimeError> {
@@ -1273,22 +1330,27 @@ impl HostContext<'_> {
                 capacity * std::mem::size_of::<(MapKey, Value)>(),
             );
         }
+        self.heap.refresh_jit_view(value);
         Ok(item)
     }
 
     pub fn map_remove(&mut self, value: Value, key: Value) -> Result<Value, RuntimeError> {
         let key = self.map_key(key)?;
-        match self.heap.get_mut(value) {
-            Some(HeapObject::Map(map)) => Ok(map.entries.remove(&key).unwrap_or(Value::NULL)),
-            _ => Err(RuntimeError::new("receiver is not a Map")),
-        }
+        let removed = match self.heap.get_mut(value) {
+            Some(HeapObject::Map(map)) => map.entries.remove(&key).unwrap_or(Value::NULL),
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        };
+        self.heap.refresh_jit_view(value);
+        Ok(removed)
     }
 
     pub fn map_clear(&mut self, value: Value) -> Result<(), RuntimeError> {
         match self.heap.get_mut(value) {
-            Some(HeapObject::Map(map)) => { map.entries.clear(); Ok(()) }
-            _ => Err(RuntimeError::new("receiver is not a Map")),
+            Some(HeapObject::Map(map)) => map.entries.clear(),
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
         }
+        self.heap.refresh_jit_view(value);
+        Ok(())
     }
 
     pub fn map_contains_key(&self, value: Value, key: Value) -> Result<bool, RuntimeError> {
@@ -5616,10 +5678,10 @@ unsafe fn h_load_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&
 unsafe fn h_load_module_var_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let v=*module_slot_ptr(op);vm.return_from_frame(v.word(),None)}
 unsafe fn h_store_module_var(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.a));*module_slot_ptr(op)=value;vm.advance(op)}
 
-unsafe fn h_alloc_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::Cell(vm.reg(op.b)));vm.set_reg(op.a,value.word());vm.advance(op)}
-unsafe fn h_load_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(value))=>{vm.set_reg(op.a,*value);vm.advance(op)},_=>vm.fail_at(op,"LoadCell operand is not cell")}}
-unsafe fn h_load_cell_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(value))=>vm.return_from_frame(*value,None),_=>vm.fail_at(op,"LoadCell operand is not cell")}}
-unsafe fn h_store_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.a));let word=vm.reg(op.b);let value=Value::from_word(word);vm.heap.remember_if_reference(cell,value);match vm.heap.get_mut(cell){Some(HeapObject::Cell(slot))=>{*slot=word;vm.advance(op)},_=>vm.fail_at(op,"StoreCell operand is not cell")}}
+unsafe fn h_alloc_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::Cell(Box::new(vm.reg(op.b))));vm.set_reg(op.a,value.word());vm.advance(op)}
+unsafe fn h_load_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(value))=>{vm.set_reg(op.a,**value);vm.advance(op)},_=>vm.fail_at(op,"LoadCell operand is not cell")}}
+unsafe fn h_load_cell_return(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.b));match vm.heap.get(cell){Some(HeapObject::Cell(value))=>vm.return_from_frame(**value,None),_=>vm.fail_at(op,"LoadCell operand is not cell")}}
+unsafe fn h_store_cell(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let cell=Value::from_word(vm.reg(op.a));let word=vm.reg(op.b);let value=Value::from_word(word);vm.heap.remember_if_reference(cell,value);match vm.heap.get_mut(cell){Some(HeapObject::Cell(slot))=>{**slot=word;vm.advance(op)},_=>vm.fail_at(op,"StoreCell operand is not cell")}}
 unsafe fn h_make_closure(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let count=((op.b as u16)|((op.c as u16)<<8)) as usize;let current=vm.current_frame().function as usize;let start=op.args_offset as usize;let mut captures=Vec::with_capacity(count);for index in 0..count{let reg=vm.prepared.functions[current].call_args[start+index];captures.push(vm.reg(reg.0));}let reference_indices=vm.prepared.functions[op.x as usize].capture_reference_indices.clone();let value=vm.heap.alloc(HeapObject::Closure{function_index:op.x,captures:captures.into_boxed_slice(),reference_indices});vm.set_reg(op.a,value.word());vm.advance(op)}
 
 #[inline]
@@ -5641,6 +5703,7 @@ unsafe fn h_list_append(vm:&mut Interpreter, ptr:*const PreparedOp){
         _=>{vm.fail_at(op,"ListAppend operand is not list");return;}
     };
     if let Some(capacity)=resized{vm.heap.set_external_bytes(list,capacity*std::mem::size_of::<Value>());}
+    vm.heap.refresh_jit_view(list);
     vm.advance(op)
 }
 unsafe fn h_list_insert(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -5655,9 +5718,10 @@ unsafe fn h_list_insert(vm:&mut Interpreter, ptr:*const PreparedOp){
         _=>{vm.fail_at(op,"ListInsert operand is not list");return;}
     };
     if let Some(capacity)=resized{vm.heap.set_external_bytes(list,capacity*std::mem::size_of::<Value>());}
+    vm.heap.refresh_jit_view(list);
     vm.advance(op)
 }
-unsafe fn h_list_remove_at(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));match vm.heap.get_mut(list){Some(HeapObject::List(values))=>if let Some(i)=normalize_index(index,values.len()){let value=values.remove(i);vm.set_reg(op.a,value.word());vm.advance(op)}else{vm.fail_at(op,"list removal index out of bounds")},_=>vm.fail_at(op,"ListRemoveAt operand is not list")}}
+unsafe fn h_list_remove_at(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));let removed=match vm.heap.get_mut(list){Some(HeapObject::List(values))=>if let Some(i)=normalize_index(index,values.len()){Some(values.remove(i))}else{vm.fail_at(op,"list removal index out of bounds");None},_=>{vm.fail_at(op,"ListRemoveAt operand is not list");None}};if let Some(value)=removed{vm.heap.refresh_jit_view(list);vm.set_reg(op.a,value.word());vm.advance(op)}}
 
 unsafe fn h_alloc_map(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let v=vm.heap.alloc(HeapObject::Map(WrenMap::default()));vm.set_reg(op.a,v.word());vm.advance(op)}
 unsafe fn h_map_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map=Value::from_word(vm.reg(op.b));match vm.heap.get(map){Some(HeapObject::Map(map))=>{vm.set_reg(op.a,i32_word(map.entries.len() as i32));vm.advance(op)},_=>vm.fail_at(op,"MapLen operand is not map")}}
@@ -5671,9 +5735,10 @@ unsafe fn h_map_set(vm:&mut Interpreter, ptr:*const PreparedOp){
         _=>{vm.fail_at(op,"MapSet operand is not map");return;}
     };
     if let Some(capacity)=resized{vm.heap.set_external_bytes(map_value,capacity*std::mem::size_of::<(MapKey,Value)>());}
+    vm.heap.refresh_jit_view(map_value);
     vm.advance(op)
 }
-unsafe fn h_map_remove(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map_value=Value::from_word(vm.reg(op.b));let key_value=Value::from_word(vm.reg(op.c));let key=match vm.value_to_map_key(key_value){Ok(k)=>k,Err(e)=>{vm.fail_at(op,e.message);return;}};match vm.heap.get_mut(map_value){Some(HeapObject::Map(map))=>{let v=map.entries.remove(&key).unwrap_or(Value::NULL);vm.set_reg(op.a,v.word());vm.advance(op)},_=>vm.fail_at(op,"MapRemove operand is not map")}}
+unsafe fn h_map_remove(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map_value=Value::from_word(vm.reg(op.b));let key_value=Value::from_word(vm.reg(op.c));let key=match vm.value_to_map_key(key_value){Ok(k)=>k,Err(e)=>{vm.fail_at(op,e.message);return;}};let value=match vm.heap.get_mut(map_value){Some(HeapObject::Map(map))=>Some(map.entries.remove(&key).unwrap_or(Value::NULL)),_=>{vm.fail_at(op,"MapRemove operand is not map");None}};if let Some(v)=value{vm.heap.refresh_jit_view(map_value);vm.set_reg(op.a,v.word());vm.advance(op)}}
 
 #[inline]
 fn decode_wren_code_point(bytes: &[u8], index: usize) -> (u32, usize) {
@@ -5917,7 +5982,8 @@ impl TraceRuntime for Interpreter<'_> {
         let banks = self.current_banks_mut();
         Ok(TraceActivationInputs { general, arguments: banks.arguments.as_mut_ptr(),
             returns: banks.returns.as_mut_ptr(), special: banks.special.as_mut_ptr(), runtime,
-            execute: execute_trace_runtime })
+            execute: execute_trace_runtime, heap_chunks: handles().jit_chunks(),
+            heap_write_barrier: trace_heap_write_barrier })
     }
 
     fn trace_materialize_constant(&self, constant: TraceConstant) -> Result<RegisterWord, RuntimeError> {
@@ -5934,6 +6000,16 @@ impl TraceRuntime for Interpreter<'_> {
     fn trace_unsupported_constant_error(&self, _: TraceConstant) -> RuntimeError {
         RuntimeError::new("unsupported trace constant")
     }
+}
+
+/// StickyImmix post barrier used by native heap stores. Generated code calls this
+/// only after all kind/bounds guards have succeeded and only when the stored value
+/// is heap-tagged. It cannot allocate or safepoint.
+unsafe extern "C" fn trace_heap_write_barrier(runtime: *mut std::ffi::c_void, object: usize) {
+    if object == 0 { return; }
+    let vm = unsafe { &mut *(runtime as *mut Interpreter<'_>) };
+    let object = unsafe { GcObject::from_address(object) };
+    unsafe { vm.heap.mutator.probable_write(object) };
 }
 
 /// The native caller has committed all dirty registers. A helper may collect,

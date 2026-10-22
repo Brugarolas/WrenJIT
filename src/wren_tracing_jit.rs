@@ -33,9 +33,11 @@
 //! can keep `sum` and `i` in native registers for the whole native loop.  There is
 //! no per-iteration store back to Wren R-registers.
 //!
-//! Numeric/control-flow operations lower directly to Cranelift. Other bytecodes lower
-//! to synchronized runtime calls. Calls which change frames/fibers terminate a
-//! trace AFTER executing the opcode; the manager can compile the continuation.
+//! Numeric/control-flow operations lower directly to Cranelift. Non-GC heap/module/
+//! container operations may use synchronized runtime leaf calls that preserve unrelated
+//! SSA values across the call. Full runtime calls still form a memory epoch. Calls which
+//! change frames/fibers terminate a trace AFTER executing the opcode; the manager can
+//! compile the continuation.
 //! No architectural register pointer or uncommitted GC root crosses such a call.
 
 #![allow(clippy::too_many_arguments)]
@@ -47,8 +49,9 @@ use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
 use std::mem::offset_of;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use cranelift::codegen::ir::UserFuncName;
+use cranelift::codegen::ir::{Type as ClifType, UserFuncName};
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{default_libcall_names, FuncId as ClifFuncId, Module};
 use cranelift::prelude::*;
@@ -59,7 +62,7 @@ use crate::wren_bytecode::{
     SpecialReg,
 };
 use crate::wren_ir::{
-    CmpKind, Constant, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, MethodKind,
+    CmpKind, Constant, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, MethodKind, Type,
 };
 use crate::wren_trace_ir::{
     verify_trace, ExitReason, ExitTarget, FrameDisposition, FrameSlot,
@@ -147,6 +150,7 @@ extern "C" fn native_cos(value: f64) -> f64 { value.cos() }
 extern "C" fn native_tan(value: f64) -> f64 { value.tan() }
 extern "C" fn native_log(value: f64) -> f64 { value.ln() }
 extern "C" fn native_exp(value: f64) -> f64 { value.exp() }
+unsafe extern "C" fn noop_heap_write_barrier(_: *mut c_void, _: usize) {}
 
 // =============================================================================
 // Native trace ABI
@@ -164,6 +168,62 @@ pub const TRACE_RESULT_RUNTIME: u32 = 4;
 /// per-entry TraceActivation buffer.
 pub const MAX_TRACE_EXIT_VALUES: usize = 768;
 
+/// Handle-table geometry shared with the interpreter. A live heap Value can only
+/// reference an already-installed chunk, and chunks are never relocated.
+pub const TRACE_HEAP_CHUNK_BITS: u32 = 10;
+pub const TRACE_HEAP_CHUNK_SIZE: usize = 1usize << TRACE_HEAP_CHUNK_BITS;
+pub const TRACE_HEAP_CHUNK_MASK: u32 = (TRACE_HEAP_CHUNK_SIZE as u32) - 1;
+
+/// Stable object kinds exposed to generated code. This is deliberately separate
+/// from the Rust `HeapObject` enum: Cranelift must never depend on Rust enum layout.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceHeapKind {
+    Invalid = 0,
+    String = 1,
+    List = 2,
+    Map = 3,
+    Cell = 4,
+    Instance = 5,
+}
+
+/// Stable JIT-visible sidecar for one Wren heap handle.
+///
+/// `address` is the moving MMTk object address and is rewritten by GC through the
+/// existing precise handle slot. `data` points only at stable external allocations
+/// (Box/Vec/Arc payloads), never into the moving GC object. `len` is the logical
+/// length used by fast paths. All fields are atomics so the GC/handle machinery can retain its
+/// existing shared handle-table representation.
+#[repr(C)]
+pub struct TraceHeapEntry {
+    pub(crate) address: AtomicUsize,
+    pub(crate) next_free: AtomicU32,
+    pub(crate) kind: AtomicU32,
+    pub(crate) data: AtomicUsize,
+    pub(crate) len: AtomicUsize,
+}
+
+impl TraceHeapEntry {
+    pub(crate) fn new(free_none: u32) -> Self {
+        Self {
+            address: AtomicUsize::new(0),
+            next_free: AtomicU32::new(free_none),
+            kind: AtomicU32::new(TraceHeapKind::Invalid as u32),
+            data: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn clear_jit_view(&self) {
+        self.kind.store(TraceHeapKind::Invalid as u32, Ordering::Relaxed);
+        self.data.store(0, Ordering::Relaxed);
+        self.len.store(0, Ordering::Relaxed);
+    }
+}
+
+pub type HeapWriteBarrierFn = unsafe extern "C" fn(*mut c_void, usize);
+
 #[repr(C, align(16))]
 pub struct TraceActivation {
     /// Base of the current Wren frame's contiguous GPR bank.
@@ -175,6 +235,10 @@ pub struct TraceActivation {
     /// Interpreter pointer/context reserved for later runtime-helper calls.
     pub runtime: *mut c_void,
     pub execute: RuntimeTraceFn,
+    /// Stable handle-table chunk array used by native heap fast paths.
+    pub heap_chunks: *const *mut TraceHeapEntry,
+    /// Non-allocating StickyImmix post-barrier slow path.
+    pub heap_write_barrier: HeapWriteBarrierFn,
 
     /// Dense native entry table and per-trace link-table pointers. The Cranelift
     /// dispatcher uses these to follow stitched trace-tree edges without returning
@@ -206,6 +270,8 @@ impl TraceActivation {
             special: inputs.special,
             runtime: inputs.runtime,
             execute: inputs.execute,
+            heap_chunks: inputs.heap_chunks,
+            heap_write_barrier: inputs.heap_write_barrier,
             trace_entries: std::ptr::null(),
             trace_link_tables: std::ptr::null(),
             current_links: std::ptr::null(),
@@ -234,6 +300,8 @@ pub struct TraceActivationInputs {
     pub special: *mut RegisterWord,
     pub runtime: *mut c_void,
     pub execute: RuntimeTraceFn,
+    pub heap_chunks: *const *mut TraceHeapEntry,
+    pub heap_write_barrier: HeapWriteBarrierFn,
 }
 
 pub type NativeTraceFn = unsafe extern "C" fn(*mut TraceActivation) -> u32;
@@ -287,8 +355,9 @@ pub enum ObservedClass {
 /// - expose pointers for the *current* frame in `trace_activation_inputs`;
 /// - execute `trace_execute_unfused_step` using the original opcode handler, not
 ///   an installed superinstruction;
-/// - keep those activation pointers stable while native code executes. The first
-///   native tier emits no allocating/runtime calls, so this naturally holds.
+/// - keep those activation pointers stable while native code executes. Native
+///   runtime leaf calls are restricted to bytecodes whose contract forbids GC and
+///   frame/fiber changes, so the register-bank pointers remain stable across them.
 pub trait TraceRuntime {
     type RuntimeError: Error + Send + Sync + 'static;
 
@@ -404,7 +473,8 @@ pub struct TracingJitOptions {
     /// Ask Cranelift for post-regalloc VCode and retain/print it.
     pub cranelift_dump_disassembly: bool,
 
-    /// Restrict compilation to numeric traces, for diagnostics/comparison.
+    /// Reject the generic full-state runtime fallback for unsupported opcodes.
+    /// Explicitly whitelisted non-GC leaf operations use a small internal budget.
     pub no_runtime_calls_in_native_trace: bool,
 }
 
@@ -425,9 +495,9 @@ impl Default for TracingJitOptions {
             cranelift_dump_ir: false,
             cranelift_dump_disassembly: false,
 
-            // Until an opcode has a real native lowering, do not compile a
-            // trace that bounces through Rust for it on every iteration. Such a
-            // trace is normally slower than the threaded interpreter.
+            // Until an opcode has a real native lowering, do not use the generic
+            // full-state fallback. A small number of non-GC leaf helpers is still
+            // profitable in mixed traces because unaffected SSA values stay native.
             no_runtime_calls_in_native_trace: true,
         }
     }
@@ -696,6 +766,12 @@ fn deopt_resume(
 // Recorder helpers
 // =============================================================================
 
+/// Keep mixed traces from degenerating into a native-to-Rust call trampoline.
+/// The whitelist is intentionally small: leaf helpers are for occasional heap or
+/// module operations between larger native regions, not for replacing baseline
+/// dispatch one opcode at a time.
+const MAX_RUNTIME_LEAF_OPS_PER_TRACE: usize = 8;
+
 struct TraceRecorder<'a> {
     options: &'a TracingJitOptions,
     trace_id: TraceId,
@@ -889,6 +965,42 @@ impl<'a> TraceRecorder<'a> {
             TraceType::UInt32,
             TraceRep::UInt32,
         )
+    }
+
+    /// Trace through a VM operation that is guaranteed by the bytecode contract
+    /// to neither GC nor change frames. Dirty architectural registers are committed
+    /// for precise exceptional state, but successful execution keeps unrelated SSA
+    /// values alive across the helper call.
+    fn runtime_leaf(
+        &self,
+        op: &RecordedOp,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
+        outputs: &[(Reg, TraceType, TraceRep)],
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if op.opcode.may_gc() {
+            return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+        }
+
+        let used = builder
+            .trace()
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, TraceInst::Runtime { .. }))
+            .count();
+        if used >= MAX_RUNTIME_LEAF_OPS_PER_TRACE {
+            return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+        }
+
+        builder.runtime_leaf(op.location, op.next_pc);
+        for &(reg, ty, rep) in outputs {
+            builder.reload_slot_after_runtime(FrameSlot::General(reg), ty, rep);
+        }
+
+        // Treat the recorded execution as a runtime step as well. On the hot
+        // successful path it must advance to `next_pc`; if the opcode throws,
+        // deoptimizes or otherwise changes control flow while recording, the
+        // recorder ends the trace cleanly instead of reporting a path mismatch.
+        Ok(ExpectedStep::Runtime { terminal: false })
     }
 
     fn record_num_invoke<R: TraceRuntime>(
@@ -1142,11 +1254,7 @@ impl<'a> TraceRecorder<'a> {
         // representation conflict. Roll back that attempt before using a helper.
         let checkpoint = (!self.options.no_runtime_calls_in_native_trace)
             .then(|| builder.clone());
-        let attempt = if matches!(op.opcode, Opcode::Switch | Opcode::OsrPoint | Opcode::ReadBarrier) {
-            Err(RecordingAbort::UnsupportedOpcode(op.opcode))
-        } else {
-            self.translate_native(runtime, program, function, op, builder)
-        };
+        let attempt = self.translate_native(runtime, program, function, op, builder);
         match attempt {
             Ok(step) => Ok(step),
             Err(reason) if self.options.no_runtime_calls_in_native_trace => Err(reason),
@@ -1252,7 +1360,13 @@ impl<'a> TraceRecorder<'a> {
                     Constant::Int32(value) => {
                         builder.constant(TraceConstant::Int32(*value))
                     }
-                    Constant::String(_) => return Err(RecordingAbort::UnsupportedConstant),
+                    Constant::String(_) => {
+                        return self.runtime_leaf(
+                            op,
+                            builder,
+                            &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                        );
+                    }
                 };
                 self.write_gpr(builder, op.a, value);
                 Ok(ExpectedStep::Exact(next))
@@ -1392,49 +1506,123 @@ impl<'a> TraceRecorder<'a> {
             }
 
             Switch => {
-                let tag = self.read_gpr(
-                    builder,
-                    op.a,
-                    TraceType::Any,
-                    TraceRep::Tagged,
-                )?;
+                let slot = FrameSlot::General(Reg(op.a));
                 let physical = runtime
-                    .trace_read_slot(FrameSlot::General(Reg(op.a)))
+                    .trace_read_slot(slot)
                     .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
 
-                let key = if let Some(number) = word_num(physical) {
-                    number as i64
-                } else {
-                    physical.0 as u32 as i32 as i64
+                // A trace only needs to prove that the switch keeps taking the
+                // recorded path. Guard the exact observed value instead of
+                // reproducing the whole jump table in native code. This is both
+                // cheaper and works for tagged and unboxed switch tags.
+                let known = builder.slot_value(slot).and_then(|value| {
+                    let value = builder.trace().canonical_value(value);
+                    builder.trace().value(value).map(|desc| (desc.ty, desc.rep))
+                });
+
+                let (tag, observed_value, key) = match known {
+                    Some((ty, TraceRep::Int32)) => {
+                        let raw = physical.0 as u32 as i32;
+                        let tag = self.read_gpr(builder, op.a, ty, TraceRep::Int32)?;
+                        let constant = builder.constant(TraceConstant::Int32(raw));
+                        (tag, constant, raw as i64)
+                    }
+                    Some((ty, TraceRep::UInt32)) => {
+                        let raw = physical.0 as u32;
+                        let tag = self.read_gpr(builder, op.a, ty, TraceRep::UInt32)?;
+                        let constant = builder.constant(TraceConstant::Int32(raw as i32));
+                        let constant = builder.emit1(
+                            TraceInst::Reinterpret { value: constant },
+                            TraceType::UInt32,
+                            TraceRep::UInt32,
+                        );
+                        (tag, constant, raw as i64)
+                    }
+                    Some((ty, TraceRep::Bool)) => {
+                        let raw = physical.0 as u32 as i32;
+                        let tag = self.read_gpr(builder, op.a, ty, TraceRep::Bool)?;
+                        let constant = builder.constant(TraceConstant::Int32(raw));
+                        let constant = builder.emit1(
+                            TraceInst::Reinterpret { value: constant },
+                            TraceType::Bool,
+                            TraceRep::Bool,
+                        );
+                        (tag, constant, raw as i64)
+                    }
+                    Some((ty, TraceRep::F64)) => {
+                        let number = f64::from_bits(physical.0);
+                        if number.is_nan() {
+                            return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+                        }
+                        let tag = self.read_gpr(builder, op.a, ty, TraceRep::F64)?;
+                        let constant = builder.constant(TraceConstant::F64Bits(physical.0));
+                        (tag, constant, number as i64)
+                    }
+                    Some((ty, TraceRep::Tagged))
+                        if matches!(ty, TraceType::Any | TraceType::Num) && word_is_num(physical) =>
+                    {
+                        let number = f64::from_bits(physical.0);
+                        let tag = self.read_gpr(
+                            builder,
+                            op.a,
+                            TraceType::Num,
+                            TraceRep::Tagged,
+                        )?;
+                        let constant = builder.constant(TraceConstant::NumBits(physical.0));
+                        (tag, constant, number as i64)
+                    }
+                    Some((ty, TraceRep::Tagged)) if physical.0 == TAG_NULL => {
+                        let tag = self.read_gpr(builder, op.a, ty, TraceRep::Tagged)?;
+                        let constant = builder.constant(TraceConstant::Null);
+                        (tag, constant, physical.0 as u32 as i32 as i64)
+                    }
+                    Some((ty, TraceRep::Tagged))
+                        if physical.0 == TAG_FALSE || physical.0 == TAG_TRUE =>
+                    {
+                        let tag = self.read_gpr(builder, op.a, ty, TraceRep::Tagged)?;
+                        let constant = builder.constant(TraceConstant::Bool(physical.0 == TAG_TRUE));
+                        (tag, constant, physical.0 as u32 as i32 as i64)
+                    }
+                    None if word_is_num(physical) => {
+                        let number = f64::from_bits(physical.0);
+                        let tag = self.read_gpr(
+                            builder,
+                            op.a,
+                            TraceType::Num,
+                            TraceRep::Tagged,
+                        )?;
+                        let constant = builder.constant(TraceConstant::NumBits(physical.0));
+                        (tag, constant, number as i64)
+                    }
+                    None if physical.0 == TAG_NULL => {
+                        let tag = self.read_gpr(builder, op.a, TraceType::Null, TraceRep::Tagged)?;
+                        let constant = builder.constant(TraceConstant::Null);
+                        (tag, constant, physical.0 as u32 as i32 as i64)
+                    }
+                    None if physical.0 == TAG_FALSE || physical.0 == TAG_TRUE => {
+                        let tag = self.read_gpr(builder, op.a, TraceType::Bool, TraceRep::Tagged)?;
+                        let constant = builder.constant(TraceConstant::Bool(physical.0 == TAG_TRUE));
+                        (tag, constant, physical.0 as u32 as i32 as i64)
+                    }
+                    _ => return Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
                 };
 
                 let Some(table) = function.chunk.switch_tables.get(op.x as usize) else {
                     return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
                 };
 
-                let mut selected = table.default_target;
-                let mut is_case = false;
-                for case in &table.cases {
-                    if case.value == key {
-                        selected = case.target;
-                        is_case = true;
-                        break;
-                    }
-                }
+                let selected = table
+                    .cases
+                    .iter()
+                    .find(|case| case.value == key)
+                    .map(|case| case.target)
+                    .unwrap_or(table.default_target);
 
-                // If the speculation fails, reexecute the original switch. This
-                // handles all alternate cases without one exit per case.
+                // On a different value, reexecute the original switch in baseline.
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
-                let observed = if is_case {
-                    TraceSwitchGuard::Case(key)
-                } else {
-                    TraceSwitchGuard::Default {
-                        excluded: table.cases.iter().map(|case| case.value).collect(),
-                    }
-                };
-                builder.emit0(TraceInst::GuardSwitch {
-                    tag,
-                    observed,
+                builder.emit0(TraceInst::GuardEq {
+                    lhs: tag,
+                    rhs: observed_value,
                     exit,
                 });
 
@@ -1569,12 +1757,70 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
-            GuardType | GuardClass | Bailout => {
-                // Type/Class guards need the runtime's heap/class representation.
-                // The IR supports them, but the first native tier deliberately
-                // does not make that private representation part of its ABI.
-                Err(RecordingAbort::UnsupportedOpcode(op.opcode))
+            GuardType => {
+                let Some(descriptor) = function.chunk.type_guards.get(op.x as usize) else {
+                    return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+                };
+                let expected = match &descriptor.expected {
+                    Type::Top => TraceType::Any,
+                    Type::Null => TraceType::Null,
+                    Type::Bool => TraceType::Bool,
+                    Type::Num => TraceType::Num,
+                    // Heap/reference guards still use the VM's private class
+                    // representation, but GuardType itself is non-GC. Trace it
+                    // through the synchronized leaf boundary and preserve the
+                    // rest of the native SSA state on the successful path.
+                    _ => {
+                        return self.runtime_leaf(
+                            op,
+                            builder,
+                            &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                        );
+                    }
+                };
+
+                let physical = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let matches = match expected {
+                    TraceType::Any => true,
+                    TraceType::Null => physical.0 == TAG_NULL,
+                    TraceType::Bool => physical.0 == TAG_FALSE || physical.0 == TAG_TRUE,
+                    TraceType::Num => word_is_num(physical),
+                    _ => false,
+                };
+                if !matches {
+                    return Err(RecordingAbort::GuardFailedWhileRecording);
+                }
+
+                let source = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let result = if expected == TraceType::Any {
+                    source
+                } else {
+                    let resume = deopt_resume(function, op.y).unwrap_or(op.location.pc);
+                    let reason = match expected {
+                        TraceType::Null | TraceType::Bool => ExitReason::GuardValue,
+                        TraceType::Num => ExitReason::GuardNumber,
+                        _ => ExitReason::GuardValue,
+                    };
+                    let exit = builder.add_side_exit(reason, resume);
+                    builder.emit1(
+                        TraceInst::GuardType { value: source, expected, exit },
+                        expected,
+                        TraceRep::Tagged,
+                    )
+                };
+                self.write_gpr(builder, op.a, result);
+                Ok(ExpectedStep::Exact(next))
             }
+
+            GuardClass => self.runtime_leaf(
+                op,
+                builder,
+                &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+            ),
+
+            Bailout => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
 
             Invoke => {
                 if self.record_num_invoke(runtime, program, function, op, builder)? {
@@ -1641,9 +1887,36 @@ impl<'a> TraceRecorder<'a> {
             }
 
             IDivS | IRemS => {
-                // Keep division-by-zero and MIN/-1 semantics exact by not tracing
-                // raw integer division/remainder until explicit checks are emitted.
-                Err(RecordingAbort::UnsupportedOpcode(op.opcode))
+                let lhs = self.read_gpr(
+                    builder,
+                    op.b,
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                )?;
+                let rhs = self.read_gpr(
+                    builder,
+                    op.c,
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                )?;
+                let exit = builder.add_side_exit(ExitReason::GuardInteger, op.location.pc);
+                let operation = if op.opcode == IDivS {
+                    IntBinOp::DivS
+                } else {
+                    IntBinOp::RemS
+                };
+                let result = builder.emit1(
+                    TraceInst::IntBinaryChecked {
+                        op: operation,
+                        lhs,
+                        rhs,
+                        exit,
+                    },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                self.write_gpr(builder, op.a, result);
+                Ok(ExpectedStep::Exact(next))
             }
 
             FNeg => {
@@ -1857,24 +2130,146 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
-            ReadBarrier => {
-                let source = self.read_gpr(
-                    builder,
-                    op.b,
+            LoadField => {
+                let object = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let result = builder.emit1(
+                    TraceInst::HeapLoadField { object, slot: op.x, exit },
                     TraceType::Any,
                     TraceRep::Tagged,
-                )?;
-                self.write_gpr(builder, op.a, source);
+                );
+                self.write_gpr(builder, op.a, result);
                 Ok(ExpectedStep::Exact(next))
             }
 
-            WriteBarrier => {
-                // The current interpreter barrier is a no-op. Do not bake that
-                // collector detail into native code yet.
-                Err(RecordingAbort::UnsupportedOpcode(op.opcode))
+            StoreField => {
+                let object = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                builder.emit0(TraceInst::HeapStoreField { object, value, slot: op.x, exit });
+                Ok(ExpectedStep::Exact(next))
             }
 
-            ProfileBlock | ProfileNumeric | Safepoint | Breakpoint => {
+            LoadCell => {
+                let cell = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let result = builder.emit1(
+                    TraceInst::HeapLoadCell { cell, exit },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                self.write_gpr(builder, op.a, result);
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            StoreCell => {
+                let cell = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                builder.emit0(TraceInst::HeapStoreCell { cell, value, exit });
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            ListLen => {
+                let list = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let result = builder.emit1(
+                    TraceInst::HeapListLen { list, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                self.write_gpr(builder, op.a, result);
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            ListGet => {
+                let list = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let index = self.read_gpr(builder, op.c, TraceType::Int32, TraceRep::Int32)?;
+                let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
+                let result = builder.emit1(
+                    TraceInst::HeapListGet { list, index, exit },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                self.write_gpr(builder, op.a, result);
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            ListSet => {
+                let list = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                let index = self.read_gpr(builder, op.b, TraceType::Int32, TraceRep::Int32)?;
+                let value = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
+                builder.emit0(TraceInst::HeapListSet { list, index, value, exit });
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            MapLen => {
+                let map = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let result = builder.emit1(
+                    TraceInst::HeapMapLen { map, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                self.write_gpr(builder, op.a, result);
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            StringLen => {
+                let string = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let result = builder.emit1(
+                    TraceInst::HeapStringLen { string, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                self.write_gpr(builder, op.a, result);
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            ReadBarrier => {
+                let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let result = builder.emit1(
+                    TraceInst::ReadBarrier { value },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                self.write_gpr(builder, op.a, result);
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            // Remaining non-GC runtime leaf operations preserve unrelated native
+            // SSA values instead of forcing the full runtime memory epoch.
+            LoadStaticField
+            | LoadModuleVar
+            | ListRemoveAt
+            | MapGet
+            | MapRemove => self.runtime_leaf(
+                op,
+                builder,
+                &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+            ),
+
+            IsInstance => self.runtime_leaf(
+                op,
+                builder,
+                &[(Reg(op.a), TraceType::Bool, TraceRep::Tagged)],
+            ),
+
+            StringCodePointAt => self.runtime_leaf(
+                op,
+                builder,
+                &[(Reg(op.a), TraceType::Int32, TraceRep::Int32)],
+            ),
+
+            StoreStaticField
+            | StoreModuleVar
+            | WriteBarrier
+            | ProfileBlock
+            | ProfileNumeric => self.runtime_leaf(op, builder, &[]),
+
+            Safepoint | Breakpoint => {
                 Err(RecordingAbort::UnsupportedOpcode(op.opcode))
             }
 
@@ -1891,36 +2286,18 @@ impl<'a> TraceRecorder<'a> {
             | BindForeignMethod
             | AllocInstance
             | AllocForeign
-            | LoadField
-            | StoreField
-            | LoadStaticField
-            | StoreStaticField
-            | IsInstance
             | ImportModule
             | ImportVariable
-            | LoadModuleVar
-            | StoreModuleVar
             | AllocCell
-            | LoadCell
-            | StoreCell
             | MakeClosure
             | AllocList
             | AllocListCap
-            | ListLen
-            | ListGet
-            | ListSet
             | ListAppend
             | ListInsert
-            | ListRemoveAt
             | AllocMap
-            | MapLen
-            | MapGet
             | MapSet
-            | MapRemove
-            | StringLen
             | StringConcat
             | StringSlice
-            | StringCodePointAt
             | MakeRange
             | MakeFiber
             | FiberCall
@@ -2635,8 +3012,9 @@ struct CraneliftLoweringState<'a, 'p> {
     builder: FunctionBuilder<'a>,
     trace: &'p Trace,
     activation: Value,
-    pointer_type: Type,
+    pointer_type: ClifType,
     runtime_signature: codegen::ir::SigRef,
+    heap_barrier_signature: codegen::ir::SigRef,
     values: Vec<Option<Value>>,
     exit_plans: &'p [CompiledExitPlan],
     /// Current loop budget block parameter. The manager derives completed native
@@ -2708,6 +3086,10 @@ impl<'a> CraneliftTraceCompiler<'a> {
         runtime_signature.params.push(AbiParam::new(types::I32));
         runtime_signature.returns.push(AbiParam::new(types::I32));
 
+        let mut heap_barrier_signature = module.make_signature();
+        heap_barrier_signature.params.push(AbiParam::new(pointer_type));
+        heap_barrier_signature.params.push(AbiParam::new(pointer_type));
+
         context.func.signature = signature;
         context.func.name = UserFuncName::user(0, function.as_u32());
         context.set_disasm(self.options.cranelift_dump_disassembly);
@@ -2726,6 +3108,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
             builder.switch_to_block(entry_block);
             let activation = builder.block_params(entry_block)[0];
             let runtime_signature = builder.import_signature(runtime_signature);
+            let heap_barrier_signature = builder.import_signature(heap_barrier_signature);
 
             let mut state = CraneliftLoweringState {
                 builder,
@@ -2733,6 +3116,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 activation,
                 pointer_type,
                 runtime_signature,
+                heap_barrier_signature,
                 values: vec![None; self.trace.values.len()],
                 exit_plans: &self.exit_plans,
                 native_budget_remaining: None,
@@ -3614,6 +3998,201 @@ impl CraneliftLoweringState<'_, '_> {
         self.builder.inst_results(call)[0]
     }
 
+    fn trace_value_may_be_heap(&self, value: TraceValueId) -> Result<bool, TracingJitError> {
+        let value = self.trace.value(value).ok_or_else(|| self.error("unknown heap-store value"))?;
+        Ok(matches!(value.ty, TraceType::Any))
+    }
+
+    /// Guard a tagged Wren value as a particular JIT-visible heap kind and return
+    /// `(entry_ptr, current_gc_object_address)`. The handle-table entry is stable;
+    /// the MMTk object address itself is reloaded on every native operation.
+    fn guard_heap_entry(
+        &mut self,
+        tagged: Value,
+        expected: TraceHeapKind,
+        exit: SideExitId,
+    ) -> Result<(Value, Value), TracingJitError> {
+        let heap_mask = self.builder.ins().iconst(types::I64, TAG_HEAP_MASK as i64);
+        let heap_tag = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
+        let masked = self.builder.ins().band(tagged, heap_mask);
+        let is_heap = self.builder.ins().icmp(IntCC::Equal, masked, heap_tag);
+        let is_heap = self.bool32(is_heap);
+        let not_heap = self.bool_not(is_heap);
+        self.emit_side_exit(exit, not_heap)?;
+
+        let payload_mask = self.builder.ins().iconst(types::I64, PAYLOAD_MASK as i64);
+        let handle = self.builder.ins().band(tagged, payload_mask);
+        let chunk_index = self
+            .builder
+            .ins()
+            .ushr_imm_u(handle, TRACE_HEAP_CHUNK_BITS as i64);
+        let entry_index_mask = self
+            .builder
+            .ins()
+            .iconst(types::I64, TRACE_HEAP_CHUNK_MASK as i64);
+        let entry_index = self.builder.ins().band(handle, entry_index_mask);
+
+        let chunk_stride = self.builder.ins().iconst(types::I64, std::mem::size_of::<usize>() as i64);
+        let chunk_offset = self.builder.ins().imul(chunk_index, chunk_stride);
+        let chunks = self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            self.activation,
+            offset_of!(TraceActivation, heap_chunks) as i32,
+        );
+        let chunk_slot = self.builder.ins().iadd(chunks, chunk_offset);
+        let chunk = self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            chunk_slot,
+            0,
+        );
+
+        let entry_stride = self
+            .builder
+            .ins()
+            .iconst(types::I64, std::mem::size_of::<TraceHeapEntry>() as i64);
+        let entry_offset = self.builder.ins().imul(entry_index, entry_stride);
+        let entry = self.builder.ins().iadd(chunk, entry_offset);
+
+        let address = self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            entry,
+            offset_of!(TraceHeapEntry, address) as i32,
+        );
+        let dead = self.builder.ins().icmp_imm_u(IntCC::Equal, address, 0);
+        let dead = self.bool32(dead);
+        self.emit_side_exit(exit, dead)?;
+
+        let kind = self.builder.ins().load(
+            types::I32,
+            Self::trusted_mem(),
+            entry,
+            offset_of!(TraceHeapEntry, kind) as i32,
+        );
+        let matches_kind = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, kind, expected as i64);
+        let matches_kind = self.bool32(matches_kind);
+        let wrong_kind = self.bool_not(matches_kind);
+        self.emit_side_exit(exit, wrong_kind)?;
+
+        Ok((entry, address))
+    }
+
+    fn heap_entry_data(&mut self, entry: Value) -> Value {
+        self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            entry,
+            offset_of!(TraceHeapEntry, data) as i32,
+        )
+    }
+
+    fn heap_entry_len(&mut self, entry: Value) -> Value {
+        self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            entry,
+            offset_of!(TraceHeapEntry, len) as i32,
+        )
+    }
+
+    fn guard_constant_index(
+        &mut self,
+        len: Value,
+        index: u32,
+        exit: SideExitId,
+    ) -> Result<(), TracingJitError> {
+        let in_bounds = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedGreaterThan, len, index as i64);
+        let in_bounds = self.bool32(in_bounds);
+        let fail = self.bool_not(in_bounds);
+        self.emit_side_exit(exit, fail)
+    }
+
+    fn normalize_list_index(
+        &mut self,
+        index: Value,
+        len: Value,
+        exit: SideExitId,
+    ) -> Result<Value, TracingJitError> {
+        let index = self.builder.ins().sextend(types::I64, index);
+        let negative = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, index, 0);
+        let from_end = self.builder.ins().iadd(len, index);
+        let normalized = self.builder.ins().select(negative, from_end, index);
+
+        let non_negative = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, normalized, 0);
+        let below_len = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, normalized, len);
+        let non_negative = self.bool32(non_negative);
+        let below_len = self.bool32(below_len);
+        let in_bounds = self.bool_and(non_negative, below_len);
+        let fail = self.bool_not(in_bounds);
+        self.emit_side_exit(exit, fail)?;
+        Ok(normalized)
+    }
+
+    fn heap_element_address(&mut self, data: Value, index: Value) -> Value {
+        let scale = self.builder.ins().iconst(types::I64, std::mem::size_of::<RegisterWord>() as i64);
+        let offset = self.builder.ins().imul(index, scale);
+        self.builder.ins().iadd(data, offset)
+    }
+
+    /// Emit the StickyImmix probable-write barrier only when a tagged value is a
+    /// heap reference. Known scalar trace types elide the barrier completely.
+    fn emit_heap_write_barrier(
+        &mut self,
+        owner_address: Value,
+        value_id: TraceValueId,
+        tagged: Value,
+    ) -> Result<(), TracingJitError> {
+        if !self.trace_value_may_be_heap(value_id)? {
+            return Ok(());
+        }
+
+        let mask = self.builder.ins().iconst(types::I64, TAG_HEAP_MASK as i64);
+        let tag = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
+        let masked = self.builder.ins().band(tagged, mask);
+        let is_heap = self.builder.ins().icmp(IntCC::Equal, masked, tag);
+
+        let barrier = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.ins().brif(is_heap, barrier, &[], done, &[]);
+
+        self.builder.switch_to_block(barrier);
+        let callee = self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            self.activation,
+            offset_of!(TraceActivation, heap_write_barrier) as i32,
+        );
+        let runtime = self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            self.activation,
+            offset_of!(TraceActivation, runtime) as i32,
+        );
+        self.builder.ins().call_indirect(
+            self.heap_barrier_signature,
+            callee,
+            &[runtime, owner_address],
+        );
+        self.builder.ins().jump(done, &[]);
+
+        self.builder.switch_to_block(done);
+        Ok(())
+    }
+
     fn lower_node(
         &mut self,
         node: &crate::wren_trace_ir::TraceNode,
@@ -4175,6 +4754,115 @@ impl CraneliftLoweringState<'_, '_> {
                 self.cache_value(one_result(node)?, handle);
             }
 
+            HeapLoadField { object, slot, exit } => {
+                let tagged = self.lower_value(*object)?;
+                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::Instance, *exit)?;
+                let len = self.heap_entry_len(entry);
+                self.guard_constant_index(len, *slot, *exit)?;
+                let data = self.heap_entry_data(entry);
+                let index = self.builder.ins().iconst(types::I64, *slot as i64);
+                let address = self.heap_element_address(data, index);
+                let result = self.builder.ins().load(
+                    types::I64,
+                    Self::trusted_mem(),
+                    address,
+                    0,
+                );
+                self.cache_value(one_result(node)?, result);
+            }
+
+            HeapStoreField { object, value, slot, exit } => {
+                let tagged_object = self.lower_value(*object)?;
+                let tagged_value = self.lower_value(*value)?;
+                let (entry, owner_address) =
+                    self.guard_heap_entry(tagged_object, TraceHeapKind::Instance, *exit)?;
+                let len = self.heap_entry_len(entry);
+                self.guard_constant_index(len, *slot, *exit)?;
+                let data = self.heap_entry_data(entry);
+                let index = self.builder.ins().iconst(types::I64, *slot as i64);
+                let address = self.heap_element_address(data, index);
+                self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
+                self.builder.ins().store(Self::trusted_mem(), tagged_value, address, 0);
+            }
+
+            HeapLoadCell { cell, exit } => {
+                let tagged = self.lower_value(*cell)?;
+                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::Cell, *exit)?;
+                let data = self.heap_entry_data(entry);
+                let result = self.builder.ins().load(
+                    types::I64,
+                    Self::trusted_mem(),
+                    data,
+                    0,
+                );
+                self.cache_value(one_result(node)?, result);
+            }
+
+            HeapStoreCell { cell, value, exit } => {
+                let tagged_cell = self.lower_value(*cell)?;
+                let tagged_value = self.lower_value(*value)?;
+                let (entry, owner_address) =
+                    self.guard_heap_entry(tagged_cell, TraceHeapKind::Cell, *exit)?;
+                let data = self.heap_entry_data(entry);
+                self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
+                self.builder.ins().store(Self::trusted_mem(), tagged_value, data, 0);
+            }
+
+            HeapListLen { list, exit } => {
+                let tagged = self.lower_value(*list)?;
+                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::List, *exit)?;
+                let len = self.heap_entry_len(entry);
+                let len = self.builder.ins().ireduce(types::I32, len);
+                self.cache_value(one_result(node)?, len);
+            }
+
+            HeapListGet { list, index, exit } => {
+                let tagged = self.lower_value(*list)?;
+                let index = self.lower_value(*index)?;
+                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::List, *exit)?;
+                let len = self.heap_entry_len(entry);
+                let index = self.normalize_list_index(index, len, *exit)?;
+                let data = self.heap_entry_data(entry);
+                let address = self.heap_element_address(data, index);
+                let result = self.builder.ins().load(
+                    types::I64,
+                    Self::trusted_mem(),
+                    address,
+                    0,
+                );
+                self.cache_value(one_result(node)?, result);
+            }
+
+            HeapListSet { list, index, value, exit } => {
+                let tagged_list = self.lower_value(*list)?;
+                let index = self.lower_value(*index)?;
+                let tagged_value = self.lower_value(*value)?;
+                let (entry, owner_address) =
+                    self.guard_heap_entry(tagged_list, TraceHeapKind::List, *exit)?;
+                let len = self.heap_entry_len(entry);
+                let index = self.normalize_list_index(index, len, *exit)?;
+                let data = self.heap_entry_data(entry);
+                let address = self.heap_element_address(data, index);
+                self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
+                self.builder.ins().store(Self::trusted_mem(), tagged_value, address, 0);
+            }
+
+            HeapMapLen { map, exit } => {
+                let tagged = self.lower_value(*map)?;
+                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::Map, *exit)?;
+                let len = self.heap_entry_len(entry);
+                let len = self.builder.ins().ireduce(types::I32, len);
+                self.cache_value(one_result(node)?, len);
+            }
+
+            HeapStringLen { string, exit } => {
+                let tagged = self.lower_value(*string)?;
+                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::String, *exit)?;
+                let len = self.heap_entry_len(entry);
+                let len = self.builder.ins().ireduce(types::I32, len);
+                self.cache_value(one_result(node)?, len);
+            }
+
             ReadBarrier { value } => {
                 let value = self.lower_value(*value)?;
                 self.cache_value(one_result(node)?, value);
@@ -4185,7 +4873,7 @@ impl CraneliftLoweringState<'_, '_> {
     }
 }
 
-fn clif_type(rep: TraceRep) -> Type {
+fn clif_type(rep: TraceRep) -> ClifType {
     match rep {
         TraceRep::Tagged | TraceRep::HeapHandle | TraceRep::RawPtr => types::I64,
         TraceRep::Int32 | TraceRep::UInt32 | TraceRep::Bool => types::I32,
@@ -5134,6 +5822,8 @@ mod tests {
                         arguments: std::ptr::null_mut(), returns: std::ptr::null_mut(),
                         special: std::ptr::null_mut(), runtime: std::ptr::null_mut(),
                         execute: unexpected_runtime,
+                        heap_chunks: std::ptr::null(),
+                        heap_write_barrier: noop_heap_write_barrier,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
                     assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
@@ -5176,6 +5866,8 @@ mod tests {
                         special: std::ptr::null_mut(),
                         runtime: std::ptr::null_mut(),
                         execute: unexpected_runtime,
+                        heap_chunks: std::ptr::null(),
+                        heap_write_barrier: noop_heap_write_barrier,
                     });
                     activation.current_links = compiled.native_links.as_ptr();
                     if tagged {
@@ -5279,6 +5971,138 @@ mod tests {
             ..default
         };
         assert_eq!(disabled.native_loop_iteration_budget, 0);
+    }
+
+    #[test]
+    fn runtime_leaf_preserves_unrelated_ssa_and_reloads_output() {
+        unsafe extern "C" fn runtime_leaf(
+            activation: *mut TraceActivation,
+            _: u32,
+            _: u32,
+            _: u32,
+        ) -> u32 {
+            let activation = unsafe { &mut *activation };
+            let general = activation.general;
+            unsafe {
+                *general.add(1) = RegisterWord(6);
+            }
+            TRACE_RESULT_CONTINUE
+        }
+
+        let location = TraceLocation::new(FuncId(0), BytecodePc(0));
+        let mut builder = crate::wren_trace_ir::TraceBuilder::new(
+            TraceId(76),
+            TraceAnchor { kind: TraceKind::Side, location },
+        );
+        let preserved = builder.constant(TraceConstant::Int32(40));
+        builder.write_slot(FrameSlot::General(Reg(0)), preserved);
+        builder.runtime_leaf(location, BytecodePc(1));
+        let runtime_result = builder.reload_slot_after_runtime(
+            FrameSlot::General(Reg(1)),
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        let sum = builder.emit1(
+            TraceInst::IntBinary {
+                op: IntBinOp::Add,
+                lhs: preserved,
+                rhs: runtime_result,
+            },
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        builder.write_slot(FrameSlot::General(Reg(2)), sum);
+        let success = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(2));
+        builder.set_terminator(TraceTerminator::Exit(success));
+        let trace = builder.finish().unwrap();
+
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        let compiled = jit.compile_trace(&trace).unwrap();
+        let mut general = [RegisterWord(0); 4];
+        let mut activation = TraceActivation::new(TraceActivationInputs {
+            general: general.as_mut_ptr(),
+            arguments: std::ptr::null_mut(),
+            returns: std::ptr::null_mut(),
+            special: std::ptr::null_mut(),
+            runtime: std::ptr::null_mut(),
+            execute: runtime_leaf,
+            heap_chunks: std::ptr::null(),
+            heap_write_barrier: noop_heap_write_barrier,
+        });
+        activation.current_links = compiled.native_links.as_ptr();
+
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(activation.exit_id, success.0);
+        assert_eq!(general[0].0 as u32 as i32, 40);
+        assert_eq!(general[1].0 as u32 as i32, 6);
+        assert_eq!(general[2].0 as u32 as i32, 46);
+    }
+
+    #[test]
+    fn checked_integer_division_lowers_and_exits_on_invalid_inputs() {
+        unsafe extern "C" fn unexpected_runtime(
+            _: *mut TraceActivation, _: u32, _: u32, _: u32,
+        ) -> u32 { TRACE_RESULT_RUNTIME }
+
+        let location = TraceLocation::new(FuncId(0), BytecodePc(0));
+        let mut builder = crate::wren_trace_ir::TraceBuilder::new(
+            TraceId(77),
+            TraceAnchor { kind: TraceKind::Side, location },
+        );
+        let lhs = builder.read_slot(
+            FrameSlot::General(Reg(0)),
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        let rhs = builder.read_slot(
+            FrameSlot::General(Reg(1)),
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        let invalid = builder.add_side_exit(ExitReason::GuardInteger, BytecodePc(0));
+        let quotient = builder.emit1(
+            TraceInst::IntBinaryChecked {
+                op: IntBinOp::DivS,
+                lhs,
+                rhs,
+                exit: invalid,
+            },
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        builder.write_slot(FrameSlot::General(Reg(2)), quotient);
+        let success = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(1));
+        builder.set_terminator(TraceTerminator::Exit(success));
+        let trace = builder.finish().unwrap();
+
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        let compiled = jit.compile_trace(&trace).unwrap();
+        let mut general = [RegisterWord(0); 4];
+        let mut activation = TraceActivation::new(TraceActivationInputs {
+            general: general.as_mut_ptr(),
+            arguments: std::ptr::null_mut(),
+            returns: std::ptr::null_mut(),
+            special: std::ptr::null_mut(),
+            runtime: std::ptr::null_mut(),
+            execute: unexpected_runtime,
+            heap_chunks: std::ptr::null(),
+            heap_write_barrier: noop_heap_write_barrier,
+        });
+        activation.current_links = compiled.native_links.as_ptr();
+
+        general[0] = RegisterWord(21);
+        general[1] = RegisterWord(3);
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(activation.exit_id, success.0);
+        assert_eq!(general[2].0 as u32 as i32, 7);
+
+        activation.reset_result();
+        general[0] = RegisterWord(21);
+        general[1] = RegisterWord(0);
+        general[2] = RegisterWord(0xdead_beef);
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(activation.exit_id, invalid.0);
+        assert_eq!(general[2].0, 0xdead_beef);
     }
 
 }

@@ -1,6 +1,9 @@
 //! Trace SSA, architectural snapshots, and the runtime synchronization boundary.
-//! Runtime calls commit registers before invoking the VM. Values read afterwards
-//! are fresh loads: no heap or register assumption survives a runtime call.
+//! Full runtime calls commit registers before invoking the VM. Values read afterwards
+//! are fresh loads: no heap or register assumption survives a full runtime call.
+//! Non-GC leaf runtime calls are also supported: they synchronize dirty architectural
+//! registers but preserve unaffected SSA values across the call. Runtime-written result
+//! slots are explicitly reloaded afterwards.
 
 use std::collections::{HashMap, HashSet};
 use crate::wren_bytecode::{ArgReg, BytecodePc, Reg, RegisterKind, ReturnReg, SpecialReg};
@@ -94,6 +97,15 @@ pub enum TraceInst {
     BoxInt32 { value: TraceValueId }, BoxUInt32 { value: TraceValueId }, BoxF64 { value: TraceValueId },
     Int32ToF64 { value: TraceValueId }, UInt32ToF64 { value: TraceValueId }, F64ToInt32 { value: TraceValueId, exit: SideExitId },
     TaggedToHeapHandle { value: TraceValueId, exit: SideExitId },
+    HeapLoadField { object: TraceValueId, slot: u32, exit: SideExitId },
+    HeapStoreField { object: TraceValueId, value: TraceValueId, slot: u32, exit: SideExitId },
+    HeapLoadCell { cell: TraceValueId, exit: SideExitId },
+    HeapStoreCell { cell: TraceValueId, value: TraceValueId, exit: SideExitId },
+    HeapListLen { list: TraceValueId, exit: SideExitId },
+    HeapListGet { list: TraceValueId, index: TraceValueId, exit: SideExitId },
+    HeapListSet { list: TraceValueId, index: TraceValueId, value: TraceValueId, exit: SideExitId },
+    HeapMapLen { map: TraceValueId, exit: SideExitId },
+    HeapStringLen { string: TraceValueId, exit: SideExitId },
     ReadBarrier { value: TraceValueId },
 }
 impl TraceInst {
@@ -106,12 +118,21 @@ impl TraceInst {
             | GuardInt32 { value, .. } | GuardUInt32 { value, .. } | GuardType { value, .. } | IntUnary { value, .. }
             | F64Unary { value, .. } | F64Math { value, .. } | IsNull { value } | BoxInt32 { value } | BoxUInt32 { value } | BoxF64 { value }
             | Int32ToF64 { value } | UInt32ToF64 { value } | F64ToInt32 { value, .. } | TaggedToHeapHandle { value, .. }
-            | ReadBarrier { value } => f(value),
+            | ReadBarrier { value }
+            | HeapLoadField { object: value, .. }
+            | HeapLoadCell { cell: value, .. }
+            | HeapListLen { list: value, .. }
+            | HeapMapLen { map: value, .. }
+            | HeapStringLen { string: value, .. } => f(value),
             GuardBounds { index, length, .. } => { f(index); f(length); },
             GuardSwitch { tag, .. } => f(tag),
             GuardEq { lhs, rhs, .. } | IntBinary { lhs, rhs, .. } | IntBinaryChecked { lhs, rhs, .. }
             | F64Binary { lhs, rhs, .. } | IntCompare { lhs, rhs, .. } | F64Compare { lhs, rhs, .. }
-            | RefEq { lhs, rhs } => { f(lhs); f(rhs); },
+            | RefEq { lhs, rhs }
+            | HeapStoreField { object: lhs, value: rhs, .. }
+            | HeapStoreCell { cell: lhs, value: rhs, .. }
+            | HeapListGet { list: lhs, index: rhs, .. } => { f(lhs); f(rhs); },
+            HeapListSet { list, index, value, .. } => { f(list); f(index); f(value); },
             Select { condition, if_true, if_false } => { f(condition); f(if_true); f(if_false); },
         }
     }
@@ -140,7 +161,11 @@ impl TraceInst {
             GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
             | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. } | GuardType { exit, .. }
             | GuardBounds { exit, .. } | GuardSwitch { exit, .. } | GuardEq { exit, .. }
-            | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. } => Some(*exit),
+            | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. }
+            | HeapLoadField { exit, .. } | HeapStoreField { exit, .. }
+            | HeapLoadCell { exit, .. } | HeapStoreCell { exit, .. }
+            | HeapListLen { exit, .. } | HeapListGet { exit, .. } | HeapListSet { exit, .. }
+            | HeapMapLen { exit, .. } | HeapStringLen { exit, .. } => Some(*exit),
             _ => None,
         }
     }
@@ -334,6 +359,45 @@ impl TraceBuilder {
             self.emit0(TraceInst::CommitFrameSlot { slot, value: self.slots[&slot] });
         }
     }
+
+    /// Synchronize all currently dirty architectural registers without forgetting
+    /// their SSA values. This is the boundary used by non-GC, non-frame-changing
+    /// runtime leaf operations: an exceptional runtime return sees a coherent VM
+    /// frame, while the successful native path can keep unaffected values live in
+    /// native registers.
+    pub fn commit_preserving_ssa(&mut self) {
+        let dirty = self.dirty.clone();
+        for slot in dirty {
+            self.emit0(TraceInst::CommitFrameSlot { slot, value: self.slots[&slot] });
+        }
+    }
+
+    /// Emit a synchronized runtime call that is guaranteed by the recorder to be
+    /// non-GC and non-frame-changing. Unlike `runtime`, this deliberately keeps
+    /// the slot cache and loop-carried SSA state alive across the call.
+    pub fn runtime_leaf(&mut self, location: TraceLocation, next: BytecodePc) {
+        self.commit_preserving_ssa();
+        self.emit0(TraceInst::Runtime { location, next, terminal: false });
+    }
+
+    /// Reload a register written by `runtime_leaf`. Runtime-owned results are
+    /// architectural writes, so keep them in the logical dirty set for loop-phi
+    /// construction and side-exit reconstruction even though memory is already
+    /// synchronized at this point.
+    pub fn reload_slot_after_runtime(
+        &mut self,
+        slot: FrameSlot,
+        ty: TraceType,
+        rep: TraceRep,
+    ) -> TraceValueId {
+        let value = self.emit1(TraceInst::LoadFrameSlot { slot }, ty, rep);
+        self.slots.insert(slot, value);
+        if !self.dirty.contains(&slot) {
+            self.dirty.push(slot);
+        }
+        value
+    }
+
     pub fn runtime(&mut self, location: TraceLocation, next: BytecodePc, terminal: bool) {
         self.commit();
         self.emit0(TraceInst::Runtime { location, next, terminal });
@@ -750,6 +814,47 @@ mod optimizer_tests {
         assert!(trace.loop_phis[0].entry_exit.is_none());
         assert_eq!(trace.value(phi).unwrap().rep, TraceRep::Tagged);
         assert_eq!(trace.stats.promoted_f64_loop_phis, 0);
+    }
+
+    #[test]
+    fn runtime_leaf_commits_without_destroying_ssa_state() {
+        let location = TraceLocation::new(FuncId(0), BytecodePc(7));
+        let mut builder = TraceBuilder::new(
+            TraceId(99),
+            TraceAnchor { kind: TraceKind::Loop, location },
+        );
+        let input = FrameSlot::General(Reg(0));
+        let output = FrameSlot::General(Reg(1));
+
+        let value = builder.constant(TraceConstant::Int32(41));
+        builder.write_slot(input, value);
+        builder.runtime_leaf(location, BytecodePc(8));
+
+        assert_eq!(builder.slot_value(input), Some(value));
+        assert!(builder.dirty.contains(&input));
+        assert!(!builder.has_runtime_calls());
+        assert!(builder.trace.nodes.iter().any(|node| matches!(
+            node.kind,
+            TraceInst::CommitFrameSlot { slot, value: committed }
+                if slot == input && committed == value
+        )));
+        assert!(builder.trace.nodes.iter().any(|node| matches!(
+            node.kind,
+            TraceInst::Runtime { location: at, next, terminal: false }
+                if at == location && next == BytecodePc(8)
+        )));
+
+        let loaded = builder.reload_slot_after_runtime(
+            output,
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        assert_eq!(builder.slot_value(output), Some(loaded));
+        assert!(builder.dirty.contains(&output));
+        assert!(matches!(
+            builder.trace.value(loaded).map(|value| &value.origin),
+            Some(TraceValueOrigin::InstResult { .. })
+        ));
     }
 
 }

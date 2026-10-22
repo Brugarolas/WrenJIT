@@ -97,7 +97,7 @@ fn setup<'p>(program: &'p BytecodeProgram, opcode: Opcode) -> Interpreter<'p> {
         },
         ImportVariable => { regs[1] = vm.modules[0].module_value.word(); },
         LoadCell | StoreCell => {
-            regs[1] = vm.heap.alloc(HeapObject::Cell(Value::TRUE.word())).word();
+            regs[1] = vm.heap.alloc(HeapObject::Cell(Box::new(Value::TRUE.word()))).word();
             if opcode == StoreCell { regs[0] = regs[1]; regs[1] = Value::FALSE.word(); }
         },
         ListLen | ListGet | ListSet | ListAppend | ListInsert | ListRemoveAt => {
@@ -173,7 +173,7 @@ fn state(vm: &mut Interpreter<'_>) -> String {
                 entries.sort();
                 format!("Map({entries:?})")
             }
-            Some(HeapObject::Cell(w)) => format!("Cell({:?})", word(*w)),
+            Some(HeapObject::Cell(w)) => format!("Cell({:?})", word(**w)),
             Some(HeapObject::Closure { function_index, captures, reference_indices }) => {
                 let captures: Vec<_> = captures.iter().enumerate().map(|(i, &w)| {
                     if reference_indices.contains(&(i as u16)) { word(w) } else { w }
@@ -227,4 +227,74 @@ fn all_122_opcodes_execute_in_native_traces_like_the_interpreter() {
         count += 1;
     }
     assert_eq!(count, 122);
+}
+
+#[test]
+fn heap_fast_paths_execute_without_runtime_callbacks() {
+    use Opcode::*;
+    for opcode in [
+        LoadField, StoreField, LoadCell, StoreCell,
+        ListLen, ListGet, ListSet, MapLen, StringLen, ReadBarrier,
+    ] {
+        let program = program_for(opcode);
+        let mut baseline = setup(&program, opcode);
+        let mut native = setup(&program, opcode);
+        baseline.trace_execute_unfused_step().unwrap();
+
+        // The default forbids runtime opcode callbacks. Success therefore proves
+        // that this opcode was lowered through the direct heap fast path.
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        assert!(jit.options().no_runtime_calls_in_native_trace, "{opcode:?}");
+        jit.execute_one_for_test(&mut native)
+            .unwrap_or_else(|error| panic!("direct {opcode:?} fast path failed: {error}"));
+        assert_eq!(state(&mut native), state(&mut baseline), "{opcode:?}");
+    }
+}
+
+#[test]
+fn list_fast_paths_preserve_negative_index_semantics() {
+    use Opcode::*;
+    for opcode in [ListGet, ListSet] {
+        let program = program_for(opcode);
+        let mut baseline = setup(&program, opcode);
+        let mut native = setup(&program, opcode);
+
+        let index_reg = if opcode == ListGet { Reg(2) } else { Reg(1) };
+        baseline.trace_write_slot(FrameSlot::General(index_reg), i32_word(-1)).unwrap();
+        native.trace_write_slot(FrameSlot::General(index_reg), i32_word(-1)).unwrap();
+
+        baseline.trace_execute_unfused_step().unwrap();
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        jit.execute_one_for_test(&mut native)
+            .unwrap_or_else(|error| panic!("negative-index {opcode:?} fast path failed: {error}"));
+        assert_eq!(state(&mut native), state(&mut baseline), "{opcode:?}");
+    }
+}
+
+#[test]
+fn heap_reference_stores_use_the_native_barrier_path() {
+    use Opcode::*;
+    for opcode in [StoreField, StoreCell, ListSet] {
+        let program = program_for(opcode);
+        let mut baseline = setup(&program, opcode);
+        let mut native = setup(&program, opcode);
+
+        let baseline_child = baseline.heap.alloc(HeapObject::String(Arc::from(b"child".as_slice())));
+        baseline.add_root(baseline_child);
+        let native_child = native.heap.alloc(HeapObject::String(Arc::from(b"child".as_slice())));
+        native.add_root(native_child);
+        let value_reg = match opcode {
+            StoreField | StoreCell => Reg(1),
+            ListSet => Reg(2),
+            _ => unreachable!(),
+        };
+        baseline.trace_write_slot(FrameSlot::General(value_reg), baseline_child.word()).unwrap();
+        native.trace_write_slot(FrameSlot::General(value_reg), native_child.word()).unwrap();
+
+        baseline.trace_execute_unfused_step().unwrap();
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        jit.execute_one_for_test(&mut native)
+            .unwrap_or_else(|error| panic!("reference-store {opcode:?} fast path failed: {error}"));
+        assert_eq!(state(&mut native), state(&mut baseline), "{opcode:?}");
+    }
 }
