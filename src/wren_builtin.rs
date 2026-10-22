@@ -379,6 +379,20 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         manifest.register(program, map, name, kind, arity, op);
     }
 
+    // Each additional subscript descends into a nested List or Map. Setters
+    // reserve one explicit argument for the value within the 16-argument ABI.
+    for (target, getter, setter) in [
+        (instance(BuiltinClass::List), BuiltinPrimitive::ListSubscript, BuiltinPrimitive::ListSubscriptSet),
+        (map, BuiltinPrimitive::MapSubscript, BuiltinPrimitive::MapSubscriptSet),
+    ] {
+        for arity in 2..=crate::wren_front::MAX_PARAMETERS as u8 {
+            manifest.register(program, target, "[]", MethodKind::SubscriptGetter, arity, getter);
+            if arity < crate::wren_front::MAX_PARAMETERS as u8 {
+                manifest.register(program, target, "[]=", MethodKind::SubscriptSetter, arity + 1, setter);
+            }
+        }
+    }
+
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::MapKeysCount),
         ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::MapKeysIsEmpty),
@@ -593,6 +607,30 @@ fn normalized_index(index: i64, len: usize) -> Result<usize, RuntimeError> {
     } else {
         Ok(index as usize)
     }
+}
+
+/// Resolve the containing List or Map, leaving the final subscript for the
+/// getter or setter. Intermediate list indices cannot be slices; map keys
+/// retain their usual semantics regardless of the depth of the lookup.
+fn nested_subscript_target(
+    context: &HostContext<'_>,
+    mut container: Value,
+    indices: &[Value],
+) -> Result<(Value, Value), RuntimeError> {
+    let (&last, path) = indices.split_last()
+        .ok_or_else(|| RuntimeError::new("builtin argument missing"))?;
+    for &subscript in path {
+        container = if let Some(len) = context.list_len(container) {
+            let index = normalized_index(integer(subscript, "index")?, len)?;
+            context.list_get(container, index)
+                .ok_or_else(|| RuntimeError::new("list index out of bounds"))?
+        } else if context.map_len(container).is_some() {
+            context.map_get(container, subscript)?
+        } else {
+            return Err(RuntimeError::new("receiver is not List or Map"));
+        };
+    }
+    Ok((container, last))
 }
 
 fn slice_bounds(
@@ -825,26 +863,35 @@ fn execute_primitive(
             context.list_remove_at(this, index)
         }
         ListClear => { context.list_clear(this)?; Ok(Value::NULL) }
-        ListSubscript => {
-            let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
-            let subscript = argument(args, 0)?;
+        ListSubscript | MapSubscript => {
+            let (container, subscript) = nested_subscript_target(context, this, &args[1..])?;
+            if context.map_len(container).is_some() {
+                return context.map_get(container, subscript);
+            }
+            let len = context.list_len(container).ok_or_else(|| RuntimeError::new("receiver is not List or Map"))?;
             if let Some((from, to, inclusive)) = context.range_parts(subscript) {
                 let (start, count, reverse) = slice_bounds(from, to, inclusive, len)?;
                 let mut values = Vec::with_capacity(count);
                 for offset in 0..count {
                     let index = if reverse { start - offset } else { start + offset };
-                    values.push(context.list_get(this, index)
+                    values.push(context.list_get(container, index)
                         .ok_or_else(|| RuntimeError::new("list index out of bounds"))?);
                 }
                 return Ok(context.allocate_list(values));
             }
             let index = normalized_index(integer(subscript, "index")?, len)?;
-            context.list_get(this,index).ok_or_else(|| RuntimeError::new("list index out of bounds"))
+            context.list_get(container,index).ok_or_else(|| RuntimeError::new("list index out of bounds"))
         }
-        ListSubscriptSet => {
-            let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
-            let index = normalized_index(integer(argument(args,0)?, "index")?, len)?;
-            context.list_set(this,index,argument(args,1)?)
+        ListSubscriptSet | MapSubscriptSet => {
+            let (&value, indices) = args[1..].split_last()
+                .ok_or_else(|| RuntimeError::new("builtin argument missing"))?;
+            let (container, subscript) = nested_subscript_target(context, this, indices)?;
+            if context.map_len(container).is_some() {
+                return context.map_set(container, subscript, value);
+            }
+            let len = context.list_len(container).ok_or_else(|| RuntimeError::new("receiver is not List or Map"))?;
+            let index = normalized_index(integer(subscript, "index")?, len)?;
+            context.list_set(container,index,value)
         }
         ListIterate => {
             let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
@@ -864,8 +911,6 @@ fn execute_primitive(
 
         MapCount => Ok(Value::from_num(context.map_len(this).ok_or_else(|| RuntimeError::new("receiver is not Map"))? as f64)),
         MapContainsKey => Ok(Value::from_bool(context.map_contains_key(this, argument(args,0)?)?)),
-        MapSubscript => context.map_get(this, argument(args,0)?),
-        MapSubscriptSet => context.map_set(this, argument(args,0)?, argument(args,1)?),
         MapRemove => context.map_remove(this, argument(args,0)?),
         MapClear => { context.map_clear(this)?; Ok(Value::NULL) }
         MapIterate | MapKeysIterate => {

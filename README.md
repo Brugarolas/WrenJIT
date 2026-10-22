@@ -94,6 +94,49 @@ capitals.clear()
 System.print(capitals.count) // 0
 ```
 
+### Nested list and map subscripts
+
+Comma-separated subscripts traverse nested lists and maps in order. List
+indices start at zero:
+
+```wren
+var matrix = [
+    [1, 2, 3],
+    [4, 5, 6],
+    [7, 8, 9]
+]
+System.print(matrix[0, 1]) // 2, like matrix[0][1]
+matrix[1, 2] = 60
+System.print(matrix[-1, -1]) // 9
+System.print(matrix[1, 0..2]) // [4, 5, 60]
+```
+
+Each intermediate value must be a List or Map. List indices must be finite
+integers within that list's bounds; negative indices count from its end,
+including for ragged lists. Invalid indices such as `matrix[3, 5]` raise a
+runtime error. Maps use their normal key semantics at every step:
+
+```wren
+var map_list = [{}, {}]
+map_list[1, "source"] = [10, 20, 30]
+System.print(map_list[1, "source", 0]) // 10
+
+var data = {"rows": map_list}
+data["rows", 1, "source", -1] = 99
+System.print(data["rows", 1, "source"]) // [10, 20, 99]
+```
+
+A missing final map key returns `null` when read and is inserted on assignment.
+Missing or non-container intermediate values raise a runtime error; nested
+containers are not created automatically. Use `var` only to declare the root
+variable, then assign its elements without `var`.
+
+Additional indices support deeper nesting (`cube[x, y, z]`). Reads accept up to
+16 indices, and assignments up to 15, leaving one argument for the assigned
+value. Assignments update the innermost container in place and return that value.
+A read's final index on a List can also be a range to slice it. Classes
+can still define their own multi-argument subscript getters and setters.
+
 ### Ranges and list slices
 
 Numeric `from..to` ranges include the endpoint; `from...to` ranges exclude it.
@@ -115,7 +158,7 @@ Negative bounds count from the end. Slice bounds must be finite integers and
 within bounds; an exclusive endpoint may be just beyond the selected elements.
 `list[0..-1]` and `list[0...list.count]` copy even an empty list. Slices do not
 modify the original list, but nested objects remain shared. Subscript assignment
-continues to accept a single integer index, not a range.
+accepts integer indices only, not ranges.
 
 ### HIR escape analysis and scalar replacement
 

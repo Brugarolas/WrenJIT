@@ -3002,11 +3002,15 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
                 kind: MethodKind::SubscriptGetter,
                 arity: args.len() as u8,
             });
-            out.insert(MethodKey {
-                name: "[]=".to_owned(),
-                kind: MethodKind::SubscriptSetter,
-                arity: (args.len() + 1) as u8,
-            });
+            // A maximum-arity getter is valid even though a corresponding
+            // setter would exceed the argument limit once its value is added.
+            if args.len() < MAX_WREN_ARITY {
+                out.insert(MethodKey {
+                    name: "[]=".to_owned(),
+                    kind: MethodKind::SubscriptSetter,
+                    arity: (args.len() + 1) as u8,
+                });
+            }
             collect_method_keys_expr(receiver, out);
             for arg in args {
                 collect_method_keys_expr(arg, out)

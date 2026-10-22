@@ -125,3 +125,13 @@ System.print((1..10).count)     //> 10
 System.print((1..10).min)       //> 1
 System.print(1.23.sin)          //> 0.9424888019317
 System.print([1, 2, 3].isEmpty) //> false
+
+System.print("***** Matrices! *****")
+
+var matrix = [
+    [1, 2, 3],
+    [4, 5, 6],
+    [7, 8, 9]
+]
+System.print(matrix) //> [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+System.print(matrix[0, 1]) //> 2

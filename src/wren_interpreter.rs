@@ -6575,6 +6575,273 @@ mod tests {
     }
 
     #[test]
+    fn source_list_multidimensional_subscripts() {
+        for (expression, expected) in [
+            ("matrix[0, 1]", "2"),
+            ("matrix[1, 2]", "6"),
+            ("matrix[2, 0]", "7"),
+            ("matrix[-1, -1]", "9"),
+            ("matrix[-3, -2]", "2"),
+            ("matrix[0, 1] == matrix[0][1]", "true"),
+            ("[[1], [2, 3]][1, -1]", "3"),
+            ("[[[10, 20]], [[30, 40]]][1, 0, 1]", "40"),
+            ("[[[10, 20]]][0, 0]", "[10, 20]"),
+            ("[[null, true, \"text\"]][0, 0]", "null"),
+            ("[[null, true, \"text\"]][0, 1]", "true"),
+            ("[[null, true, \"text\"]][0, 2]", "text"),
+            ("matrix[1, 0..1]", "[4, 5]"),
+            ("matrix[1, -1..0]", "[6, 5, 4]"),
+            ("[[]][0, 0...0]", "[]"),
+        ] {
+            let source = format!(
+                "var matrix = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]\nvar result = {expression}\n"
+            );
+            let (program, entry, manifest) = compile_wren_module(&source);
+            for jit_enabled in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+                vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
+                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let context = HostContext { heap: &mut vm.heap };
+                assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_list_multidimensional_assignment_preserves_aliases_and_references() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var matrix = [[1, 2], [3, 4]]
+            var row = matrix[0]
+            var assigned = (matrix[0, 1] = 20)
+            matrix[-1, -1] = 40
+            var cube = [[[5]]]
+            cube[0, 0, 0] = 50
+            var slice = matrix[0, 0..1]
+            slice[0] = 999
+            System.gc()
+            matrix[1, 0] = [60]
+            System.gc()
+            return assigned + row[1] + matrix[1, 1] + cube[0, 0, 0] + matrix[1, 0, 0] + matrix[0, 0]
+        "#);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 191.0, "jit={jit_enabled}");
+        }
+    }
+
+    #[test]
+    fn source_list_multidimensional_subscripts_reject_invalid_accesses() {
+        for (expression, expected) in [
+            ("matrix[3, 5]", "index out of bounds"),
+            ("matrix[0, 3]", "index out of bounds"),
+            ("matrix[-4, 0]", "index out of bounds"),
+            ("matrix[0, -4]", "index out of bounds"),
+            ("[][0, 0]", "index out of bounds"),
+            ("[[]][0, 0]", "index out of bounds"),
+            ("matrix[0.5, 0]", "index must be an integer"),
+            ("matrix[0, Num.nan]", "index must be an integer"),
+            ("matrix[Num.infinity, 0]", "index must be an integer"),
+            ("matrix[true, 0]", "index must be a Num"),
+            ("matrix[0, null]", "index must be a Num"),
+            ("matrix[0..1, 0]", "index must be a Num"),
+            ("matrix[0, 0, 0]", "receiver is not List"),
+            ("[null][0, 0]", "receiver is not List"),
+            ("matrix[3, 5] = 10", "index out of bounds"),
+            ("matrix[0, 3] = 10", "index out of bounds"),
+            ("matrix[0, -4] = 10", "index out of bounds"),
+            ("matrix[0, 0.5] = 10", "index must be an integer"),
+            ("matrix[0, 0..1] = 10", "index must be a Num"),
+            ("matrix[0, 0, 0] = 10", "receiver is not List"),
+        ] {
+            let source = format!(
+                "var matrix = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]\n{expression}\n"
+            );
+            let (program, entry, manifest) = compile_wren_module(&source);
+            for jit_enabled in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+                let error = vm.run_module(entry).err().expect(expression);
+                assert!(error.message.contains(expected), "{expression}, jit={jit_enabled}: {error:?}");
+                let matrix = *vm.modules.last().unwrap().variables.last().unwrap();
+                let context = HostContext { heap: &mut vm.heap };
+                assert_eq!(context.format_value(matrix), "[[1, 2, 3], [4, 5, 6], [7, 8, 9]]");
+            }
+        }
+    }
+
+    #[test]
+    fn source_list_multidimensional_subscripts_support_maximum_arity() {
+        for dimensions in [2, 3, 15, 16] {
+            let indices = vec!["0"; dimensions].join(", ");
+            let initial = if dimensions < 16 { 0 } else { 42 };
+            let assignment = if dimensions < 16 {
+                format!("matrix[{indices}] = 42\n")
+            } else {
+                String::new()
+            };
+            let source = format!(
+                "var matrix = {}{initial}{}\n{assignment}var result = matrix[{indices}]\n",
+                "[".repeat(dimensions), "]".repeat(dimensions),
+            );
+            let (program, entry, manifest) = compile_wren_module(&source);
+            for jit_enabled in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+                vm.run_module(entry).unwrap();
+                assert_eq!(source_result(&vm), 42.0, "dimensions={dimensions}, jit={jit_enabled}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_mixed_multidimensional_subscripts() {
+        for (expression, expected) in [
+            (r#"map_list[1, "source"]"#, "[3, 4]"),
+            (r#"map_list[-1, "source", 0]"#, "3"),
+            (r#"map_list[0, "missing"]"#, "null"),
+            (r#"map["rows", 0, "source", -1]"#, "2"),
+            (r#"map["meta", "version"]"#, "7"),
+            (r#"map["meta", "missing"]"#, "null"),
+            (r#"map[1.5, null]"#, "9"),
+            (r#"map[true, -1]"#, "10"),
+            (r#"map["rows", 1, "source", 1..0]"#, "[4, 3]"),
+            (r#"map["rows", 1, "source", 0] == map["rows"][1]["source"][0]"#, "true"),
+        ] {
+            let source = format!(r#"
+                var map_list = [{{"source": [1, 2]}}, {{"source": [3, 4]}}]
+                var map = {{"rows": map_list, "meta": {{"version": 7}}, 1.5: {{null: 9}}, true: {{-1: 10}}}}
+                var result = {expression}
+            "#);
+            let (program, entry, manifest) = compile_wren_module(&source);
+            for jit_enabled in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+                vm.run_module(entry).unwrap_or_else(|error| panic!("{expression}: {error:?}"));
+                let value = *vm.modules.last().unwrap().variables.last().unwrap();
+                let context = HostContext { heap: &mut vm.heap };
+                assert_eq!(context.format_value(value), expected, "{expression}, jit={jit_enabled}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_mixed_multidimensional_assignment_preserves_keys_aliases_and_gc() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var map_list = [{}, {}]
+            var map = {"rows": map_list, "meta": {}}
+            var alias = map_list[1]
+            System.gc()
+            var assigned = (map_list[1, "source"] = [1, 2, 3])
+            map["rows", 1, "source", -1] = 9
+            map["meta", "version"] = 7
+            map["rows", 0, "source"] = {"nested": [11]}
+            map["rows", 0, "source", "nested", 0] = 12
+            var objectKey = [100]
+            map["meta", objectKey] = [13]
+            var rangeKey = 1..3
+            map["meta", rangeKey] = 14
+            var i = 0
+            while (i < 100) {
+                map["meta", i] = [i]
+                i = i + 1
+            }
+            System.gc()
+            return alias["source", 2] + assigned[2] + map["meta", "version"] +
+                map["rows", 0, "source", "nested", 0] + map["meta", objectKey, 0] +
+                map["meta", rangeKey] + map["meta", 99, 0]
+        "#);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 163.0, "jit={jit_enabled}");
+        }
+    }
+
+    #[test]
+    fn source_mixed_multidimensional_subscripts_reject_invalid_paths() {
+        for (expression, expected) in [
+            (r#"data["missing", "source"]"#, "receiver is not List or Map"),
+            (r#"data["empty", "missing", "source"]"#, "receiver is not List or Map"),
+            (r#"data["null", "source"]"#, "receiver is not List or Map"),
+            (r#"data["scalar", 0]"#, "receiver is not List or Map"),
+            (r#"data["rows", 1, "source"]"#, "index out of bounds"),
+            (r#"data["rows", "bad", "source"]"#, "index must be a Num"),
+            (r#"data["rows", 0.5, "source"]"#, "index must be an integer"),
+        ] {
+            for suffix in ["", " = [42]"] {
+                let source = format!(r#"
+                    var data = {{"rows": [{{}}], "empty": {{}}, "null": null, "scalar": 7}}
+                    {expression}{suffix}
+                "#);
+                let (program, entry, manifest) = compile_wren_module(&source);
+                for jit_enabled in [false, true] {
+                    let mut vm = source_vm(&program, &manifest);
+                    vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+                    let error = vm.run_module(entry).err().expect(expression);
+                    assert!(error.message.contains(expected), "{expression}{suffix}, jit={jit_enabled}: {error:?}");
+                    let data = *vm.modules.last().unwrap().variables.last().unwrap();
+                    let context = HostContext { heap: &mut vm.heap };
+                    assert_eq!(context.map_len(data), Some(4));
+                    let HeapObject::Map(map) = context.heap.get(data).unwrap() else { panic!("expected Map") };
+                    let empty = map.entries[&MapKey::String(Arc::from(b"empty".as_slice()))];
+                    let rows = map.entries[&MapKey::String(Arc::from(b"rows".as_slice()))];
+                    assert_eq!(context.map_len(empty), Some(0));
+                    assert_eq!(context.map_len(context.list_get(rows, 0).unwrap()), Some(0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_map_multidimensional_subscripts_support_maximum_arity() {
+        for dimensions in [2, 15, 16] {
+            let indices = vec![r#""next""#; dimensions].join(", ");
+            let initial = if dimensions < 16 { "0" } else { "42" };
+            let nested = (0..dimensions).fold(initial.to_owned(), |inner, _| {
+                format!(r#"{{"next": {inner}}}"#)
+            });
+            let assignment = if dimensions < 16 {
+                format!("data[{indices}] = 42\n")
+            } else {
+                String::new()
+            };
+            let source = format!("var data = {nested}\n{assignment}var result = data[{indices}]\n");
+            let (program, entry, manifest) = compile_wren_module(&source);
+            for jit_enabled in [false, true] {
+                let mut vm = source_vm(&program, &manifest);
+                vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+                vm.run_module(entry).unwrap();
+                assert_eq!(source_result(&vm), 42.0, "dimensions={dimensions}, jit={jit_enabled}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_custom_multidimensional_subscripts_keep_method_dispatch() {
+        let (program, entry, manifest) = compile_wren_module(r#"
+            class Grid {
+                construct new() { _rows = [[1, 2], [3, 4]] }
+                [column, row] { _rows[row, column] }
+                [column, row]=(value) { _rows[row, column] = value }
+            }
+            var grid = Grid.new()
+            var before = grid[0, 1]
+            grid[1, 0] = 20
+            var result = before + grid[1, 0]
+        "#);
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(TracingJitOptions::default));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 23.0, "jit={jit_enabled}");
+        }
+    }
+
+    #[test]
     fn source_ranges_and_list_slices() {
         let cases = [
             ("trees[1..2]", "[birch, oak]"),
