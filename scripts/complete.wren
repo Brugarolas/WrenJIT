@@ -135,3 +135,172 @@ var matrix = [
 ]
 System.print(matrix) //> [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
 System.print(matrix[0, 1]) //> 2
+
+System.print("***** Classes! *****")
+
+class Unicorn {
+  // Unicorns are always fancy.
+  isFancy { true }
+
+  name { "Scoop" }
+
+  prance() {
+    System.print("The unicorn prances in a fancy manner!")
+  }
+
+  prance(where) {
+    System.print("The unicorn prances in %(where).")
+  }
+
+  prance(where, when) {
+    System.print("The unicorn prances in %(where) at %(when).")
+  }
+
+  rider=(value) {
+    System.print("I am being ridden by %(value).")
+  }
+
+  printIsFancy() {
+    System.print("Is fancy? %(this.isFancy)") //> true
+  }
+
+  printName() {
+    System.print(name) //> Francis (implicit this)
+  }
+
+  -(other) {
+    System.print("Subtracting %(other) from a unicorn is weird.")
+  }
+
+  [index] {
+    System.print("Unicorns are not lists!")
+  }
+
+  [x, y] {
+    System.print("Unicorns are not matrices either!")
+  }
+}
+
+var myUnicorn = Unicorn.new()
+myUnicorn.prance()
+myUnicorn.prance("the meadow")
+myUnicorn.prance("the meadow", "sunset")
+
+System.print("***** Scoping! *****")
+
+var shadowed = "surrounding"
+var lowercase = "surrounding"
+var Capitalized = "surrounding"
+
+class Scope {
+  shadowed { "object" }
+  lowercase { "object" }
+  Capitalized { "object" }
+
+  test() {
+    var shadowed = "local"
+
+    System.print(shadowed) //> local (local variables have preference over object fields)
+    System.print(lowercase) //> object (object fields have preference over top-level variables if they are lowercased)
+    System.print(Capitalized) //> surrounding (the top-level variable is used because it is capitalized)
+  }
+}
+
+System.print("***** Constructors *****")
+
+class Horse {
+  construct new(name, color) {
+    System.print("My name is " + name + " and I am " + color + ".")
+  }
+construct brown(name) {
+    System.print("My name is " + name + " and I am brown.")
+  }
+}
+
+var fred = Horse.new("Fred", "palomino")
+var dave = Horse.brown("Dave")
+
+System.print("***** Fields, getters and setters *****")
+
+class Rectangle {
+    area { _width * _height }
+
+    width=(value) { _width = value }
+    height=(value) { _height = value }
+}
+
+class Shape {
+  construct new() {
+    _shape = "none"
+  }
+}
+
+class Square is Shape {
+  construct new() {
+    //This will print null!
+    //_shape from the parent class is private,
+    //we are reading `_shape` from `this`,
+    //which has not been set, so returns null.
+    System.print("I am a %(_shape)")
+
+    //a local variable, all variables are private
+    _width = 10
+    var other = Square.new()
+
+    //other._width is not accessible from here,
+    //even though we are also a rectangle. The field
+    //is private, and other._width is invalid syntax!
+  }
+}
+
+System.print("***** Statics! *****")
+
+class Foo {
+  construct new() {}
+
+  static setFromStatic(a) { __a = a }
+  setFromInstance(a) { __a = a }
+
+  static printFromStatic() {
+    System.print(__a)
+  }
+
+  printFromInstance() {
+    System.print(__a)
+  }
+}
+
+Foo.printFromStatic() //> null
+
+Foo.setFromStatic("first")
+Foo.printFromStatic() //> first
+
+var foo1 = Foo.new()
+var foo2 = Foo.new()
+foo1.setFromInstance("second")
+foo2.printFromInstance() //> second
+
+System.print("***** Inheritance! *****")
+
+class FancyUnicorn {
+  construct new(name) {
+    System.print("My name is " + name + ".")
+  }
+
+  fly() {
+    System.print("I am flying!")
+  }
+}
+
+class Pegasus is FancyUnicorn {
+  construct new(name) {
+    super(name)
+  }
+
+  fly() {
+    super.fly() //> base method
+  }
+}
+
+var pegasus = Pegasus.new("Fred") //> My name is Fred
+pegasus.fly()

@@ -2193,6 +2193,10 @@ impl<'p> Builder<'p> {
         self.emit1(Inst::Const(Constant::String(string)), Type::String)
     }
 
+    pub fn intern_method(&mut self, name: &str, kind: MethodKind, arity: u8) -> MethodSymbol {
+        self.program.intern_method(name, kind, arity)
+    }
+
     pub fn invoke(
         &mut self,
         receiver: ValueId,

@@ -3929,7 +3929,7 @@ impl Interpreter<'_> {
             return Ok(());
         }
 
-        let (field_base, inherited_instance_methods, inherited_static_methods) =
+        let (field_base, inherited_instance_methods) =
             if let Some(super_slot) = superclass {
                 let super_class = self
                     .classes
@@ -3950,10 +3950,9 @@ impl Interpreter<'_> {
                 (
                     super_class.total_instance_field_count,
                     Some(super_class.instance_methods.clone()),
-                    Some(super_class.static_methods.clone()),
                 )
             } else {
-                (0, None, None)
+                (0, None)
             };
 
         let own = self.classes[class_index].own_instance_field_count;
@@ -3968,9 +3967,6 @@ impl Interpreter<'_> {
             class.total_instance_field_count = total;
             if let Some(methods) = inherited_instance_methods {
                 class.instance_methods = methods;
-            }
-            if let Some(methods) = inherited_static_methods {
-                class.static_methods = methods;
             }
             class.layout_finalized = true;
         }
@@ -6123,6 +6119,8 @@ mod tests {
     fn source_result(vm: &Interpreter<'_>) -> f64 {
         vm.modules.last().unwrap().variables.last().unwrap().as_num().unwrap()
     }
+
+    include!("wren_class_tests.rs");
 
     #[test]
     fn jit_numeric_math_getters_and_remainder_stay_in_native_loops() {

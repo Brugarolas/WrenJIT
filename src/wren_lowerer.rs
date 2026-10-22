@@ -425,6 +425,9 @@ impl Analyzer {
 
     fn note_binding_use(&mut self, ident: &Ident, write: bool) {
         let Some(binding) = self.resolve(&ident.value) else {
+            if is_implicit_receiver_name(&ident.value) {
+                self.note_this_use();
+            }
             return;
         };
         self.analysis.use_map.insert(ident.span, binding);
@@ -724,6 +727,8 @@ struct MethodPlan {
 #[derive(Clone, Debug)]
 struct ClassPlan {
     id: ClassId,
+    /// Hidden module root for this lexical class, independent of user rebinding.
+    class_slot: ModuleSlot,
     name: String,
     declaration_span: Span,
     superclass: Option<ClassId>,
@@ -891,6 +896,17 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             next += 1;
         }
 
+        // Keep lexical class objects accessible from inherited instance methods
+        // and nested closures, even when the user-facing class name is rebound.
+        let mut classes = Vec::new();
+        collect_class_declarations(&self.ast.statements, &mut classes);
+        for (class, _) in classes {
+            self.module_layout.slots.insert(
+                format!("<class:{}>", class.name.span.start), ModuleSlot(next),
+            );
+            next += 1;
+        }
+
         for (name, span) in declarations {
             self.insert_module_slot(&name, span, &mut next);
         }
@@ -943,6 +959,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 class.name.span,
                 ClassPlan {
                     id,
+                    class_slot: self.module_layout.get(&format!("<class:{}>", class.name.span.start)).unwrap(),
                     name: class.name.value.clone(),
                     declaration_span: class.name.span,
                     superclass: None,
@@ -1172,6 +1189,18 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 }
 
                 let params = method_formal_params(&method.signature);
+                // Constructor bodies are private instance initializers. Their
+                // public static factories allocate once before calling them.
+                let body_symbol = if method.is_constructor {
+                    let key = MethodKey {
+                        name: format!("<init>{name}"), kind: MethodKind::Method, arity: arity as u8,
+                    };
+                    let symbol = self.program.intern_method(&key.name, key.kind, key.arity);
+                    self.symbols.methods.insert(key, symbol);
+                    symbol
+                } else {
+                    symbol
+                };
                 let (analysis, diagnostics) =
                     Analyzer::method(method, params.clone(), self.options.warn_shadowing);
                 self.diagnostics.extend(diagnostics);
@@ -1182,7 +1211,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     FunctionNodeId(0),
                     Some(MethodContextSpec {
                         class: class_plan.id,
-                        method_symbol: symbol,
+                        method_symbol: body_symbol,
                         constructor: method.is_constructor,
                         static_method: method.is_static,
                         fields: class_plan.fields.clone(),
@@ -1201,12 +1230,25 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     name: format!("{}.{}", class.name.value, display_method_signature(&method.signature)),
                     kind: function_kind,
                     class: Some(class_plan.id),
-                    method_symbol: Some(symbol),
+                    method_symbol: Some(body_symbol),
                     constructor: method.is_constructor,
                     static_method: method.is_static,
                 };
                 if let Some(function) = self.compile_function_node(module, &analysis, FunctionNodeId(0), spec) {
                     self.method_functions.insert(method.span, function);
+                    if method.is_constructor {
+                        plans.push(MethodPlan {
+                            symbol: body_symbol,
+                            function: Some(function),
+                            foreign: None,
+                            bind_static: false,
+                        });
+                        let factory = self.compile_constructor_factory(module, &class_plan, &name, arity, Some(function));
+                        plans.push(MethodPlan {
+                            symbol, function: Some(factory), foreign: None, bind_static: true,
+                        });
+                        continue;
+                    }
                     plans.push(MethodPlan {
                         symbol,
                         function: Some(function),
@@ -1215,8 +1257,44 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     });
                 }
             }
+            // WrenJIT convenience: a class with no declared constructors gets
+            // an empty new(). Do not replace an explicitly defined static new().
+            if !class.is_foreign && !class.methods.iter().any(|method| method.is_constructor)
+                && !class.methods.iter().any(|method| method.is_static
+                    && method_signature_key(&method.signature) == Some(("new".to_owned(), MethodKind::Method, 0)))
+            {
+                let symbol = self.program.intern_method("new", MethodKind::Method, 0);
+                let factory = self.compile_constructor_factory(module, &class_plan, "new", 0, None);
+                plans.push(MethodPlan {
+                    symbol, function: Some(factory), foreign: None, bind_static: true,
+                });
+            }
             self.class_plans.get_mut(&class.name.span).unwrap().methods = plans;
         }
+    }
+
+    fn compile_constructor_factory(
+        &mut self,
+        module: ModuleId,
+        class: &ClassPlan,
+        name: &str,
+        arity: usize,
+        initializer: Option<FuncId>,
+    ) -> FuncId {
+        let mut params = vec![Type::Class(ClassSet::singleton(class.id))];
+        params.extend((0..arity).map(|_| Type::Top));
+        let mut builder = Builder::new(
+            self.program, module, format!("{}.{name}<factory>", class.name),
+            FunctionKind::StaticMethod, params, Type::Instance(ClassSet::singleton(class.id)),
+        );
+        let instance = builder.alloc_instance(class.id);
+        if let Some(callee) = initializer {
+            let mut args = vec![instance];
+            args.extend((1..=arity).map(|index| builder.param(index)));
+            builder.emit1(Inst::CallDirect { conv: ir::CallConv::Wren, callee, args }, Type::Top);
+        }
+        builder.ret(instance);
+        builder.finish()
     }
 
     fn compile_closure_descendants(
@@ -1269,7 +1347,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         let has_receiver = spec.class.is_some() && spec.kind != FunctionKind::Closure;
         let receiver_type = if has_receiver {
             spec.class.map(|class| {
-                if spec.static_method || spec.constructor {
+                if spec.static_method {
                     Type::Class(ClassSet::singleton(class))
                 } else {
                     Type::Instance(ClassSet::singleton(class))
@@ -1467,7 +1545,6 @@ struct FunctionCompiler<'p, 'a, 'd> {
     env: HashMap<BindingId, Storage>,
     loops: Vec<LoopContext>,
     constructor_this: Option<ValueId>,
-    class_receiver: Option<ValueId>,
 }
 
 impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
@@ -1484,7 +1561,6 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             env,
             loops: Vec::new(),
             constructor_this: None,
-            class_receiver: None,
         }
     }
 
@@ -1495,13 +1571,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         if self.context.has_receiver {
             if let Some(method) = &self.context.method_context {
                 let receiver = self.builder.param(0);
-                self.class_receiver = (method.static_method || method.constructor).then_some(receiver);
                 param_offset = 1;
                 if let Some(this_binding) = node.this_binding {
                     let this_value = if method.constructor {
-                        let value = self.builder.alloc_instance(method.class);
-                        self.constructor_this = Some(value);
-                        value
+                        self.constructor_this = Some(receiver);
+                        receiver
                     } else {
                         receiver
                     };
@@ -1654,6 +1728,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             },
             Type::Class(ClassSet::singleton(plan.id)),
         );
+
+        self.builder.emit0(Inst::StoreModuleVar {
+            module: self.context.module,
+            slot: plan.class_slot,
+            value: class_value,
+        });
 
         if module_level {
             if let Some(slot) = self.context.module_layout.get(&class.name.value) {
@@ -2117,6 +2197,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         if let Some(binding) = self.context.analysis.use_map.get(&name.span).copied() {
             return self.read_binding(binding);
         }
+        if self.context.method_context.is_some() && is_implicit_receiver_name(&name.value) {
+            let receiver = self.lower_this(name.span);
+            let method = self.context.symbols.expect(&name.value, MethodKind::Getter, 0);
+            return self.builder.invoke(receiver, method, Vec::new());
+        }
         if let Some(slot) = self.context.module_layout.get(&name.value) {
             return self.builder.emit1(
                 Inst::LoadModuleVar {
@@ -2125,11 +2210,6 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 },
                 Type::Top,
             );
-        }
-        if self.context.method_context.is_some() {
-            let receiver = self.lower_this(name.span);
-            let method = self.context.symbols.expect(&name.value, MethodKind::Getter, 0);
-            return self.builder.invoke(receiver, method, Vec::new());
         }
         self.error(
             "WREN-L018",
@@ -2158,6 +2238,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             self.error("WREN-L020", "instance field used outside a class method", name.span);
             return self.builder.const_null();
         };
+        if method.static_method {
+            self.error("WREN-L039", "instance fields cannot be used in static methods", name.span);
+            return self.builder.const_null();
+        }
         let Some(slot) = method.fields.get(&name.value).copied() else {
             self.error(
                 "WREN-L021",
@@ -2183,19 +2267,17 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             );
             return self.builder.const_null();
         };
-        if !method.static_method && !method.constructor {
-            self.error(
-                "WREN-L024",
-                "static fields are only directly addressable from static methods in this WIR lowering",
-                name.span,
-            );
-            return self.builder.const_null();
-        }
-        let class = self
-            .class_receiver
-            .unwrap_or_else(|| self.lower_this(name.span));
+        let class = self.lower_lexical_class(method.class);
         self.builder
             .emit1(Inst::LoadStaticField { class, slot }, Type::Top)
+    }
+
+    fn lower_lexical_class(&mut self, class: ClassId) -> ValueId {
+        let plan = self.context.class_plans.values().find(|plan| plan.id == class).unwrap();
+        self.builder.emit1(
+            Inst::LoadModuleVar { module: self.context.module, slot: plan.class_slot },
+            Type::Class(ClassSet::singleton(class)),
+        )
     }
 
     fn lower_super(&mut self, super_expr: &front::SuperExpr, span: Span) -> ValueId {
@@ -2223,7 +2305,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             self.error("WREN-L027", "unnamed super call has no enclosing method", span);
             return self.builder.const_null();
         };
-        let symbol = self.context.symbols.expect(&name, kind, arity);
+        // A missing superclass implementation is a runtime dispatch error, not
+        // a missing-symbol panic in the compiler (including changed arities).
+        let symbol = self.builder.intern_method(&name, kind, arity as u8);
         let args = super_expr.args.iter().map(|arg| self.lower_expr(arg)).collect();
         self.builder.invoke_super(method.class, receiver, symbol, args)
     }
@@ -2425,6 +2509,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             ExprKind::Name(name) => {
                 if let Some(binding) = self.context.analysis.use_map.get(&name.span).copied() {
                     self.write_binding(binding, value);
+                } else if self.context.method_context.is_some() && is_implicit_receiver_name(&name.value) {
+                    let receiver = self.lower_this(name.span);
+                    let setter = self.context.symbols.expect(&name.value, MethodKind::Setter, 1);
+                    let _ = self.builder.invoke(receiver, setter, vec![value]);
                 } else if let Some(slot) = self.context.module_layout.get(&name.value) {
                     if BuiltinId::ALL.iter().any(|builtin| builtin.name() == name.value) {
                         self.error(
@@ -2439,10 +2527,6 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                             value,
                         });
                     }
-                } else if self.context.method_context.is_some() {
-                    let receiver = self.lower_this(name.span);
-                    let setter = self.context.symbols.expect(&name.value, MethodKind::Setter, 1);
-                    let _ = self.builder.invoke(receiver, setter, vec![value]);
                 } else {
                     self.error(
                         "WREN-L028",
@@ -2456,6 +2540,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     self.error("WREN-L029", "field assignment outside a method", name.span);
                     return value;
                 };
+                if method.static_method {
+                    self.error("WREN-L039", "instance fields cannot be used in static methods", name.span);
+                    return value;
+                }
                 if let Some(slot) = method.fields.get(&name.value).copied() {
                     let this = self.lower_this(name.span);
                     self.builder.store_field(this, slot, value);
@@ -2468,18 +2556,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     self.error("WREN-L031", "static field assignment outside a method", name.span);
                     return value;
                 };
-                if !method.static_method && !method.constructor {
-                    self.error(
-                        "WREN-L032",
-                        "static field assignment requires a static method in this lowering",
-                        name.span,
-                    );
-                    return value;
-                }
                 if let Some(slot) = method.static_fields.get(&name.value).copied() {
-                    let class = self
-                        .class_receiver
-                        .unwrap_or_else(|| self.lower_this(name.span));
+                    let class = self.lower_lexical_class(method.class);
                     self.builder.emit0(Inst::StoreStaticField { class, slot, value });
                 } else {
                     self.error("WREN-L033", "unknown static field", name.span);
@@ -2605,6 +2683,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 // =============================================================================
 // Collection / planning helpers
 // =============================================================================
+
+fn is_implicit_receiver_name(name: &str) -> bool {
+    name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+}
 
 fn function_node_span(node: &FunctionNode) -> Span {
     match &node.ast {

@@ -1494,7 +1494,9 @@ impl<'a> Parser<'a> {
                     "a class header cannot break the line immediately after `is`",
                 );
             }
-            Some(self.parse_precedence(16)?)
+            // The next top-level brace starts the class body, not a trailing
+            // block argument to the superclass name/getter/call.
+            Some(self.parse_precedence_with_block(16, false)?)
         } else {
             None
         };
@@ -2219,6 +2221,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_precedence(&mut self, min_bp: u8) -> PResult<Expr> {
+        self.parse_precedence_with_block(min_bp, true)
+    }
+
+    fn parse_precedence_with_block(&mut self, min_bp: u8, allow_block: bool) -> PResult<Expr> {
         let mut left = self.parse_prefix()?;
 
         loop {
@@ -2248,7 +2254,7 @@ impl<'a> Parser<'a> {
                     left = self.parse_implicit_call(left)?;
                     continue;
                 }
-                TokenKind::LeftBrace if 16 >= min_bp && self.can_attach_block_argument(&left) => {
+                TokenKind::LeftBrace if allow_block && 16 >= min_bp && self.can_attach_block_argument(&left) => {
                     self.advance();
                     left = self.attach_block_argument(left)?;
                     continue;
