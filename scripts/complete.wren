@@ -304,3 +304,28 @@ class Pegasus is FancyUnicorn {
 
 var pegasus = Pegasus.new("Fred") //> My name is Fred
 pegasus.fly()
+
+System.print("***** Async/Await! *****")
+
+class AsyncMath {
+  static async value(x) {
+    return await Promise.resolve(x)
+  }
+
+  static async add(a, b) {
+    var left = await AsyncMath.value(a)
+    var right = await AsyncMath.value(b)
+    return left + right
+  }
+}
+
+var result_fn = await AsyncMath.add(20, 22)
+System.print(result_fn) //> 42
+
+var plusOne = async { |value|
+  var resolved = await Promise.resolve(value)
+  return resolved + 1
+}
+
+var result_closure = await plusOne.call(21)
+System.print(result_closure) //> 22

@@ -1783,7 +1783,7 @@ impl<'a> FunctionEmitter<'a> {
             Invoke | InvokeSuper | CallDirect | CallClosure | CallPrimitive => SafepointKind::Call,
             CallForeign => SafepointKind::Foreign,
             ImportModule | ImportVariable => SafepointKind::Module,
-            MakeFiber | FiberCall | FiberTry | FiberTransfer | FiberTransferError | FiberYield
+            Await | MakeFiber | FiberCall | FiberTry | FiberTransfer | FiberTransferError | FiberYield
             | FiberSuspend => SafepointKind::FiberSwitch,
             BindMethod | BindForeignMethod | ListAppend | ListInsert | MapSet => {
                 SafepointKind::RuntimeMutation
@@ -2632,6 +2632,12 @@ impl FunctionEmitter<'_> {
                 self.reg(*value)?.0,
             ),
 
+            Await { promise } => self.assembler.emit_ab(
+                Opcode::Await,
+                self.result_reg(node)?.0,
+                self.reg(*promise)?.0,
+            ),
+
             MakeFiber { closure } => self.assembler.emit_ab(
                 Opcode::MakeFiber,
                 self.result_reg(node)?.0,
@@ -2835,6 +2841,7 @@ impl FunctionEmitter<'_> {
             id: self.function.id,
             module: self.function.module,
             kind: self.function.kind,
+            is_async: self.function.is_async,
             field_owner: self.function.field_owner,
             name: self.function.signature.name,
             arity,

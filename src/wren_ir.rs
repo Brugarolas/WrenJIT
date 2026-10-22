@@ -295,13 +295,14 @@ pub enum BuiltinId {
     System = 11,
     Date = 12,
     Random = 13,
+    Promise = 14,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
-        Self::Fiber, Self::System, Self::Date, Self::Random,
+        Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -312,6 +313,7 @@ impl BuiltinId {
             Self::Fn => "Fn", Self::Fiber => "Fiber", Self::System => "System",
             Self::Date => "Date",
             Self::Random => "Random",
+            Self::Promise => "Promise",
         }
     }
     #[inline] pub const fn index(self) -> usize { self as usize }
@@ -851,6 +853,14 @@ pub enum Inst {
         value: ValueId,
     },
 
+    // ----- Async / promises -----
+    /// Suspends the current async execution if `promise` is pending. A fulfilled
+    /// promise produces its value immediately; rejection propagates through the
+    /// current async task.
+    Await {
+        promise: ValueId,
+    },
+
     // ----- Fibers -----
     MakeFiber {
         closure: ValueId,
@@ -953,6 +963,7 @@ impl Inst {
             | MapSet { .. }
             | MapRemove { .. } => B::Chain(E::Write),
 
+            Await { .. } => B::Chain(E::Fiber),
             MakeFiber { .. } => B::Chain(E::Alloc),
             FiberCall { .. }
             | FiberTry { .. }
@@ -1066,6 +1077,7 @@ impl Inst {
             | NumToF64 { .. }
             | Int32ToNum { .. }
             | F64ToNum { .. }
+            | Await { .. }
             | MakeFiber { .. }
             | FiberCall { .. }
             | FiberTry { .. }
@@ -1152,6 +1164,7 @@ impl Inst {
             | NumToF64 { value }
             | Int32ToNum { value }
             | F64ToNum { value }
+            | Await { promise: value }
             | FiberYield { value }
             | ReadBarrier { object: value } => out.push(*value),
             GuardBounds { index, length, .. } => {
@@ -1340,6 +1353,7 @@ impl Inst {
             | NumToF64 { value }
             | Int32ToNum { value }
             | F64ToNum { value }
+            | Await { promise: value }
             | FiberYield { value }
             | ReadBarrier { object: value } => f(value),
             GuardBounds { index, length, .. } => {
@@ -1574,6 +1588,10 @@ pub struct Function {
     pub id: FuncId,
     pub module: ModuleId,
     pub kind: FunctionKind,
+    /// WrenJIT extension: async functions return a Promise when called and may
+    /// contain `Await` instructions. The ordinary FunctionKind remains unchanged
+    /// so method/receiver ABI rules stay identical.
+    pub is_async: bool,
     /// Class whose instance-field layout this function was compiled against.
     ///
     /// This is set for methods and for closures lexically nested inside methods.
@@ -1840,6 +1858,7 @@ impl<'p> Builder<'p> {
             id: function_id,
             module,
             kind,
+            is_async: false,
             field_owner: None,
             signature: Signature {
                 name,
@@ -2301,6 +2320,12 @@ impl<'p> Builder<'p> {
         self.emit1(Inst::GuardF64 { value, deopt }, Type::F64)
     }
 
+    /// Marks this function as an async entrypoint. Calls to it produce a Promise
+    /// and execute the body on the VM async scheduler.
+    pub fn set_async(&mut self, is_async: bool) {
+        self.function.is_async = is_async;
+    }
+
     pub fn finish(self) -> FuncId {
         for (index, node) in self.function.nodes.iter().enumerate() {
             debug_assert_eq!(node.id.0 as usize, index);
@@ -2659,8 +2684,8 @@ impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "func {:?} {:?}({:?}) -> {:?}",
-            self.id, self.kind, self.signature.params, self.signature.result
+            "func {:?} {:?}{}({:?}) -> {:?}",
+            self.id, self.kind, if self.is_async { " async" } else { "" }, self.signature.params, self.signature.result
         )?;
 
         if !self.captures.is_empty() {

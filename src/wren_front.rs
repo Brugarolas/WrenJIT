@@ -278,6 +278,10 @@ enum RawTokenKind {
     // Keywords.
     #[token("as")]
     As,
+    #[token("async")]
+    Async,
+    #[token("await")]
+    Await,
     #[token("break")]
     Break,
     #[token("class")]
@@ -417,6 +421,8 @@ enum RawTokenKind {
 pub enum TokenKind {
     Newline,
     As,
+    Async,
+    Await,
     Break,
     Class,
     Construct,
@@ -486,6 +492,8 @@ impl TokenKind {
         match self {
             Newline => "newline",
             As => "`as`",
+            Async => "`async`",
+            Await => "`await`",
             Break => "`break`",
             Class => "`class`",
             Construct => "`construct`",
@@ -659,6 +667,8 @@ fn map_raw_token(raw: RawTokenKind) -> Option<TokenKind> {
         R::_Whitespace | R::_LineComment | R::BlockComment => return None,
         R::Newline => T::Newline,
         R::As => T::As,
+        R::Async => T::Async,
+        R::Await => T::Await,
         R::Break => T::Break,
         R::Class => T::Class,
         R::Construct => T::Construct,
@@ -987,6 +997,8 @@ pub struct ClassDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MethodDecl {
     pub signature: MethodSignatureAst,
+    /// WrenJIT extension: async methods return a Promise and may use `await`.
+    pub is_async: bool,
     pub is_static: bool,
     pub is_foreign: bool,
     pub is_constructor: bool,
@@ -1182,7 +1194,10 @@ pub enum ExprKind {
         receiver: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// WrenJIT extension: suspend the current async execution until a Promise settles.
+    Await(Box<Expr>),
     Closure(FunctionBody),
+    AsyncClosure(FunctionBody),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1551,9 +1566,20 @@ impl<'a> Parser<'a> {
             .map(|attribute| attribute.span.start)
             .unwrap_or(self.peek().span.start);
 
-        // Wren's modifier order is fixed: `foreign` may precede `static`.
-        let is_foreign = self.match_kind(TokenKind::Foreign);
-        let is_static = self.match_kind(TokenKind::Static);
+        // WrenJIT keeps Wren's modifiers but also accepts `async` for methods.
+        // Accept the three modifiers in either order so both `static async` and
+        // `async static` remain natural to users.
+        let mut is_foreign = false;
+        let mut is_static = false;
+        let mut is_async = false;
+        loop {
+            match self.peek().kind {
+                TokenKind::Foreign if !is_foreign => { self.advance(); is_foreign = true; }
+                TokenKind::Static if !is_static => { self.advance(); is_static = true; }
+                TokenKind::Async if !is_async => { self.advance(); is_async = true; }
+                _ => break,
+            }
+        }
 
         let is_constructor = self.match_kind(TokenKind::Construct);
         if is_constructor && is_static {
@@ -1564,6 +1590,26 @@ impl<'a> Parser<'a> {
                     self.previous().span,
                 )
                 .with_primary_label(self.previous().span, "remove `static`"),
+            );
+        }
+        if is_constructor && is_async {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "WREN-P074",
+                    "constructors cannot be async",
+                    Span::new(start, self.previous().span.end),
+                )
+                .with_note("Use an async static factory method when construction requires awaiting."),
+            );
+        }
+        if is_foreign && is_async {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "WREN-P075",
+                    "foreign methods cannot be declared async",
+                    Span::new(start, self.previous().span.end),
+                )
+                .with_note("A foreign method may return a Promise, which can then be awaited normally."),
             );
         }
 
@@ -1600,6 +1646,7 @@ impl<'a> Parser<'a> {
 
         Ok(MethodDecl {
             signature,
+            is_async,
             is_static,
             is_foreign,
             is_constructor,
@@ -2403,6 +2450,23 @@ impl<'a> Parser<'a> {
             }
             TokenKind::This => Ok(Expr::new(ExprKind::This, token.span)),
             TokenKind::Super => self.parse_super(token.span.start),
+            TokenKind::Await => {
+                self.skip_newlines();
+                let operand = self.parse_precedence(15)?;
+                let span = token.span.join(operand.span);
+                Ok(Expr::new(ExprKind::Await(Box::new(operand)), span))
+            }
+            TokenKind::Async => {
+                self.skip_newlines();
+                self.expect(
+                    TokenKind::LeftBrace,
+                    "WREN-P076",
+                    "expected `{` after `async`",
+                )?;
+                let body = self.parse_function_body_after_open(token.span.start, true)?;
+                let span = Span::new(token.span.start, body.span.end);
+                Ok(Expr::new(ExprKind::AsyncClosure(body), span))
+            }
             TokenKind::Minus | TokenKind::Bang | TokenKind::Tilde => {
                 let operator = match token.kind {
                     TokenKind::Minus => UnaryOp::Negate,
@@ -3801,4 +3865,24 @@ class Example {
             )
         }));
     }
+    #[test]
+    fn parses_async_methods_closures_and_await() {
+        let source = r#"
+class Tasks {
+  static async answer() { 42 }
+  async twice(value) {
+    var resolved = await value
+    return resolved + resolved
+  }
+}
+var work = async {|value| await value }
+"#;
+        let module = parse_ok(source);
+        let StmtKind::Class(class) = &module.statements[0].kind else { panic!("expected class"); };
+        assert!(class.methods[0].is_async && class.methods[0].is_static);
+        assert!(class.methods[1].is_async);
+        let StmtKind::Variable { initializer: Some(expr), .. } = &module.statements[1].kind else { panic!("expected async closure"); };
+        assert!(matches!(expr.kind, ExprKind::AsyncClosure(_)));
+    }
+
 }

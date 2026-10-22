@@ -17,7 +17,7 @@
 #![allow(clippy::identity_op)]
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -245,6 +245,59 @@ struct WrenMap {
     entries: FastMap<MapKey, Value>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PromiseWaiter {
+    Resume {
+        fiber: u32,
+        fiber_object: Value,
+        dst: Reg,
+    },
+    /// Promise chaining used by async return-value adoption. When the source
+    /// settles, the target Promise is settled with exactly the same outcome.
+    Forward {
+        promise: Value,
+    },
+}
+
+#[derive(Debug)]
+enum PromiseState {
+    Pending {
+        producer: Option<Value>,
+        waiters: Vec<PromiseWaiter>,
+    },
+    Fulfilled(Value),
+    Rejected(Value),
+}
+
+struct PromiseCell {
+    state: std::cell::UnsafeCell<PromiseState>,
+}
+
+impl PromiseCell {
+    fn new(state: PromiseState) -> Self {
+        Self { state: std::cell::UnsafeCell::new(state) }
+    }
+
+    #[inline(always)]
+    unsafe fn get(&self) -> &PromiseState {
+        unsafe { &*self.state.get() }
+    }
+
+    #[inline(always)]
+    unsafe fn get_mut(&self) -> &mut PromiseState {
+        unsafe { &mut *self.state.get() }
+    }
+}
+
+unsafe impl Send for PromiseCell {}
+unsafe impl Sync for PromiseCell {}
+
+impl fmt::Debug for PromiseCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PromiseCell(..)")
+    }
+}
+
 #[derive(Debug)]
 enum HeapObject {
     Random { state: u64 },
@@ -277,6 +330,17 @@ enum HeapObject {
     Foreign {
         class_slot: u32,
         bytes: Vec<u8>,
+    },
+    Promise {
+        state: Arc<PromiseCell>,
+    },
+    /// Scheduler-owned execution context for an async function. It deliberately
+    /// reuses FiberState's frame/register storage without being a Wren Fiber.
+    AsyncTaskObject {
+        task: u32,
+        state: Arc<FiberCell>,
+        trace_metadata: Arc<FiberTraceMetadata>,
+        promise: Value,
     },
     FiberObject {
         fiber: u32,
@@ -600,16 +664,18 @@ unsafe fn trace_instance(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     }
 }
 
-unsafe fn trace_fiber(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
-    let managed = unsafe { managed_object(object) };
-    let HeapObject::FiberObject { state, trace_metadata, .. } = &managed.object else {
-        return;
-    };
-    // SAFETY: MMTk calls custom tracing only after the owning mutator has
-    // stopped. FiberCell is stable Arc storage and cannot be mutated concurrently.
-    let state = unsafe { state.get() };
-
+unsafe fn trace_fiber_state(
+    state: &FiberState,
+    trace_metadata: &FiberTraceMetadata,
+    visitor: &mut dyn FnMut(GcSlot),
+) {
     if let Some(value) = state.starter {
+        visit_value(value, visitor);
+    }
+    if let Some(value) = state.async_promise {
+        visit_value(value, visitor);
+    }
+    if let Some(value) = state.awaiting_promise {
         visit_value(value, visitor);
     }
     visit_value(state.last_value, visitor);
@@ -656,6 +722,47 @@ unsafe fn trace_fiber(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     }
 }
 
+unsafe fn trace_promise(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    let HeapObject::Promise { state } = &managed.object else { return; };
+    // SAFETY: GC invokes custom tracing only while all mutators are stopped.
+    match unsafe { state.get() } {
+        PromiseState::Pending { producer, waiters } => {
+            if let Some(value) = producer {
+                visit_value(*value, visitor);
+            }
+            for waiter in waiters {
+                match *waiter {
+                    PromiseWaiter::Resume { fiber_object, .. } => visit_value(fiber_object, visitor),
+                    PromiseWaiter::Forward { promise } => visit_value(promise, visitor),
+                }
+            }
+        }
+        PromiseState::Fulfilled(value) | PromiseState::Rejected(value) => {
+            visit_value(*value, visitor);
+        }
+    }
+}
+
+unsafe fn trace_async_task(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    let HeapObject::AsyncTaskObject { state, trace_metadata, promise, .. } = &managed.object else {
+        return;
+    };
+    visit_value(*promise, visitor);
+    // SAFETY: AsyncTaskObject owns stable Arc storage and GC runs at STW.
+    unsafe { trace_fiber_state(state.get(), trace_metadata, visitor) };
+}
+
+unsafe fn trace_fiber(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+    let managed = unsafe { managed_object(object) };
+    let HeapObject::FiberObject { state, trace_metadata, .. } = &managed.object else {
+        return;
+    };
+    // SAFETY: FiberObject owns stable Arc storage and GC runs at STW.
+    unsafe { trace_fiber_state(state.get(), trace_metadata, visitor) };
+}
+
 unsafe fn cleanup_managed_object(object: GcObject) {
     let managed = unsafe { managed_object_mut(object) };
     handles().release(managed.handle);
@@ -686,6 +793,8 @@ gc_descriptor!(GC_MAP_VIEW, "Wren.MapView", GcTraceLayout::Custom(trace_map_view
 gc_descriptor!(GC_CELL, "Wren.Cell", GcTraceLayout::Custom(trace_cell));
 gc_descriptor!(GC_CLOSURE, "Wren.Closure", GcTraceLayout::Custom(trace_closure));
 gc_descriptor!(GC_INSTANCE, "Wren.Instance", GcTraceLayout::Custom(trace_instance));
+gc_descriptor!(GC_PROMISE, "Wren.Promise", GcTraceLayout::Custom(trace_promise));
+gc_descriptor!(GC_ASYNC_TASK, "Wren.AsyncTask", GcTraceLayout::Custom(trace_async_task));
 gc_descriptor!(GC_FIBER, "Wren.Fiber", GcTraceLayout::Custom(trace_fiber));
 
 #[inline(always)]
@@ -703,6 +812,8 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::BuiltinClass { .. } => &GC_BUILTIN_CLASS,
         HeapObject::Instance { .. } => &GC_INSTANCE,
         HeapObject::Foreign { .. } => &GC_FOREIGN,
+        HeapObject::Promise { .. } => &GC_PROMISE,
+        HeapObject::AsyncTaskObject { .. } => &GC_ASYNC_TASK,
         HeapObject::FiberObject { .. } => &GC_FIBER,
         HeapObject::ModuleObject { .. } => &GC_MODULE,
     }
@@ -721,7 +832,15 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         },
         HeapObject::Instance { fields, .. } => fields.len() * std::mem::size_of::<Value>(),
         HeapObject::Foreign { bytes, .. } => bytes.capacity(),
-        HeapObject::FiberObject { state, .. } => {
+        HeapObject::Promise { state } => {
+            // SAFETY: this is queried by the owning mutator.
+            match unsafe { state.get() } {
+                PromiseState::Pending { waiters, .. } =>
+                    waiters.capacity() * std::mem::size_of::<PromiseWaiter>(),
+                PromiseState::Fulfilled(_) | PromiseState::Rejected(_) => 0,
+            }
+        }
+        HeapObject::AsyncTaskObject { state, .. } | HeapObject::FiberObject { state, .. } => {
             // SAFETY: this is queried by the owning mutator before publication or
             // while it has exclusive VM access. GC workers never call this helper.
             fiber_state_external_bytes(unsafe { state.get() })
@@ -794,6 +913,47 @@ fn push_value_handle(value: Value, roots: &mut Vec<u32>) {
     }
 }
 
+fn collect_fiber_state_handles(
+    state: &FiberState,
+    trace_metadata: &FiberTraceMetadata,
+    roots: &mut Vec<u32>,
+) {
+    if let Some(value) = state.starter { push_value_handle(value, roots); }
+    if let Some(value) = state.async_promise { push_value_handle(value, roots); }
+    if let Some(value) = state.awaiting_promise { push_value_handle(value, roots); }
+    push_value_handle(state.last_value, roots);
+    push_value_handle(state.error, roots);
+    if let Some(link) = state.link { push_value_handle(link.caller_object, roots); }
+    for (depth, frame) in state.frames.iter().enumerate() {
+        if frame.root_map == NO_INDEX { continue; }
+        let Some(maps) = trace_metadata.gc_maps.get(frame.function as usize) else { continue; };
+        let Some(map) = maps.get(frame.root_map as usize) else { continue; };
+        let Some(banks) = state.banks.get(depth) else { continue; };
+        for reg in 0..frame.reg_count as usize {
+            if map.general_is_reference(Reg(reg as u8)) {
+                if let Some(&word) = state.registers.get(frame.reg_base + reg) {
+                    push_value_handle(Value::from_word(word), roots);
+                }
+            }
+        }
+        for index in 0..ARGUMENT_REGISTER_COUNT {
+            if (map.arguments & (1u16 << index)) != 0 {
+                push_value_handle(Value::from_word(banks.arguments[index]), roots);
+            }
+        }
+        for index in 0..RETURN_REGISTER_COUNT {
+            if (map.returns & (1u8 << index)) != 0 {
+                push_value_handle(Value::from_word(banks.returns[index]), roots);
+            }
+        }
+        for index in 0..SPECIAL_REGISTER_COUNT {
+            if (map.special & (1u16 << index)) != 0 {
+                push_value_handle(Value::from_word(banks.special[index]), roots);
+            }
+        }
+    }
+}
+
 fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
     match object {
         HeapObject::MapEntry { key, value } => {
@@ -825,43 +985,30 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         HeapObject::Instance { fields, .. } => {
             for &value in fields.iter() { push_value_handle(value, roots); }
         }
-        HeapObject::FiberObject { state, trace_metadata, .. } => {
-            // SAFETY: allocation happens on the owning mutator before the object
-            // is published; the Arc-backed state is stable and exclusively owned
-            // by this thread at this point.
-            let state = unsafe { state.get() };
-            if let Some(value) = state.starter { push_value_handle(value, roots); }
-            push_value_handle(state.last_value, roots);
-            push_value_handle(state.error, roots);
-            if let Some(link) = state.link { push_value_handle(link.caller_object, roots); }
-            for (depth, frame) in state.frames.iter().enumerate() {
-                if frame.root_map == NO_INDEX { continue; }
-                let Some(maps) = trace_metadata.gc_maps.get(frame.function as usize) else { continue; };
-                let Some(map) = maps.get(frame.root_map as usize) else { continue; };
-                let Some(banks) = state.banks.get(depth) else { continue; };
-                for reg in 0..frame.reg_count as usize {
-                    if map.general_is_reference(Reg(reg as u8)) {
-                        if let Some(&word) = state.registers.get(frame.reg_base + reg) {
-                            push_value_handle(Value::from_word(word), roots);
+        HeapObject::Promise { state } => {
+            // SAFETY: allocation root collection runs on the owning mutator.
+            match unsafe { state.get() } {
+                PromiseState::Pending { producer, waiters } => {
+                    if let Some(value) = producer { push_value_handle(*value, roots); }
+                    for waiter in waiters {
+                        match *waiter {
+                            PromiseWaiter::Resume { fiber_object, .. } => push_value_handle(fiber_object, roots),
+                            PromiseWaiter::Forward { promise } => push_value_handle(promise, roots),
                         }
                     }
                 }
-                for index in 0..ARGUMENT_REGISTER_COUNT {
-                    if (map.arguments & (1u16 << index)) != 0 {
-                        push_value_handle(Value::from_word(banks.arguments[index]), roots);
-                    }
-                }
-                for index in 0..RETURN_REGISTER_COUNT {
-                    if (map.returns & (1u8 << index)) != 0 {
-                        push_value_handle(Value::from_word(banks.returns[index]), roots);
-                    }
-                }
-                for index in 0..SPECIAL_REGISTER_COUNT {
-                    if (map.special & (1u16 << index)) != 0 {
-                        push_value_handle(Value::from_word(banks.special[index]), roots);
-                    }
+                PromiseState::Fulfilled(value) | PromiseState::Rejected(value) => {
+                    push_value_handle(*value, roots);
                 }
             }
+        }
+        HeapObject::AsyncTaskObject { state, trace_metadata, promise, .. } => {
+            push_value_handle(*promise, roots);
+            collect_fiber_state_handles(unsafe { state.get() }, trace_metadata, roots);
+        }
+        HeapObject::FiberObject { state, trace_metadata, .. } => {
+            // SAFETY: allocation happens on the owning mutator before publication.
+            collect_fiber_state_handles(unsafe { state.get() }, trace_metadata, roots);
         }
         HeapObject::String(_)
         | HeapObject::Random { .. }
@@ -1460,6 +1607,12 @@ impl HostContext<'_> {
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
             Some(HeapObject::Instance { class_slot, .. }) => format!("<instance class#{class_slot}>"),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign class#{class_slot}>"),
+            Some(HeapObject::Promise { state }) => match unsafe { state.get() } {
+                PromiseState::Pending { .. } => "<promise:pending>".to_owned(),
+                PromiseState::Fulfilled(_) => "<promise:fulfilled>".to_owned(),
+                PromiseState::Rejected(_) => "<promise:rejected>".to_owned(),
+            },
+            Some(HeapObject::AsyncTaskObject { task, .. }) => format!("<async-task#{task}>"),
             Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber#{fiber}>"),
             Some(HeapObject::ModuleObject { module_slot }) => format!("<module#{module_slot}>"),
             Some(HeapObject::Cell(_)) => "<cell>".to_owned(),
@@ -1656,6 +1809,10 @@ struct PreparedFunction {
     call_args: Vec<Reg>,
     switches: Vec<PreparedSwitch>,
     gc_maps: Vec<ReferenceMap>,
+    /// Synthetic precise map for a frame that has been initialized but has not
+    /// executed its first GC-capable opcode yet. Async tasks can remain queued in
+    /// exactly this state, so NO_INDEX would make their entry values invisible.
+    entry_gc_map: u32,
     word_to_op: Vec<u32>,
     deopt_resume: FastMap<u32, u32>,
     frame: FrameLayout,
@@ -1690,6 +1847,7 @@ struct PreparedFunction {
     needs_return_bank: bool,
     module_slot: u32,
     kind: FunctionKind,
+    is_async: bool,
     arity: u8,
     return_kind: RegisterKind,
     capture_count: u16,
@@ -2007,6 +2165,32 @@ impl PreparedProgram {
             }
         }
 
+        // Async calls create their frame before the task is scheduled. A GC can
+        // therefore observe this frame before any bytecode safepoint has installed
+        // a normal stack map. Build one precise entry map from the physical frame
+        // bindings plus the special registers initialized by push_frame().
+        let mut entry_references = ReferenceMap::default();
+        for binding in &function.frame.parameters {
+            if binding.kind == RegisterKind::Value {
+                entry_references.set_general(binding.destination, true);
+            }
+        }
+        for binding in &function.frame.captures {
+            if binding.kind == RegisterKind::Value {
+                entry_references.set_general(binding.destination, true);
+            }
+        }
+        if function_kind_uses_this(function.kind) {
+            entry_references.special |= 1u16 << SpecialReg::This.index();
+        }
+        if function.kind == FunctionKind::Closure {
+            entry_references.special |= 1u16 << SpecialReg::Closure.index();
+        }
+        entry_references.special |= 1u16 << SpecialReg::Module.index();
+        entry_references.special |= 1u16 << SpecialReg::Fiber.index();
+        let entry_gc_map = gc_maps.len() as u32;
+        gc_maps.push(entry_references);
+
         let deopt_uses_argument = function.chunk.deopts.iter().any(|point| {
             point.slots.iter().chain(point.inlined_frames.iter().flat_map(|frame| frame.slots.iter()))
                 .any(|slot| matches!(slot.location, DeoptLocation::Argument(_)))
@@ -2038,6 +2222,7 @@ impl PreparedProgram {
             call_args,
             switches,
             gc_maps,
+            entry_gc_map,
             word_to_op,
             deopt_resume,
             frame: function.frame.clone(),
@@ -2056,6 +2241,7 @@ impl PreparedProgram {
             needs_return_bank,
             module_slot,
             kind: function.kind,
+            is_async: function.is_async,
             arity: function.arity,
             return_kind: function.frame.return_kind,
             capture_count: function.capture_count,
@@ -2237,6 +2423,11 @@ pub enum NativeBuiltin {
     FiberAbort,
     FiberError,
     FiberIsDone,
+    PromiseResolve,
+    PromiseReject,
+    PromiseIsPending,
+    PromiseIsFulfilled,
+    PromiseIsRejected,
     SystemGc,
 }
 
@@ -2251,12 +2442,13 @@ pub enum BuiltinClass {
     Range,
     Closure,
     Fiber,
+    Promise,
     MapEntry,
     MapKeys,
     Random,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 12;
+const BUILTIN_CLASS_COUNT: usize = 13;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -2286,6 +2478,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Range as u64),
         HeapObject::Closure { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Closure as u64),
+        HeapObject::Promise { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Promise as u64),
         HeapObject::FiberObject { .. } =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Fiber as u64),
         HeapObject::ClassObject { class_slot } =>
@@ -2296,7 +2490,9 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_INSTANCE | *class_slot as u64),
         HeapObject::Foreign { class_slot, .. } =>
             ReceiverClass(CLASS_KIND_FOREIGN | *class_slot as u64),
-        HeapObject::Cell(_) | HeapObject::ModuleObject { .. } => return None,
+        HeapObject::AsyncTaskObject { .. }
+        | HeapObject::Cell(_)
+        | HeapObject::ModuleObject { .. } => return None,
     })
 }
 
@@ -2498,6 +2694,7 @@ struct RuntimeModule {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FiberStatus {
     New,
+    Ready,
     Running,
     Suspended,
     Done,
@@ -2562,6 +2759,10 @@ struct FiberState {
     starter: Option<Value>,
     link: Option<FiberLink>,
     suspend_dst: Option<Reg>,
+    /// Promise resolved/rejected when this internal async task completes.
+    async_promise: Option<Value>,
+    /// Promise whose settlement will make this execution runnable again.
+    awaiting_promise: Option<Value>,
     last_value: Value,
     error: Value,
 }
@@ -2578,6 +2779,8 @@ impl FiberState {
             starter: None,
             link: None,
             suspend_dst: None,
+            async_promise: None,
+            awaiting_promise: None,
             last_value: Value::NULL,
             error: Value::NULL,
         }
@@ -2661,6 +2864,8 @@ pub struct Interpreter<'p> {
     resolved_constants: Vec<Vec<RegisterWord>>,
     fibers: Vec<Option<Arc<FiberCell>>>,
     free_fibers: Vec<u32>,
+    /// Cooperative FIFO run queue for internal async tasks and resumed awaiters.
+    ready_async: VecDeque<u32>,
     fiber_trace_metadata: Arc<FiberTraceMetadata>,
     current_fiber: u32,
     run_state: RunState,
@@ -2737,6 +2942,12 @@ unsafe impl GcRootProvider for VmRootProvider {
         {
             // SAFETY: provider runs only while mutators are stopped.
             root(unsafe { fiber.get() }.object);
+        }
+        for &id in &vm.ready_async {
+            if let Some(fiber) = vm.fibers.get(id as usize).and_then(|slot| slot.as_ref()) {
+                // SAFETY: provider runs only while mutators are stopped.
+                root(unsafe { fiber.get() }.object);
+            }
         }
         root(vm.result);
     }
@@ -2936,6 +3147,7 @@ impl<'p> Interpreter<'p> {
             resolved_constants,
             fibers: vec![Some(main)],
             free_fibers: Vec::new(),
+            ready_async: VecDeque::new(),
             fiber_trace_metadata,
             current_fiber: 0,
             run_state: RunState::Running,
@@ -3005,6 +3217,12 @@ impl<'p> Interpreter<'p> {
         {
             // SAFETY: sync_persistent_roots runs on the owning mutator thread.
             push(unsafe { fiber.get() }.object);
+        }
+        for &id in &self.ready_async {
+            if let Some(fiber) = self.fibers.get(id as usize).and_then(|slot| slot.as_deref()) {
+                // SAFETY: owning mutator thread; task object is stable native storage owner.
+                push(unsafe { fiber.get() }.object);
+            }
         }
         push(self.result);
         self.persistent_roots.replace(roots);
@@ -3232,6 +3450,11 @@ impl<'p> Interpreter<'p> {
             return Err(RuntimeError::new("resume requires a suspended VM"));
         }
         let current = self.current_fiber;
+        if self.fiber(current).awaiting_promise.is_some() {
+            return Err(RuntimeError::new(
+                "a Promise-suspended execution can only resume when that Promise settles",
+            ));
+        }
         let dst = self.fiber_mut(current).suspend_dst.take();
         if let Some(dst) = dst {
             let fiber = self.fiber_mut(current);
@@ -3760,12 +3983,14 @@ impl<'p> Interpreter<'p> {
             }
         }
 
-        fiber.frames.push(Frame::new(
+        let mut frame = Frame::new(
             function_index,
             base,
             reg_count as u16,
             return_dst,
-        ));
+        );
+        frame.root_map = prepared.entry_gc_map;
+        fiber.frames.push(frame);
         let external_update = may_grow_external.then(|| {
             (fiber.object, fiber_state_external_bytes(fiber))
         });
@@ -3848,8 +4073,473 @@ impl<'p> Interpreter<'p> {
         self.finish_fiber(value);
     }
 
+    #[inline]
+    fn allocate_promise(&mut self, state: PromiseState) -> Value {
+        self.heap.alloc(HeapObject::Promise {
+            state: Arc::new(PromiseCell::new(state)),
+        })
+    }
+
+    #[inline]
+    fn promise_cell(&self, promise: Value) -> Result<Arc<PromiseCell>, RuntimeError> {
+        match self.heap.get(promise) {
+            Some(HeapObject::Promise { state }) => Ok(state.clone()),
+            _ => Err(RuntimeError::new("await expects a Promise")),
+        }
+    }
+
+    #[inline]
+    fn enqueue_ready_execution(&mut self, id: u32) {
+        let Some(cell) = self.fibers.get(id as usize).and_then(|slot| slot.as_ref()) else {
+            return;
+        };
+        // SAFETY: scheduler mutation is confined to the owning interpreter thread.
+        let state = unsafe { cell.get_mut() };
+        if matches!(state.status, FiberStatus::Done | FiberStatus::Failed | FiberStatus::Ready) {
+            return;
+        }
+        state.status = FiberStatus::Ready;
+        self.ready_async.push_back(id);
+    }
+
+    /// Select the next runnable async continuation. The public Fiber API never
+    /// uses this queue; it keeps its explicit call/transfer graph unchanged.
+    fn schedule_next_ready(&mut self) -> bool {
+        while let Some(id) = self.ready_async.pop_front() {
+            let is_ready = self
+                .fibers
+                .get(id as usize)
+                .and_then(|slot| slot.as_ref())
+                .is_some_and(|cell| unsafe { cell.get() }.status == FiberStatus::Ready);
+            if !is_ready {
+                continue;
+            }
+            self.switch_current_fiber(id);
+            let state = self.fiber_mut(id);
+            state.status = FiberStatus::Running;
+            state.awaiting_promise = None;
+            self.refresh_hot_frame();
+            self.run_state = RunState::Running;
+            return true;
+        }
+        false
+    }
+
+    fn install_execution_cell(&mut self, id: u32, cell: Arc<FiberCell>) {
+        if id as usize == self.fibers.len() {
+            self.fibers.push(Some(cell));
+        } else {
+            self.fibers[id as usize] = Some(cell);
+        }
+    }
+
+    /// Create an internal task for an async bytecode function and immediately
+    /// return its result Promise to the caller. Execution is cooperative: the
+    /// task starts at the next await/scheduler boundary rather than recursively
+    /// entering a second interpreter dispatch loop.
+    fn spawn_async_task(
+        &mut self,
+        function_index: u32,
+        receiver: Option<RegisterWord>,
+        args: &[RegisterWord],
+        closure: Option<Value>,
+    ) -> Result<Value, RuntimeError> {
+        let promise = self.allocate_promise(PromiseState::Pending {
+            producer: None,
+            waiters: Vec::new(),
+        });
+        // A second managed allocation follows before the Promise becomes reachable
+        // from either caller registers or its producer task.
+        let promise_root = self.add_root(promise);
+
+        let id = if let Some(id) = self.free_fibers.pop() {
+            id
+        } else {
+            self.fibers.len() as u32
+        };
+        let mut task_state = FiberState::new(Value::NULL, FiberStatus::Ready);
+        task_state.async_promise = Some(promise);
+        let task = Arc::new(FiberCell::new(task_state));
+        let task_object = self.heap.alloc(HeapObject::AsyncTaskObject {
+            task: id,
+            state: task.clone(),
+            trace_metadata: self.fiber_trace_metadata.clone(),
+            promise,
+        });
+        unsafe { task.get_mut() }.object = task_object;
+        self.install_execution_cell(id, task);
+
+        // The pending Promise owns its producer while the task is runnable or
+        // suspended. This edge is removed when the Promise settles.
+        self.heap.remember_owner(promise);
+        let promise_cell = self.promise_cell(promise)?;
+        if let PromiseState::Pending { producer, .. } = unsafe { promise_cell.get_mut() } {
+            *producer = Some(task_object);
+        }
+
+        let source = self.current_fiber;
+        self.switch_current_fiber(id);
+        let pushed = self.push_frame(function_index, receiver, args, closure, None);
+        self.fiber_mut(id).status = FiberStatus::Ready;
+        self.switch_current_fiber(source);
+        self.refresh_hot_frame();
+
+        if let Err(error) = pushed {
+            self.fiber_mut(id).status = FiberStatus::Failed;
+            self.release_root(promise_root);
+            return Err(error);
+        }
+
+        self.ready_async.push_back(id);
+        self.release_root(promise_root);
+        Ok(promise)
+    }
+
+    /// Common bytecode-call boundary. Async callees return a Promise immediately;
+    /// synchronous callees retain the existing frame-push fast path.
+    fn enter_bytecode_call(
+        &mut self,
+        op: &PreparedOp,
+        function: u32,
+        receiver: Option<RegisterWord>,
+        args: &[RegisterWord],
+        closure: Option<Value>,
+    ) {
+        self.mark_gc_point(op);
+        unsafe { self.advance(op); }
+        self.flush_hot_pc();
+
+        if self.prepared.functions[function as usize].is_async {
+            self.maybe_collect();
+            match self.spawn_async_task(function, receiver, args, closure) {
+                Ok(promise) => unsafe { self.set_reg(op.a, promise.word()) },
+                Err(error) => self.fail_at(op, error.message),
+            }
+        } else if let Err(error) = self.push_frame(
+            function,
+            receiver,
+            args,
+            closure,
+            Some(Reg(op.a)),
+        ) {
+            self.fail_at(op, error.message);
+        }
+    }
+
+    fn enter_direct_bytecode_call(
+        &mut self,
+        op: &PreparedOp,
+        function: u32,
+        sources: &[RegisterWord],
+        closure: Option<Value>,
+    ) {
+        let uses_this = function_kind_uses_this(self.prepared.functions[function as usize].kind);
+        let (receiver, args) = if uses_this {
+            let Some((first, rest)) = sources.split_first() else {
+                self.fail_at(op, "method-like call has no receiver");
+                return;
+            };
+            (Some(*first), rest)
+        } else {
+            (None, sources)
+        };
+        self.enter_bytecode_call(op, function, receiver, args, closure);
+    }
+
+    fn resume_promise_waiter(
+        &mut self,
+        promise: Value,
+        fiber: u32,
+        fiber_object: Value,
+        dst: Reg,
+        value: Value,
+    ) {
+        // The suspended execution object can be mature while `value` is young.
+        // Its register stack lives in external Arc storage but is traced as part
+        // of that managed owner, so the owner barrier must precede the write.
+        self.heap.remember_if_reference(fiber_object, value);
+        let Some(cell) = self.fibers.get(fiber as usize).and_then(|slot| slot.as_ref()) else {
+            return;
+        };
+        // SAFETY: scheduler and Promise settlement run on the owning interpreter thread.
+        let state = unsafe { cell.get_mut() };
+        if state.object != fiber_object
+            || state.awaiting_promise != Some(promise)
+            || matches!(state.status, FiberStatus::Done | FiberStatus::Failed)
+        {
+            return;
+        }
+        let Some(frame) = state.frames.last() else { return; };
+        let index = frame.reg_base + dst.index();
+        if index >= state.registers.len() { return; }
+        state.registers[index] = value.word();
+        state.awaiting_promise = None;
+        state.suspend_dst = None;
+        state.status = FiberStatus::Ready;
+        self.ready_async.push_back(fiber);
+    }
+
+    fn reject_execution(&mut self, id: u32, reason: Value) {
+        let owner = match self.fibers.get(id as usize).and_then(|slot| slot.as_ref()) {
+            Some(cell) => unsafe { cell.get() }.object,
+            None => return,
+        };
+        self.heap.remember_if_reference(owner, reason);
+        let result_promise = {
+            let Some(cell) = self.fibers.get(id as usize).and_then(|slot| slot.as_ref()) else {
+                return;
+            };
+            // SAFETY: scheduler mutation is confined to the owning interpreter thread.
+            let state = unsafe { cell.get_mut() };
+            state.status = FiberStatus::Failed;
+            state.error = reason;
+            state.awaiting_promise = None;
+            state.suspend_dst = None;
+            state.frames.clear();
+            state.register_top = 0;
+            state.async_promise
+        };
+
+        if id == 0 {
+            self.switch_current_fiber(0);
+            self.error = Some(RuntimeError::new(format!(
+                "awaited Promise rejected: {:?}", reason
+            )));
+            self.run_state = RunState::Failed;
+            self.clear_hot_frame();
+            return;
+        }
+
+        if let Some(promise) = result_promise {
+            let _ = self.settle_promise(promise, true, reason);
+        }
+    }
+
+    fn reject_promise_waiter(
+        &mut self,
+        promise: Value,
+        fiber: u32,
+        fiber_object: Value,
+        reason: Value,
+    ) {
+        let valid = self
+            .fibers
+            .get(fiber as usize)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|cell| {
+                let state = unsafe { cell.get() };
+                state.object == fiber_object && state.awaiting_promise == Some(promise)
+            });
+        if valid {
+            self.reject_execution(fiber, reason);
+        }
+    }
+
+    fn settle_promise(
+        &mut self,
+        promise: Value,
+        rejected: bool,
+        value: Value,
+    ) -> Result<(), RuntimeError> {
+        let cell = self.promise_cell(promise)?;
+        self.heap.remember_owner(promise);
+        let replacement = if rejected {
+            PromiseState::Rejected(value)
+        } else {
+            PromiseState::Fulfilled(value)
+        };
+        let previous = unsafe { std::mem::replace(cell.get_mut(), replacement) };
+        let waiters = match previous {
+            PromiseState::Pending { waiters, .. } => waiters,
+            settled => {
+                unsafe { *cell.get_mut() = settled; }
+                return Err(RuntimeError::new("Promise has already been settled"));
+            }
+        };
+        self.heap.set_external_bytes(promise, 0);
+
+        for waiter in waiters {
+            match waiter {
+                PromiseWaiter::Resume { fiber, fiber_object, dst } => {
+                    if rejected {
+                        self.reject_promise_waiter(promise, fiber, fiber_object, value);
+                    } else {
+                        self.resume_promise_waiter(promise, fiber, fiber_object, dst, value);
+                    }
+                }
+                PromiseWaiter::Forward { promise: target } => {
+                    // A Forward waiter is installed only on a still-pending target.
+                    // If user/runtime code has already settled it, preserve that
+                    // first settlement and ignore the stale forwarding edge.
+                    let _ = self.settle_promise(target, rejected, value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve an async function's result Promise. Returning another Promise
+    /// adopts its state instead of producing a nested Promise.
+    fn resolve_async_result(&mut self, promise: Value, value: Value) -> Result<(), RuntimeError> {
+        if promise == value {
+            // Self-resolution would otherwise create a permanently pending cycle.
+            return self.settle_promise(promise, true, Value::NULL);
+        }
+
+        let Some(inner_cell) = (match self.heap.get(value) {
+            Some(HeapObject::Promise { state }) => Some(state.clone()),
+            _ => None,
+        }) else {
+            return self.settle_promise(promise, false, value);
+        };
+
+        // Promise state belongs to this interpreter thread. GC only observes it
+        // after STW, so it is safe to inspect/mutate through the stable Arc cell.
+        match unsafe { inner_cell.get_mut() } {
+            PromiseState::Fulfilled(result) => self.settle_promise(promise, false, *result),
+            PromiseState::Rejected(reason) => self.settle_promise(promise, true, *reason),
+            PromiseState::Pending { waiters, .. } => {
+                self.heap.remember_owner(value);
+                waiters.push(PromiseWaiter::Forward { promise });
+                self.heap.set_external_bytes(
+                    value,
+                    waiters.capacity() * std::mem::size_of::<PromiseWaiter>(),
+                );
+
+                // Replace the completed task as the outer Promise's dependency.
+                // This keeps the adopted inner Promise alive until forwarding fires.
+                self.heap.remember_if_reference(promise, value);
+                let outer = self.promise_cell(promise)?;
+                match unsafe { outer.get_mut() } {
+                    PromiseState::Pending { producer, .. } => *producer = Some(value),
+                    _ => return Err(RuntimeError::new("async result Promise settled before adoption")),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn await_promise(&mut self, op: &PreparedOp, promise: Value, dst: Reg) {
+        let cell = match self.promise_cell(promise) {
+            Ok(cell) => cell,
+            Err(error) => {
+                self.fail_at(op, error.message);
+                return;
+            }
+        };
+
+        // SAFETY: Promise state is mutated only by this interpreter thread. GC
+        // observes it only after a stop-the-world rendezvous.
+        match unsafe { cell.get_mut() } {
+            PromiseState::Fulfilled(value) => unsafe {
+                self.set_reg(dst.0, (*value).word());
+                self.advance(op);
+            },
+            PromiseState::Rejected(reason) => {
+                let reason = *reason;
+                self.mark_gc_point(op);
+                unsafe { self.advance(op); }
+                self.flush_hot_pc();
+                let current = self.current_fiber;
+                self.reject_execution(current, reason);
+                if self.run_state != RunState::Failed && !self.schedule_next_ready() {
+                    self.switch_current_fiber(0);
+                    self.run_state = if self.fiber(0).status == FiberStatus::Done {
+                        RunState::Returned
+                    } else {
+                        RunState::Suspended
+                    };
+                    self.clear_hot_frame();
+                }
+            }
+            PromiseState::Pending { waiters, .. } => {
+                self.mark_gc_point(op);
+                unsafe { self.advance(op); }
+                self.flush_hot_pc();
+
+                let current = self.current_fiber;
+                let fiber_object = self.fiber(current).object;
+                self.heap.remember_owner(promise);
+                waiters.push(PromiseWaiter::Resume { fiber: current, fiber_object, dst });
+                let external = waiters.capacity() * std::mem::size_of::<PromiseWaiter>();
+                self.heap.set_external_bytes(promise, external);
+
+                // The suspended execution object may already be mature while the
+                // Promise is young. The Promise becomes an outgoing edge of the
+                // execution state, so log the managed owner before publishing it.
+                self.heap.remember_if_reference(fiber_object, promise);
+                let state = self.fiber_mut(current);
+                state.status = FiberStatus::Suspended;
+                state.awaiting_promise = Some(promise);
+                state.suspend_dst = Some(dst);
+
+                if !self.schedule_next_ready() {
+                    // Park only when the public execution itself is waiting. A
+                    // detached async task must not keep an already-completed main
+                    // module artificially suspended just because its Promise is
+                    // still pending.
+                    self.switch_current_fiber(0);
+                    if self.fiber(0).status == FiberStatus::Done {
+                        self.result = self.fiber(0).last_value;
+                        self.run_state = RunState::Returned;
+                    } else {
+                        self.result = promise;
+                        self.run_state = RunState::Suspended;
+                    }
+                    self.clear_hot_frame();
+                }
+            }
+        }
+    }
+
     fn finish_fiber(&mut self, value: Value) {
         let current = self.current_fiber;
+        let async_promise = self.fiber(current).async_promise;
+
+        if let Some(promise) = async_promise {
+            {
+                let task = self.fiber_mut(current);
+                task.status = FiberStatus::Done;
+                task.last_value = value;
+                task.awaiting_promise = None;
+            }
+            if let Err(error) = self.resolve_async_result(promise, value) {
+                self.fail(error);
+                return;
+            }
+            if self.run_state == RunState::Failed {
+                return;
+            }
+            if self.schedule_next_ready() {
+                return;
+            }
+            // No async continuation is runnable. Return control to the public
+            // main execution object before exposing an idle VM state; internal
+            // AsyncTask objects must never become the externally current Fiber.
+            self.switch_current_fiber(0);
+            if self.fiber(0).status == FiberStatus::Done {
+                self.run_state = RunState::Returned;
+            } else {
+                self.result = self.fiber(0).awaiting_promise.unwrap_or(Value::NULL);
+                self.run_state = RunState::Suspended;
+            }
+            self.clear_hot_frame();
+            return;
+        }
+
+        if current == 0 {
+            let main = self.fiber_mut(0);
+            main.status = FiberStatus::Done;
+            main.last_value = value;
+            self.result = value;
+            if self.schedule_next_ready() {
+                return;
+            }
+            self.run_state = RunState::Returned;
+            self.clear_hot_frame();
+            return;
+        }
+
         let link = {
             let fiber = self.fiber_mut(current);
             fiber.status = FiberStatus::Done;
@@ -4316,12 +5006,7 @@ impl Interpreter<'_> {
     ) {
         match target {
             CallTarget::Bytecode(function) => {
-                self.mark_gc_point(op);
-                unsafe { self.advance(op); }
-                self.flush_hot_pc();
-                if let Err(error) = self.push_frame(function, Some(receiver), args, None, Some(Reg(op.a))) {
-                    self.fail_at(op, error.message);
-                }
+                self.enter_bytecode_call(op, function, Some(receiver), args, None);
             }
             CallTarget::Primitive(primitive) => {
                 // Stock numeric primitives are pure, non-allocating operations.
@@ -4397,6 +5082,21 @@ impl Interpreter<'_> {
         args: &[RegisterWord],
     ) {
         let arg = |index: usize| args.get(index).copied().map(Value::from_word).unwrap_or(Value::NULL);
+        if self.fiber(self.current_fiber).async_promise.is_some()
+            && matches!(
+                native,
+                NativeBuiltin::FiberCall
+                    | NativeBuiltin::FiberTry
+                    | NativeBuiltin::FiberTransfer
+                    | NativeBuiltin::FiberTransferError
+                    | NativeBuiltin::FiberYield
+                    | NativeBuiltin::FiberSuspend
+                    | NativeBuiltin::FiberAbort
+            )
+        {
+            self.fail_at(op, "Fiber control-flow operations are unavailable inside async tasks");
+            return;
+        }
         match native {
             NativeBuiltin::FnNew => {
                 let closure = arg(0);
@@ -4421,15 +5121,17 @@ impl Interpreter<'_> {
                     Some(HeapObject::Closure { function_index, .. }) => *function_index,
                     _ => { self.fail_at(op, "Fn.call receiver is not a closure"); return; }
                 };
-                self.mark_gc_point(op);
-                unsafe { self.advance(op); }
-                self.flush_hot_pc();
-                if let Err(error) = self.push_frame(function, None, args, Some(closure), Some(Reg(op.a))) {
-                    self.fail_at(op, error.message);
-                }
+                self.enter_bytecode_call(op, function, None, args, Some(closure));
             }
             NativeBuiltin::FiberCurrent => {
-                let value = self.fiber(self.current_fiber).object;
+                let current = self.fiber(self.current_fiber);
+                // Async tasks reuse FiberState storage but are deliberately not
+                // public Wren Fiber objects. Do not leak the internal task handle.
+                let value = if current.async_promise.is_some() {
+                    Value::NULL
+                } else {
+                    current.object
+                };
                 unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
             }
             NativeBuiltin::FiberNew => {
@@ -4479,6 +5181,40 @@ impl Interpreter<'_> {
                     .and_then(|slot| slot.as_ref())
                     .map_or(true, |state| matches!(unsafe { state.get() }.status, FiberStatus::Done | FiberStatus::Failed));
                 unsafe { self.set_reg(op.a, Value::from_bool(done).word()); self.advance(op); }
+            }
+            NativeBuiltin::PromiseResolve => {
+                let value = arg(0);
+                if matches!(self.heap.get(value), Some(HeapObject::Promise { .. })) {
+                    unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+                    return;
+                }
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let promise = self.allocate_promise(PromiseState::Fulfilled(value));
+                unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
+            }
+            NativeBuiltin::PromiseReject => {
+                let reason = arg(0);
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let promise = self.allocate_promise(PromiseState::Rejected(reason));
+                unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
+            }
+            NativeBuiltin::PromiseIsPending
+            | NativeBuiltin::PromiseIsFulfilled
+            | NativeBuiltin::PromiseIsRejected => {
+                let promise = Value::from_word(receiver);
+                let state = match self.heap.get(promise) {
+                    Some(HeapObject::Promise { state }) => state.clone(),
+                    _ => { self.fail_at(op, "Promise state getter receiver is not a Promise"); return; }
+                };
+                let matches = match native {
+                    NativeBuiltin::PromiseIsPending => matches!(unsafe { state.get() }, PromiseState::Pending { .. }),
+                    NativeBuiltin::PromiseIsFulfilled => matches!(unsafe { state.get() }, PromiseState::Fulfilled(_)),
+                    NativeBuiltin::PromiseIsRejected => matches!(unsafe { state.get() }, PromiseState::Rejected(_)),
+                    _ => false,
+                };
+                unsafe { self.set_reg(op.a, Value::from_bool(matches).word()); self.advance(op); }
             }
             NativeBuiltin::SystemGc => {
                 // System.gc() is itself a GC-capable call. Publish the exact
@@ -4653,11 +5389,14 @@ impl Interpreter<'_> {
         for index in 1..self.fibers.len() {
             let dead = self.fibers[index].as_ref().is_some_and(|cell| {
                 let fiber = unsafe { cell.get() };
-                !matches!(
-                    self.heap.get(fiber.object),
-                    Some(HeapObject::FiberObject { fiber: live_id, .. })
-                        if *live_id == index as u32
-                )
+                let live = match self.heap.get(fiber.object) {
+                    Some(HeapObject::FiberObject { fiber: live_id, .. }) =>
+                        *live_id == index as u32,
+                    Some(HeapObject::AsyncTaskObject { task: live_id, .. }) =>
+                        *live_id == index as u32,
+                    _ => false,
+                };
+                !live
             });
             if dead && self.fibers[index].take().is_some() {
                 self.free_fibers.push(index as u32);
@@ -4682,10 +5421,15 @@ impl Interpreter<'_> {
             Some(HeapObject::Closure { function_index, .. }) => *function_index,
             _ => return Err(RuntimeError::new("Fiber.new requires a closure")),
         };
-        if self.program.functions
-            .get(function_index as usize)
-            .map_or(true, |function| function.arity > 1)
-        {
+        let Some(function) = self.program.functions.get(function_index as usize) else {
+            return Err(RuntimeError::new("Fiber.new closure has an invalid function"));
+        };
+        if function.is_async {
+            return Err(RuntimeError::new(
+                "Fiber.new cannot wrap an async closure; call the async closure directly",
+            ));
+        }
+        if function.arity > 1 {
             return Err(RuntimeError::new("Fiber function cannot take more than one parameter"));
         }
 
@@ -4957,7 +5701,7 @@ impl Interpreter<'_> {
 // Static token-threading handler table.
 // =============================================================================
 
-const OPCODE_COUNT: usize = 122;
+const OPCODE_COUNT: usize = 123;
 
 static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_nop, // Nop
@@ -5082,13 +5826,14 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_profile_block, // ProfileBlock
     h_profile_numeric, // ProfileNumeric
     h_breakpoint, // Breakpoint
+    h_await, // Await
 ];
 
 #[inline(always)]
 fn handler_for(opcode: Opcode) -> Handler {
-    // Opcode values are deliberately dense 0..121. Preparation has already
+    // Opcode values are deliberately dense 0..122. Preparation has already
     // validated the byte stream, so dispatch selection is a single indexed
-    // load instead of a generated 122-way match.
+    // load instead of a generated 123-way match.
     unsafe { *HANDLER_TABLE.get_unchecked(opcode as usize) }
 }
 
@@ -5291,12 +6036,7 @@ unsafe fn h_invoke_mono_bytecode_small<const N: usize>(vm:&mut Interpreter, ptr:
         return;
     };
     let args=vm.gather_call_words_const::<N>(&op);
-    vm.mark_gc_point(&op);
-    vm.advance(&op);
-    vm.flush_hot_pc();
-    if let Err(error)=vm.push_frame(function,Some(receiver),&args[..N],None,Some(Reg(op.a))){
-        vm.fail_at(&op,error.message);
-    }
+    vm.enter_bytecode_call(&op,function,Some(receiver),&args[..N],None);
 }
 
 unsafe fn h_invoke_mono_bytecode(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -5319,21 +6059,11 @@ unsafe fn h_invoke_mono_bytecode(vm:&mut Interpreter, ptr:*const PreparedOp){
     if op.c <= 4 {
         let mut args=[RegisterWord(0);4];
         let count=vm.gather_call_words_small(&op,&mut args);
-        vm.mark_gc_point(&op);
-        vm.advance(&op);
-        vm.flush_hot_pc();
-        if let Err(error)=vm.push_frame(function,Some(receiver),&args[..count],None,Some(Reg(op.a))){
-            vm.fail_at(&op,error.message);
-        }
+        vm.enter_bytecode_call(&op,function,Some(receiver),&args[..count],None);
     } else {
         let mut args=[RegisterWord(0);17];
         let count=vm.gather_call_words_large(&op,&mut args);
-        vm.mark_gc_point(&op);
-        vm.advance(&op);
-        vm.flush_hot_pc();
-        if let Err(error)=vm.push_frame(function,Some(receiver),&args[..count],None,Some(Reg(op.a))){
-            vm.fail_at(&op,error.message);
-        }
+        vm.enter_bytecode_call(&op,function,Some(receiver),&args[..count],None);
     }
 }
 
@@ -5489,10 +6219,7 @@ unsafe fn h_invoke_num_quick_specialized<const OP: u8, const BRANCH: u8>(
 unsafe fn h_call_direct_small<const N: usize>(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     let words=vm.gather_call_words_const::<N>(op);
-    vm.mark_gc_point(op);
-    vm.advance(op);
-    vm.flush_hot_pc();
-    if let Err(e)=vm.push_frame_direct(op.x,&words[..N],None,Some(Reg(op.a))){vm.fail_at(op,e.message)}
+    vm.enter_direct_bytecode_call(op,op.x,&words[..N],None);
 }
 
 unsafe fn h_call_closure_small<const N: usize>(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -5503,40 +6230,36 @@ unsafe fn h_call_closure_small<const N: usize>(vm:&mut Interpreter, ptr:*const P
         _=>{vm.fail_at(op,"CallClosure operand is not a closure");return;}
     };
     let words=vm.gather_call_words_const::<N>(op);
-    vm.mark_gc_point(op);
-    vm.advance(op);
-    vm.flush_hot_pc();
-    if let Err(e)=vm.push_frame(function,None,&words[..N],Some(closure),Some(Reg(op.a))){vm.fail_at(op,e.message)}
+    vm.enter_bytecode_call(op,function,None,&words[..N],Some(closure));
 }
 
 unsafe fn h_call_direct(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
-    vm.mark_gc_point(op);
-    vm.advance(op);
-    vm.flush_hot_pc();
     if op.c <= 4 {
         let mut words=[RegisterWord(0);4];
         let count=vm.gather_call_words_small(op,&mut words);
-        if let Err(e)=vm.push_frame_direct(op.x,&words[..count],None,Some(Reg(op.a))){vm.fail_at(op,e.message)}
+        vm.enter_direct_bytecode_call(op,op.x,&words[..count],None);
     } else {
         let mut words=[RegisterWord(0);17];
         let count=vm.gather_call_words_large(op,&mut words);
-        if let Err(e)=vm.push_frame_direct(op.x,&words[..count],None,Some(Reg(op.a))){vm.fail_at(op,e.message)}
+        vm.enter_direct_bytecode_call(op,op.x,&words[..count],None);
     }
 }
 unsafe fn h_call_closure(vm:&mut Interpreter, ptr:*const PreparedOp){
-    let op=&*ptr; let closure=Value::from_word(vm.reg(op.b)); let function=match vm.heap.get(closure){Some(HeapObject::Closure{function_index,..})=>*function_index,_=>{vm.fail_at(op,"CallClosure operand is not a closure");return;}};
-    vm.mark_gc_point(op);
-    vm.advance(op);
-    vm.flush_hot_pc();
+    let op=&*ptr;
+    let closure=Value::from_word(vm.reg(op.b));
+    let function=match vm.heap.get(closure){
+        Some(HeapObject::Closure{function_index,..})=>*function_index,
+        _=>{vm.fail_at(op,"CallClosure operand is not a closure");return;}
+    };
     if op.c <= 4 {
         let mut words=[RegisterWord(0);4];
         let count=vm.gather_call_words_small(op,&mut words);
-        if let Err(e)=vm.push_frame(function,None,&words[..count],Some(closure),Some(Reg(op.a))){vm.fail_at(op,e.message)}
+        vm.enter_bytecode_call(op,function,None,&words[..count],Some(closure));
     } else {
         let mut words=[RegisterWord(0);17];
         let count=vm.gather_call_words_large(op,&mut words);
-        if let Err(e)=vm.push_frame(function,None,&words[..count],Some(closure),Some(Reg(op.a))){vm.fail_at(op,e.message)}
+        vm.enter_bytecode_call(op,function,None,&words[..count],Some(closure));
     }
 }
 unsafe fn h_call_primitive(vm:&mut Interpreter, ptr:*const PreparedOp){
@@ -5826,6 +6549,7 @@ unsafe fn h_read_barrier(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr
 unsafe fn h_profile_block(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let f=vm.current_frame().function as usize;if let Some(counter)=vm.profile_counters[f].get_mut(op.x as usize){*counter=counter.saturating_add(1);}vm.advance(op)}
 unsafe fn h_profile_numeric(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let f=vm.current_frame().function as usize;if let Some(counter)=vm.profile_counters[f].get_mut(op.x as usize){*counter=counter.saturating_add(1);}vm.advance(op)}
 unsafe fn h_breakpoint(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let(f,pc)=vm.current_location(op);match vm.host.breakpoint(f,pc){Ok(())=>vm.advance(op),Err(e)=>vm.fail_at(op,e.message)}}
+unsafe fn h_await(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let promise=Value::from_word(vm.reg(op.b));vm.await_promise(op,promise,Reg(op.a))}
 
 #[inline(always)]
 unsafe fn fused_branch(vm:&mut Interpreter,op:&PreparedOp,condition:bool){let take=if op.flags!=0{condition}else{!condition};let target=if take{op.y}else{op.next};vm.branch_to(op,target)}
@@ -5874,6 +6598,12 @@ impl Interpreter<'_> {
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
             Some(HeapObject::Instance { class_slot, .. }) => format!("<{} instance>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign {}>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
+            Some(HeapObject::Promise { state }) => match unsafe { state.get() } {
+                PromiseState::Pending { .. } => "<promise:pending>".into(),
+                PromiseState::Fulfilled(_) => "<promise:fulfilled>".into(),
+                PromiseState::Rejected(_) => "<promise:rejected>".into(),
+            },
+            Some(HeapObject::AsyncTaskObject { task, .. }) => format!("<async-task#{task}>"),
             Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber:{fiber}>") ,
             Some(HeapObject::ModuleObject { module_slot }) => format!("<module:{}>", self.program.metadata.string(self.modules[*module_slot as usize].name).unwrap_or("module")),
             Some(HeapObject::Cell(_)) => "<cell>".into(),
@@ -6061,7 +6791,7 @@ mod tests {
         program.push_function(BytecodeFunction {
             id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,
             field_owner: None,
-            name: StringId(0), arity: 0, capture_count: 0,
+            name: StringId(0), is_async: false, arity: 0, capture_count: 0,
             frame: FrameLayout { general_register_count: gprs, parameters: vec![], captures: vec![], return_kind: RegisterKind::Value },
             chunk,
         }).unwrap();

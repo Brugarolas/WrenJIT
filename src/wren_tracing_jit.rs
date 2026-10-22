@@ -1267,7 +1267,7 @@ impl<'a> TraceRecorder<'a> {
                     | Opcode::CallDirect | Opcode::CallClosure | Opcode::ImportModule
                     | Opcode::FiberCall | Opcode::FiberTry | Opcode::FiberTransfer
                     | Opcode::FiberTransferError | Opcode::FiberYield | Opcode::FiberSuspend
-                    | Opcode::FiberAbort);
+                    | Opcode::FiberAbort | Opcode::Await);
                 builder.runtime(op.location, op.next_pc, terminal);
                 Ok(ExpectedStep::Runtime { terminal })
             }
@@ -2306,7 +2306,8 @@ impl<'a> TraceRecorder<'a> {
             | FiberTransferError
             | FiberYield
             | FiberSuspend
-            | FiberAbort => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
+            | FiberAbort
+            | Await => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
         }
     }
 

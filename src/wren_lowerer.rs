@@ -260,6 +260,7 @@ struct FunctionNode {
     capture_set: HashSet<BindingId>,
     this_binding: Option<BindingId>,
     closure_span: Option<Span>,
+    is_async: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -298,6 +299,7 @@ impl Analyzer {
             capture_set: HashSet::new(),
             this_binding: None,
             closure_span: None,
+            is_async: false,
         };
         let mut analyzer = Self {
             analysis: RootAnalysis {
@@ -339,6 +341,7 @@ impl Analyzer {
             capture_set: HashSet::new(),
             this_binding: None,
             closure_span: None,
+            is_async: method.is_async,
         };
         let mut analyzer = Self {
             analysis: RootAnalysis {
@@ -614,7 +617,9 @@ impl Analyzer {
                     self.visit_expr(arg);
                 }
             }
-            ExprKind::Closure(body) => self.visit_closure(body),
+            ExprKind::Await(value) => self.visit_expr(value),
+            ExprKind::Closure(body) => self.visit_closure(body, false),
+            ExprKind::AsyncClosure(body) => self.visit_closure(body, true),
         }
     }
 
@@ -639,7 +644,7 @@ impl Analyzer {
         }
     }
 
-    fn visit_closure(&mut self, body: &FunctionBody) {
+    fn visit_closure(&mut self, body: &FunctionBody, is_async: bool) {
         let parent = self.current_function;
         let id = FunctionNodeId(self.analysis.nodes.len());
         self.analysis.nodes.push(FunctionNode {
@@ -651,6 +656,7 @@ impl Analyzer {
             capture_set: HashSet::new(),
             this_binding: self.analysis.nodes[parent.0].this_binding,
             closure_span: Some(body.span),
+            is_async,
         });
         self.analysis.closure_map.insert(body.span, id);
 
@@ -834,6 +840,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             method_symbol: None,
             constructor: false,
             static_method: false,
+            is_async: false,
         };
         let entry = self.compile_function_node(module_id, &analysis, FunctionNodeId(0), spec)?;
 
@@ -1233,6 +1240,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     method_symbol: Some(body_symbol),
                     constructor: method.is_constructor,
                     static_method: method.is_static,
+                    is_async: method.is_async,
                 };
                 if let Some(function) = self.compile_function_node(module, &analysis, FunctionNodeId(0), spec) {
                     self.method_functions.insert(method.span, function);
@@ -1328,6 +1336,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     .as_ref()
                     .map(|context| context.static_method)
                     .unwrap_or(false),
+                is_async: analysis.nodes[child.0].is_async,
             };
             if let Some(function) = self.compile_function_node(module, analysis, child, spec) {
                 self.closure_functions
@@ -1370,6 +1379,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             param_types,
             Type::Top,
         );
+        builder.set_async(spec.is_async);
         if let Some(class) = spec.class {
             // Methods and closures nested inside them use field slots local to
             // this declaring class. The runtime relocates them exactly once when
@@ -1439,6 +1449,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             closure_ids,
             method_context,
             has_receiver,
+            allows_await: node.is_async || (node_id.0 == 0 && spec.kind == FunctionKind::ModuleBody),
         };
         let diagnostics = &mut self.diagnostics;
         let mut compiler = FunctionCompiler::new(builder, context, diagnostics, capture_values);
@@ -1477,6 +1488,7 @@ struct FunctionSpec {
     method_symbol: Option<MethodSymbol>,
     constructor: bool,
     static_method: bool,
+    is_async: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1536,6 +1548,7 @@ struct FunctionCompilerContext<'a> {
     closure_ids: HashMap<FunctionNodeId, FuncId>,
     method_context: Option<MethodContext>,
     has_receiver: bool,
+    allows_await: bool,
 }
 
 struct FunctionCompiler<'p, 'a, 'd> {
@@ -2144,7 +2157,18 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             ExprKind::Assign { target, value } => self.lower_assignment(target, value),
             ExprKind::Invoke(invoke) => self.lower_invoke(invoke, expr.span),
             ExprKind::Subscript { receiver, args } => self.lower_subscript(receiver, args),
-            ExprKind::Closure(body) => self.lower_closure(body),
+            ExprKind::Await(promise) => {
+                let promise = self.lower_expr(promise);
+                if !self.context.allows_await {
+                    self.error(
+                        "WREN-L040",
+                        "`await` is only valid inside an async function or at module scope",
+                        expr.span,
+                    );
+                }
+                self.builder.emit1(Inst::Await { promise }, Type::Top)
+            }
+            ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => self.lower_closure(body),
         }
     }
 
@@ -2941,7 +2965,8 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
                 collect_fields_expr(arg, instance, statics)
             }
         }
-        ExprKind::Closure(body) => collect_fields_in_body(body, instance, statics),
+        ExprKind::Await(value) => collect_fields_expr(value, instance, statics),
+        ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => collect_fields_in_body(body, instance, statics),
         ExprKind::Super(super_expr) => {
             for arg in &super_expr.args {
                 collect_fields_expr(arg, instance, statics)
@@ -3156,7 +3181,8 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
             collect_method_keys_expr(then_expr, out);
             collect_method_keys_expr(else_expr, out)
         }
-        ExprKind::Closure(body) => collect_method_keys_body(body, out),
+        ExprKind::Await(value) => collect_method_keys_expr(value, out),
+        ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => collect_method_keys_body(body, out),
         ExprKind::Name(name) => {
             out.insert(MethodKey {
                 name: name.value.clone(),
@@ -3290,7 +3316,8 @@ fn collect_strings_expr(expr: &Expr, out: &mut Vec<Vec<u8>>) {
                 collect_strings_expr(arg, out)
             }
         }
-        ExprKind::Closure(body) => match &body.kind {
+        ExprKind::Await(value) => collect_strings_expr(value, out),
+        ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => match &body.kind {
             FunctionBodyKind::Expression(expr) => collect_strings_expr(expr, out),
             FunctionBodyKind::Statements(statements) => collect_strings_in_statements(statements, out),
         },
@@ -3458,7 +3485,9 @@ fn collect_written_bindings_expr(
         }
         // Do not descend into closures: their writes happen when the closure is
         // invoked, and captured mutable bindings are cells already.
+        ExprKind::Await(value) => collect_written_bindings_expr(value, analysis, out),
         ExprKind::Closure(_)
+        | ExprKind::AsyncClosure(_)
         | ExprKind::Null
         | ExprKind::Bool(_)
         | ExprKind::Number(_)

@@ -1059,6 +1059,9 @@ define_opcodes! {
     ProfileBlock = 119,
     ProfileNumeric = 120,
     Breakpoint = 121,
+
+    // WrenJIT async extension. A=destination, B=Promise value.
+    Await = 122,
 }
 
 impl Opcode {
@@ -1157,6 +1160,7 @@ impl Opcode {
                 | FiberTransferError
                 | FiberYield
                 | FiberSuspend
+                | Await
         )
     }
 }
@@ -1519,6 +1523,8 @@ pub struct BytecodeFunction {
     pub id: FuncId,
     pub module: ModuleId,
     pub kind: FunctionKind,
+    /// Async functions return a Promise at call sites and execute on the VM task scheduler.
+    pub is_async: bool,
     /// Declaring class for class-local instance FieldSlot operands.
     ///
     /// The interpreter relocates LoadField/StoreField operands in the prepared
@@ -3404,6 +3410,16 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, c)?;
             }
 
+            Await => {
+                Self::verify_reg(function, inst.pc, a)?;
+                Self::verify_reg(function, inst.pc, b)?;
+                if !function.is_async && function.kind != FunctionKind::ModuleBody {
+                    return Err(VerificationError::at(
+                        inst.pc,
+                        "Await is only valid in async functions or module bodies",
+                    ));
+                }
+            }
             MakeFiber => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
@@ -3525,6 +3541,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         | IShrU | ISar | FAdd | FSub | FMul | FDiv | FRem | ICmpEq | ICmpNe
         | ICmpLt | ICmpLe | ICmpGt | ICmpGe | FCmpEq | FCmpNe | FCmpLt
         | FCmpLe | FCmpGt | FCmpGe | RefEq => [General, General, General],
+        Await => [General, General, None],
         MakeFiber => [General, General, None],
         FiberCall | FiberTry | FiberTransfer | FiberTransferError => [General, General, General],
         FiberYield => [General, General, None],
@@ -3577,10 +3594,11 @@ pub fn disassemble(function: &BytecodeFunction) -> Result<String, DecodeError> {
 
     writeln!(
         &mut out,
-        "func {:?} module={:?} kind={:?} arity={} captures={} gprs={}",
+        "func {:?} module={:?} kind={:?} async={} arity={} captures={} gprs={}",
         function.id,
         function.module,
         function.kind,
+        function.is_async,
         function.arity,
         function.capture_count,
         function.frame.general_register_count

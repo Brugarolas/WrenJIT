@@ -234,6 +234,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::Range,
         BuiltinClass::Closure,
         BuiltinClass::Fiber,
+        BuiltinClass::Promise,
         BuiltinClass::MapEntry,
         BuiltinClass::MapKeys,
         BuiltinClass::Random,
@@ -450,6 +451,14 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register_native(program, static_(BuiltinId::Fiber), "yield", MethodKind::Method, 1, NativeBuiltin::FiberYield);
     manifest.register_native(program, static_(BuiltinId::Fiber), "suspend", MethodKind::Method, 0, NativeBuiltin::FiberSuspend);
     manifest.register_native(program, static_(BuiltinId::Fiber), "abort", MethodKind::Method, 1, NativeBuiltin::FiberAbort);
+
+    // Promise is the async result object. Settlement is VM-native because it
+    // owns suspended continuation edges and participates directly in scheduling.
+    manifest.register_native(program, static_(BuiltinId::Promise), "resolve", MethodKind::Method, 1, NativeBuiltin::PromiseResolve);
+    manifest.register_native(program, static_(BuiltinId::Promise), "reject", MethodKind::Method, 1, NativeBuiltin::PromiseReject);
+    manifest.register_native(program, instance(BuiltinClass::Promise), "isPending", MethodKind::Getter, 0, NativeBuiltin::PromiseIsPending);
+    manifest.register_native(program, instance(BuiltinClass::Promise), "isFulfilled", MethodKind::Getter, 0, NativeBuiltin::PromiseIsFulfilled);
+    manifest.register_native(program, instance(BuiltinClass::Promise), "isRejected", MethodKind::Getter, 0, NativeBuiltin::PromiseIsRejected);
 
     // System and Date are static-only engine classes.
     let system = static_(BuiltinId::System);
