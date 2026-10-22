@@ -107,6 +107,25 @@ pub enum TraceInst {
     HeapListGet { list: TraceValueId, index: TraceValueId, exit: SideExitId },
     HeapListSet { list: TraceValueId, index: TraceValueId, value: TraceValueId, exit: SideExitId },
     HeapMapLen { map: TraceValueId, exit: SideExitId },
+    /// Direct access to the dense value array of a shape-backed Map. Dynamic
+    /// keys are guarded by exact UTF-8 content, never by recyclable heap handle.
+    HeapMapGetShaped {
+        map: TraceValueId,
+        key: TraceValueId,
+        expected_key: Vec<u8>,
+        shape: u32,
+        slot: u32,
+        exit: SideExitId,
+    },
+    HeapMapSetShaped {
+        map: TraceValueId,
+        key: TraceValueId,
+        value: TraceValueId,
+        expected_key: Vec<u8>,
+        shape: u32,
+        slot: u32,
+        exit: SideExitId,
+    },
     HeapStringLen { string: TraceValueId, exit: SideExitId },
     ReadBarrier { value: TraceValueId },
 }
@@ -133,8 +152,10 @@ impl TraceInst {
             | RefEq { lhs, rhs }
             | HeapStoreField { object: lhs, value: rhs, .. }
             | HeapStoreCell { cell: lhs, value: rhs, .. }
-            | HeapListGet { list: lhs, index: rhs, .. } => { f(lhs); f(rhs); },
-            HeapListSet { list, index, value, .. } => { f(list); f(index); f(value); },
+            | HeapListGet { list: lhs, index: rhs, .. }
+            | HeapMapGetShaped { map: lhs, key: rhs, .. } => { f(lhs); f(rhs); },
+            HeapListSet { list, index, value, .. }
+            | HeapMapSetShaped { map: list, key: index, value, .. } => { f(list); f(index); f(value); },
             Select { condition, if_true, if_false } => { f(condition); f(if_true); f(if_false); },
         }
     }
@@ -167,7 +188,8 @@ impl TraceInst {
             | HeapLoadField { exit, .. } | HeapStoreField { exit, .. }
             | HeapLoadCell { exit, .. } | HeapStoreCell { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. } | HeapListSet { exit, .. }
-            | HeapMapLen { exit, .. } | HeapStringLen { exit, .. } => Some(*exit),
+            | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. }
+            | HeapMapSetShaped { exit, .. } | HeapStringLen { exit, .. } => Some(*exit),
             _ => None,
         }
     }

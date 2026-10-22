@@ -173,6 +173,11 @@ pub const MAX_TRACE_EXIT_VALUES: usize = 768;
 pub const TRACE_HEAP_CHUNK_BITS: u32 = 10;
 pub const TRACE_HEAP_CHUNK_SIZE: usize = 1usize << TRACE_HEAP_CHUNK_BITS;
 pub const TRACE_HEAP_CHUNK_MASK: u32 = (TRACE_HEAP_CHUNK_SIZE as u32) - 1;
+pub const TRACE_HEAP_KIND_MASK: u32 = 0xff;
+pub const TRACE_HEAP_METADATA_SHIFT: u32 = 8;
+pub const TRACE_HEAP_METADATA_MAX: u32 = 0x00ff_ffff;
+pub const TRACE_MAP_DICTIONARY_SHAPE: u32 = TRACE_HEAP_METADATA_MAX;
+
 
 /// Stable object kinds exposed to generated code. This is deliberately separate
 /// from the Rust `HeapObject` enum: Cranelift must never depend on Rust enum layout.
@@ -199,6 +204,9 @@ pub enum TraceHeapKind {
 pub struct TraceHeapEntry {
     pub(crate) address: AtomicUsize,
     pub(crate) next_free: AtomicU32,
+    /// Packed metadata: low 8 bits are TraceHeapKind. The upper 24 bits are a
+    /// type-specific payload: ShapeId for shaped Maps and UTF-8 byte length for
+    /// Strings. Packing avoids adding another sidecar field for Map/String metadata.
     pub(crate) kind: AtomicU32,
     pub(crate) receiver_class: AtomicU64,
     pub(crate) data: AtomicUsize,
@@ -351,6 +359,15 @@ pub enum ObservedClass {
     UnknownHeap,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShapedMapAccess {
+    pub shape: u32,
+    pub slot: u16,
+    /// Canonical shape-key bytes. Recording copies them into Trace IR; generated
+    /// code never embeds the recyclable heap handle of the observed String.
+    pub key_bytes: Vec<u8>,
+}
+
 /// Thin interface implemented by `wren_interpreter::Interpreter`.
 ///
 /// Keeping this trait here makes the JIT independently testable. The interpreter
@@ -398,6 +415,16 @@ pub trait TraceRuntime {
     fn trace_activation_inputs(
         &mut self,
     ) -> Result<TraceActivationInputs, Self::RuntimeError>;
+
+    /// Observe a Map/key pair without mutating VM state. Returning Some allows
+    /// the recorder to specialize this site to shape+slot native code.
+    fn trace_shaped_map_access(
+        &self,
+        _map: RegisterWord,
+        _key: RegisterWord,
+    ) -> Option<ShapedMapAccess> {
+        None
+    }
 
     /// Resolve a heap object's semantic class if the recorder asks for one.
     fn trace_observe_heap_class(
@@ -2247,6 +2274,68 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
+            MapGet => {
+                let map = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let key = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                let map_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                let key_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.c)))
+                    .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                if let Some(access) = runtime.trace_shaped_map_access(map_word, key_word) {
+                    let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    let result = builder.emit1(
+                        TraceInst::HeapMapGetShaped {
+                            map,
+                            key,
+                            expected_key: access.key_bytes,
+                            shape: access.shape,
+                            slot: access.slot as u32,
+                            exit,
+                        },
+                        TraceType::Any,
+                        TraceRep::Tagged,
+                    );
+                    self.write_gpr(builder, op.a, result);
+                    Ok(ExpectedStep::Exact(next))
+                } else {
+                    self.runtime_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    )
+                }
+            }
+
+            MapSet => {
+                let map = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                let key = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let value = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                let map_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.a)))
+                    .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                let key_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                let Some(access) = runtime.trace_shaped_map_access(map_word, key_word) else {
+                    // Inserts, dictionary Maps and non-string keys remain runtime
+                    // operations because they can change representation/storage.
+                    return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+                };
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                builder.emit0(TraceInst::HeapMapSetShaped {
+                    map,
+                    key,
+                    value,
+                    expected_key: access.key_bytes,
+                    shape: access.shape,
+                    slot: access.slot as u32,
+                    exit,
+                });
+                Ok(ExpectedStep::Exact(next))
+            }
+
             StringLen => {
                 let string = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
@@ -2275,7 +2364,6 @@ impl<'a> TraceRecorder<'a> {
             LoadStaticField
             | LoadModuleVar
             | ListRemoveAt
-            | MapGet
             | MapRemove => self.runtime_leaf(
                 op,
                 builder,
@@ -2326,7 +2414,6 @@ impl<'a> TraceRecorder<'a> {
             | ListAppend
             | ListInsert
             | AllocMap
-            | MapSet
             | StringConcat
             | StringSlice
             | MakeRange
@@ -4060,27 +4147,53 @@ impl CraneliftLoweringState<'_, '_> {
     }
 
     /// Guard a tagged Wren value as a particular JIT-visible heap kind and return
-    /// `(entry_ptr, current_gc_object_address)`. The handle-table entry is stable;
-    /// the MMTk object address itself is reloaded on every native operation.
+    /// `(entry_ptr, current_gc_object_address, packed_metadata)`. The handle-table
+    /// entry is stable; the MMTk object address itself is reloaded on every native
+    /// operation.
+    fn guard_heap_entry_with_metadata(
+        &mut self,
+        tagged: Value,
+        expected: TraceHeapKind,
+        exit: SideExitId,
+    ) -> Result<(Value, Value, Value), TracingJitError> {
+        let (entry, address) = self.guard_live_heap_entry(tagged, exit)?;
+        let metadata = self.builder.ins().load(
+            types::I32,
+            Self::trusted_mem(),
+            entry,
+            offset_of!(TraceHeapEntry, kind) as i32,
+        );
+        let kind_mask = self
+            .builder
+            .ins()
+            .iconst(types::I32, TRACE_HEAP_KIND_MASK as i64);
+        let kind = self.builder.ins().band(metadata, kind_mask);
+        let matches_kind = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, kind, expected as i64);
+        let matches_kind = self.bool32(matches_kind);
+        let wrong_kind = self.bool_not(matches_kind);
+        self.emit_side_exit(exit, wrong_kind)?;
+        Ok((entry, address, metadata))
+    }
+
     fn guard_heap_entry(
         &mut self,
         tagged: Value,
         expected: TraceHeapKind,
         exit: SideExitId,
     ) -> Result<(Value, Value), TracingJitError> {
-        let (entry, address) = self.guard_live_heap_entry(tagged, exit)?;
-        let kind = self.builder.ins().load(
-            types::I32, Self::trusted_mem(), entry, offset_of!(TraceHeapEntry, kind) as i32);
-        let matches_kind = self.builder.ins().icmp_imm_u(IntCC::Equal, kind, expected as i64);
-        let matches_kind = self.bool32(matches_kind);
-        let wrong_kind = self.bool_not(matches_kind);
-        self.emit_side_exit(exit, wrong_kind)?;
+        let (entry, address, _) =
+            self.guard_heap_entry_with_metadata(tagged, expected, exit)?;
         Ok((entry, address))
     }
 
-    fn guard_live_heap_entry(&mut self, tagged: Value, exit: SideExitId)
-        -> Result<(Value, Value), TracingJitError>
-    {
+    fn guard_live_heap_entry(
+        &mut self,
+        tagged: Value,
+        exit: SideExitId,
+    ) -> Result<(Value, Value), TracingJitError> {
         let heap_mask = self.builder.ins().iconst(types::I64, TAG_HEAP_MASK as i64);
         let heap_tag = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
         let masked = self.builder.ins().band(tagged, heap_mask);
@@ -4101,7 +4214,10 @@ impl CraneliftLoweringState<'_, '_> {
             .iconst(types::I64, TRACE_HEAP_CHUNK_MASK as i64);
         let entry_index = self.builder.ins().band(handle, entry_index_mask);
 
-        let chunk_stride = self.builder.ins().iconst(types::I64, std::mem::size_of::<usize>() as i64);
+        let chunk_stride = self
+            .builder
+            .ins()
+            .iconst(types::I64, std::mem::size_of::<usize>() as i64);
         let chunk_offset = self.builder.ins().imul(chunk_index, chunk_stride);
         let chunks = self.builder.ins().load(
             self.pointer_type,
@@ -4135,6 +4251,91 @@ impl CraneliftLoweringState<'_, '_> {
         self.emit_side_exit(exit, dead)?;
 
         Ok((entry, address))
+    }
+
+    #[inline(always)]
+    fn heap_metadata_payload(&mut self, metadata: Value) -> Value {
+        self.builder
+            .ins()
+            .ushr_imm_u(metadata, TRACE_HEAP_METADATA_SHIFT as i64)
+    }
+
+    fn guard_map_shape_metadata(
+        &mut self,
+        metadata: Value,
+        expected: u32,
+        exit: SideExitId,
+    ) -> Result<(), TracingJitError> {
+        let shape = self.heap_metadata_payload(metadata);
+        let matches = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, shape, expected as i64);
+        let matches = self.bool32(matches);
+        let fail = self.bool_not(matches);
+        self.emit_side_exit(exit, fail)
+    }
+
+    /// Guard a dynamic Wren String against canonical shape-key bytes. The heap
+    /// handle itself is deliberately not compared: handles are recyclable. The
+    /// String sidecar packs UTF-8 byte length in the metadata high bits and keeps
+    /// an Arc-backed stable data pointer, so the guard is exact and GC-safe.
+    fn guard_string_bytes(
+        &mut self,
+        tagged: Value,
+        expected: &[u8],
+        exit: SideExitId,
+    ) -> Result<(), TracingJitError> {
+        debug_assert!(expected.len() <= 64);
+        let (entry, _, metadata) =
+            self.guard_heap_entry_with_metadata(tagged, TraceHeapKind::String, exit)?;
+        let byte_len = self.heap_metadata_payload(metadata);
+        let same_len = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, byte_len, expected.len() as i64);
+        let same_len = self.bool32(same_len);
+        let wrong_len = self.bool_not(same_len);
+        self.emit_side_exit(exit, wrong_len)?;
+
+        let data = self.heap_entry_data(entry);
+        let mut offset = 0usize;
+        while offset + 8 <= expected.len() {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&expected[offset..offset + 8]);
+            let actual = self.builder.ins().load(
+                types::I64,
+                Self::trusted_mem(),
+                data,
+                offset as i32,
+            );
+            let wanted = self
+                .builder
+                .ins()
+                .iconst(types::I64, u64::from_ne_bytes(chunk) as i64);
+            let equal = self.builder.ins().icmp(IntCC::Equal, actual, wanted);
+            let equal = self.bool32(equal);
+            let fail = self.bool_not(equal);
+            self.emit_side_exit(exit, fail)?;
+            offset += 8;
+        }
+        while offset < expected.len() {
+            let actual = self.builder.ins().load(
+                types::I8,
+                Self::trusted_mem(),
+                data,
+                offset as i32,
+            );
+            let equal = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, actual, expected[offset] as i64);
+            let equal = self.bool32(equal);
+            let fail = self.bool_not(equal);
+            self.emit_side_exit(exit, fail)?;
+            offset += 1;
+        }
+        Ok(())
     }
 
     fn heap_entry_data(&mut self, entry: Value) -> Value {
@@ -4925,6 +5126,44 @@ impl CraneliftLoweringState<'_, '_> {
                 let len = self.heap_entry_len(entry);
                 let len = self.builder.ins().ireduce(types::I32, len);
                 self.cache_value(one_result(node)?, len);
+            }
+
+            HeapMapGetShaped { map, key, expected_key, shape, slot, exit } => {
+                let tagged_map = self.lower_value(*map)?;
+                let tagged_key = self.lower_value(*key)?;
+                let (entry, _, metadata) =
+                    self.guard_heap_entry_with_metadata(tagged_map, TraceHeapKind::Map, *exit)?;
+                self.guard_map_shape_metadata(metadata, *shape, *exit)?;
+                self.guard_string_bytes(tagged_key, expected_key, *exit)?;
+                let len = self.heap_entry_len(entry);
+                self.guard_constant_index(len, *slot, *exit)?;
+                let data = self.heap_entry_data(entry);
+                let index = self.builder.ins().iconst(types::I64, *slot as i64);
+                let address = self.heap_element_address(data, index);
+                let result = self.builder.ins().load(
+                    types::I64,
+                    Self::trusted_mem(),
+                    address,
+                    0,
+                );
+                self.cache_value(one_result(node)?, result);
+            }
+
+            HeapMapSetShaped { map, key, value, expected_key, shape, slot, exit } => {
+                let tagged_map = self.lower_value(*map)?;
+                let tagged_key = self.lower_value(*key)?;
+                let tagged_value = self.lower_value(*value)?;
+                let (entry, owner_address, metadata) =
+                    self.guard_heap_entry_with_metadata(tagged_map, TraceHeapKind::Map, *exit)?;
+                self.guard_map_shape_metadata(metadata, *shape, *exit)?;
+                self.guard_string_bytes(tagged_key, expected_key, *exit)?;
+                let len = self.heap_entry_len(entry);
+                self.guard_constant_index(len, *slot, *exit)?;
+                let data = self.heap_entry_data(entry);
+                let index = self.builder.ins().iconst(types::I64, *slot as i64);
+                let address = self.heap_element_address(data, index);
+                self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
+                self.builder.ins().store(Self::trusted_mem(), tagged_value, address, 0);
             }
 
             HeapStringLen { string, exit } => {

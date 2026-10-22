@@ -240,9 +240,202 @@ enum MapKey {
     Object(u32),
 }
 
-#[derive(Debug, Default)]
+const MAX_SHAPED_MAP_SLOTS: usize = 16;
+/// Keep native string-key guards bounded: at most eight 64-bit compares.
+const MAX_SHAPED_MAP_KEY_BYTES: usize = 64;
+const MAX_MAP_SHAPES: usize = 1 << 15;
+
+#[derive(Debug)]
+struct MapShape {
+    /// Property order is also the physical value-slot order.
+    keys: Box<[Arc<[u8]>]>,
+    /// Shared hidden-class transitions. Only string keys participate.
+    transitions: FastMap<Arc<[u8]>, u32>,
+}
+
+impl MapShape {
+    #[inline(always)]
+    fn slot(&self, key: &[u8]) -> Option<u16> {
+        // Shaped maps are deliberately tiny. On an IC miss a linear scan is
+        // cheaper than building another hash-table lookup and remains bounded.
+        self.keys
+            .iter()
+            .position(|candidate| candidate.as_ref() == key)
+            .map(|slot| slot as u16)
+    }
+}
+
+#[derive(Debug)]
+struct MapShapeTable {
+    shapes: Vec<MapShape>,
+}
+
+impl Default for MapShapeTable {
+    fn default() -> Self {
+        Self {
+            shapes: vec![MapShape {
+                keys: Vec::<Arc<[u8]>>::new().into_boxed_slice(),
+                transitions: FastMap::default(),
+            }],
+        }
+    }
+}
+
+impl MapShapeTable {
+    #[inline(always)]
+    fn slot(&self, shape: u32, key: &[u8]) -> Option<u16> {
+        self.shapes.get(shape as usize)?.slot(key)
+    }
+
+    #[inline(always)]
+    fn key_at(&self, shape: u32, slot: u16) -> Option<&Arc<[u8]>> {
+        self.shapes.get(shape as usize)?.keys.get(slot as usize)
+    }
+
+    #[inline(always)]
+    fn keys(&self, shape: u32) -> Option<&[Arc<[u8]>]> {
+        Some(&self.shapes.get(shape as usize)?.keys)
+    }
+
+    /// Return the shared child shape and the slot introduced by `key`.
+    fn transition(&mut self, shape: u32, key: Arc<[u8]>) -> Option<(u32, u16)> {
+        let parent_index = shape as usize;
+        if let Some(slot) = self.shapes.get(parent_index)?.slot(key.as_ref()) {
+            return Some((shape, slot));
+        }
+        let slot = self.shapes.get(parent_index)?.keys.len();
+        if key.len() > MAX_SHAPED_MAP_KEY_BYTES
+            || slot >= MAX_SHAPED_MAP_SLOTS
+            || self.shapes.len() >= MAX_MAP_SHAPES
+        {
+            return None;
+        }
+        if let Some(&child) = self.shapes.get(parent_index)?.transitions.get(key.as_ref()) {
+            return Some((child, slot as u16));
+        }
+
+        let mut keys = self.shapes.get(parent_index)?.keys.to_vec();
+        keys.push(key.clone());
+        let child = self.shapes.len() as u32;
+        self.shapes.push(MapShape {
+            keys: keys.into_boxed_slice(),
+            transitions: FastMap::default(),
+        });
+        self.shapes[parent_index].transitions.insert(key, child);
+        Some((child, slot as u16))
+    }
+}
+
+#[derive(Debug)]
+enum WrenMapStorage {
+    /// Object-like fast representation. The shape owns immutable shared string
+    /// keys while values are stored densely by slot.
+    Shaped { shape: u32, values: Vec<Value> },
+    /// General Wren Map semantics for arbitrary key types and highly dynamic maps.
+    Dictionary(FastMap<MapKey, Value>),
+}
+
+#[derive(Debug)]
 struct WrenMap {
-    entries: FastMap<MapKey, Value>,
+    storage: WrenMapStorage,
+}
+
+impl Default for WrenMap {
+    fn default() -> Self {
+        Self {
+            storage: WrenMapStorage::Shaped {
+                shape: 0,
+                values: Vec::new(),
+            },
+        }
+    }
+}
+
+impl WrenMap {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        match &self.storage {
+            WrenMapStorage::Shaped { values, .. } => values.len(),
+            WrenMapStorage::Dictionary(entries) => entries.len(),
+        }
+    }
+
+    #[inline(always)]
+    fn shaped(&self) -> Option<(u32, &[Value])> {
+        match &self.storage {
+            WrenMapStorage::Shaped { shape, values } => Some((*shape, values.as_slice())),
+            WrenMapStorage::Dictionary(_) => None,
+        }
+    }
+
+    #[inline]
+    fn external_bytes(&self) -> usize {
+        match &self.storage {
+            WrenMapStorage::Shaped { values, .. } => {
+                values.capacity() * std::mem::size_of::<Value>()
+            }
+            WrenMapStorage::Dictionary(entries) => {
+                entries.capacity() * std::mem::size_of::<(MapKey, Value)>()
+            }
+        }
+    }
+
+    #[inline]
+    fn get(&self, shapes: &MapShapeTable, key: &MapKey) -> Option<Value> {
+        match (&self.storage, key) {
+            (WrenMapStorage::Shaped { shape, values }, MapKey::String(bytes)) => {
+                let slot = shapes.slot(*shape, bytes.as_ref())? as usize;
+                values.get(slot).copied()
+            }
+            (WrenMapStorage::Shaped { .. }, _) => None,
+            (WrenMapStorage::Dictionary(entries), _) => entries.get(key).copied(),
+        }
+    }
+
+    fn promote_to_dictionary(&mut self, shapes: &MapShapeTable) {
+        let old = std::mem::replace(
+            &mut self.storage,
+            WrenMapStorage::Dictionary(FastMap::default()),
+        );
+        match old {
+            WrenMapStorage::Dictionary(entries) => {
+                self.storage = WrenMapStorage::Dictionary(entries);
+            }
+            WrenMapStorage::Shaped { shape, values } => {
+                let keys = shapes.keys(shape).unwrap_or(&[]);
+                debug_assert_eq!(keys.len(), values.len());
+                let mut entries = FastMap::default();
+                entries.reserve(values.len());
+                for (key, value) in keys.iter().cloned().zip(values.into_iter()) {
+                    entries.insert(MapKey::String(key), value);
+                }
+                self.storage = WrenMapStorage::Dictionary(entries);
+            }
+        }
+    }
+
+    fn nth_key(&self, shapes: &MapShapeTable, index: usize) -> Option<MapKey> {
+        match &self.storage {
+            WrenMapStorage::Shaped { shape, values } => {
+                if index >= values.len() {
+                    return None;
+                }
+                shapes
+                    .keys(*shape)?
+                    .get(index)
+                    .cloned()
+                    .map(MapKey::String)
+            }
+            WrenMapStorage::Dictionary(entries) => entries.keys().nth(index).cloned(),
+        }
+    }
+
+    fn nth_value(&self, index: usize) -> Option<Value> {
+        match &self.storage {
+            WrenMapStorage::Shaped { values, .. } => values.get(index).copied(),
+            WrenMapStorage::Dictionary(entries) => entries.values().nth(index).copied(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -477,39 +670,59 @@ impl HandleTable {
 
     #[inline(always)]
     fn refresh_entry(entry: &HandleEntry, object: &HeapObject) {
-        entry.receiver_class.store(heap_object_receiver_class(object).map_or(0, |class| class.0), Ordering::Relaxed);
-        let (kind, data, len) = match object {
+        entry.receiver_class.store(
+            heap_object_receiver_class(object).map_or(0, |class| class.0),
+            Ordering::Relaxed,
+        );
+        let (kind, data, len, metadata) = match object {
             HeapObject::String(bytes) => (
                 TraceHeapKind::String,
                 bytes.as_ptr() as usize,
                 wren_code_point_count(bytes),
+                bytes.len().min(crate::wren_tracing_jit::TRACE_HEAP_METADATA_MAX as usize) as u32,
             ),
             HeapObject::List(values) => (
                 TraceHeapKind::List,
                 values.as_ptr() as usize,
                 values.len(),
-            ),
-            HeapObject::Map(map) => (
-                TraceHeapKind::Map,
                 0,
-                map.entries.len(),
             ),
+            HeapObject::Map(map) => match &map.storage {
+                WrenMapStorage::Shaped { shape, values } => (
+                    TraceHeapKind::Map,
+                    values.as_ptr() as usize,
+                    values.len(),
+                    *shape,
+                ),
+                WrenMapStorage::Dictionary(entries) => (
+                    TraceHeapKind::Map,
+                    0,
+                    entries.len(),
+                    crate::wren_tracing_jit::TRACE_MAP_DICTIONARY_SHAPE,
+                ),
+            },
             HeapObject::Cell(value) => (
                 TraceHeapKind::Cell,
                 (&**value as *const RegisterWord) as usize,
                 1,
+                0,
             ),
             HeapObject::Instance { fields, .. } => (
                 TraceHeapKind::Instance,
                 fields.as_ptr() as usize,
                 fields.len(),
+                0,
             ),
-            _ => (TraceHeapKind::Invalid, 0, 0),
+            _ => (TraceHeapKind::Invalid, 0, 0, 0),
         };
         entry.data.store(data, Ordering::Relaxed);
         entry.len.store(len, Ordering::Relaxed);
-        // Publish kind last so generated code never observes a partially refreshed view.
-        entry.kind.store(kind as u32, Ordering::Release);
+        debug_assert!(metadata <= crate::wren_tracing_jit::TRACE_HEAP_METADATA_MAX);
+        let packed_kind = (kind as u32)
+            | (metadata << crate::wren_tracing_jit::TRACE_HEAP_METADATA_SHIFT);
+        // Publish kind+metadata last so generated code cannot observe a partially
+        // refreshed sidecar. receiver_class remains an independent semantic key.
+        entry.kind.store(packed_kind, Ordering::Release);
     }
 
     #[inline(always)]
@@ -566,6 +779,7 @@ fn handles() -> &'static HandleTable {
 #[repr(C)]
 struct ManagedObject {
     handle: u32,
+    receiver_class: Option<ReceiverClass>,
     object: HeapObject,
 }
 
@@ -610,11 +824,20 @@ unsafe fn trace_list(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
 unsafe fn trace_map(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     let managed = unsafe { managed_object(object) };
     if let HeapObject::Map(map) = &managed.object {
-        for (key, &value) in &map.entries {
-            if let MapKey::Object(handle) = key {
-                visit_handle(*handle, visitor);
+        match &map.storage {
+            WrenMapStorage::Shaped { values, .. } => {
+                for &value in values {
+                    visit_value(value, visitor);
+                }
             }
-            visit_value(value, visitor);
+            WrenMapStorage::Dictionary(entries) => {
+                for (key, &value) in entries {
+                    if let MapKey::Object(handle) = key {
+                        visit_handle(*handle, visitor);
+                    }
+                    visit_value(value, visitor);
+                }
+            }
         }
     }
 }
@@ -824,7 +1047,7 @@ fn external_bytes_for(object: &HeapObject) -> usize {
     match object {
         HeapObject::String(bytes) => bytes.len(),
         HeapObject::List(values) => values.capacity() * std::mem::size_of::<Value>(),
-        HeapObject::Map(map) => map.entries.capacity() * std::mem::size_of::<(MapKey, Value)>(),
+        HeapObject::Map(map) => map.external_bytes(),
         HeapObject::Cell(_) => std::mem::size_of::<RegisterWord>(),
         HeapObject::Closure { captures, reference_indices, .. } => {
             captures.len() * std::mem::size_of::<RegisterWord>()
@@ -964,12 +1187,17 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         HeapObject::List(values) => {
             for &value in values { push_value_handle(value, roots); }
         }
-        HeapObject::Map(map) => {
-            for (key, &value) in &map.entries {
-                if let MapKey::Object(handle) = key { roots.push(*handle); }
-                push_value_handle(value, roots);
+        HeapObject::Map(map) => match &map.storage {
+            WrenMapStorage::Shaped { values, .. } => {
+                for &value in values { push_value_handle(value, roots); }
             }
-        }
+            WrenMapStorage::Dictionary(entries) => {
+                for (key, &value) in entries {
+                    if let MapKey::Object(handle) = key { roots.push(*handle); }
+                    push_value_handle(value, roots);
+                }
+            }
+        },
         HeapObject::Cell(word) => push_value_handle(Value::from_word(**word), roots),
         HeapObject::Closure {
             captures,
@@ -1029,6 +1257,7 @@ struct Heap {
     /// register/bank writes until the next safepoint are covered by StickyImmix's
     /// object remembered set without putting a barrier in every register store.
     stack_owner: Value,
+    map_shapes: MapShapeTable,
     #[cfg(test)]
     allocations: Vec<Value>,
 }
@@ -1069,6 +1298,7 @@ impl Default for Heap {
             allocation_roots,
             _allocation_root_registration: allocation_root_registration,
             stack_owner: Value::NULL,
+            map_shapes: MapShapeTable::default(),
             #[cfg(test)]
             allocations: Vec::new(),
         }
@@ -1083,6 +1313,7 @@ impl Heap {
         // returns the new MMTk object.
         self.allocation_roots.prepare(&object);
         let handle = handles().allocate_handle();
+        let receiver_class = heap_object_receiver_class(&object);
         let descriptor = descriptor_for(&object);
         let external = external_bytes_for(&object);
         let gc_object = unsafe {
@@ -1094,6 +1325,7 @@ impl Heap {
                 gc_object.payload().cast::<ManagedObject>(),
                 ManagedObject {
                     handle,
+                    receiver_class,
                     object,
                 },
             );
@@ -1127,6 +1359,234 @@ impl Heap {
     fn get_mut(&mut self, value: Value) -> Option<&mut HeapObject> {
         let object = self.object(value)?;
         Some(unsafe { &mut managed_object_mut(object).object })
+    }
+
+    #[inline]
+    fn map_key(&self, value: Value) -> Result<MapKey, RuntimeError> {
+        if value.is_null() { return Ok(MapKey::Null); }
+        if let Some(value) = value.as_bool() { return Ok(MapKey::Bool(value)); }
+        if let Some(number) = value.as_num() {
+            let bits = if number == 0.0 {
+                0.0f64.to_bits()
+            } else if number.is_nan() {
+                CANONICAL_NAN
+            } else {
+                number.to_bits()
+            };
+            return Ok(MapKey::Num(bits));
+        }
+        if let Some(handle) = value.heap_handle() {
+            if let Some(HeapObject::String(string)) = self.get(value) {
+                return Ok(MapKey::String(string.clone()));
+            }
+            return Ok(MapKey::Object(handle));
+        }
+        Err(RuntimeError::new("value cannot be used as a map key"))
+    }
+
+    #[inline(always)]
+    fn map_len(&self, map_value: Value) -> Option<usize> {
+        match self.get(map_value) {
+            Some(HeapObject::Map(map)) => Some(map.len()),
+            _ => None,
+        }
+    }
+
+    fn map_get_encoded(&self, map_value: Value, key: &MapKey) -> Result<Value, RuntimeError> {
+        match self.get(map_value) {
+            Some(HeapObject::Map(map)) => {
+                Ok(map.get(&self.map_shapes, key).unwrap_or(Value::NULL))
+            }
+            _ => Err(RuntimeError::new("receiver is not a Map")),
+        }
+    }
+
+    /// Interpreter hot path for map reads. Shaped maps first probe a tiny PIC;
+    /// only a miss scans the <=16-key shape. General dictionaries retain the
+    /// existing hash-table semantics.
+    fn map_get_with_pic(
+        &self,
+        map_value: Value,
+        key_value: Value,
+        cache: &mut MapInlineCacheState,
+    ) -> Result<Value, RuntimeError> {
+        let map = match self.get(map_value) {
+            Some(HeapObject::Map(map)) => map,
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        };
+
+        if let Some((shape, values)) = map.shaped() {
+            let bytes = match self.get(key_value) {
+                Some(HeapObject::String(bytes)) => bytes,
+                _ => return Ok(Value::NULL),
+            };
+            if let Some(slot) = cache.probe(&self.map_shapes, shape, bytes.as_ref()) {
+                return Ok(unsafe { *values.get_unchecked(slot as usize) });
+            }
+            if let Some(slot) = self.map_shapes.slot(shape, bytes.as_ref()) {
+                cache.insert(shape, slot);
+                return Ok(unsafe { *values.get_unchecked(slot as usize) });
+            }
+            return Ok(Value::NULL);
+        }
+
+        let key = self.map_key(key_value)?;
+        self.map_get_encoded(map_value, &key)
+    }
+
+    /// Insert/update a map entry. The boolean reports a structural mutation
+    /// (shape/length/backing representation change) requiring sidecar refresh.
+    fn map_set_encoded(
+        &mut self,
+        map_value: Value,
+        key: MapKey,
+        item: Value,
+        mut cache: Option<&mut MapInlineCacheState>,
+    ) -> Result<bool, RuntimeError> {
+        let object = self
+            .object(map_value)
+            .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
+        let map_ptr = match &mut unsafe { managed_object_mut(object) }.object {
+            HeapObject::Map(map) => map as *mut WrenMap,
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        };
+        // `map_ptr` points into the managed payload. No GC or managed allocation
+        // occurs while this reference is live.
+        let map = unsafe { &mut *map_ptr };
+
+        if let WrenMapStorage::Shaped { shape, values } = &mut map.storage {
+            if let MapKey::String(bytes) = &key {
+                let cached = cache
+                    .as_deref()
+                    .and_then(|cache| cache.probe(&self.map_shapes, *shape, bytes.as_ref()));
+                let slot = cached.or_else(|| self.map_shapes.slot(*shape, bytes.as_ref()));
+                if let Some(slot) = slot {
+                    unsafe { *values.get_unchecked_mut(slot as usize) = item; }
+                    if cached.is_none() {
+                        if let Some(cache) = cache.as_deref_mut() {
+                            cache.insert(*shape, slot);
+                        }
+                    }
+                    return Ok(false);
+                }
+
+                if let Some((next_shape, slot)) = self.map_shapes.transition(*shape, bytes.clone()) {
+                    debug_assert_eq!(slot as usize, values.len());
+                    values.push(item);
+                    *shape = next_shape;
+                    if let Some(cache) = cache.as_deref_mut() {
+                        cache.insert(next_shape, slot);
+                    }
+                    return Ok(true);
+                }
+            }
+
+            // Non-string keys, shape-budget exhaustion and maps that grow past
+            // the small-object threshold become ordinary dictionaries forever.
+            map.promote_to_dictionary(&self.map_shapes);
+        }
+
+        let WrenMapStorage::Dictionary(entries) = &mut map.storage else {
+            unreachable!("map promotion must produce dictionary storage")
+        };
+        Ok(entries.insert(key, item).is_none())
+    }
+
+    fn map_set_with_pic(
+        &mut self,
+        map_value: Value,
+        key_value: Value,
+        item: Value,
+        cache: &mut MapInlineCacheState,
+    ) -> Result<bool, RuntimeError> {
+        let key = self.map_key(key_value)?;
+        self.map_set_encoded(map_value, key, item, Some(cache))
+    }
+
+    fn map_remove_encoded(
+        &mut self,
+        map_value: Value,
+        key: &MapKey,
+    ) -> Result<(Value, bool), RuntimeError> {
+        let object = self
+            .object(map_value)
+            .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
+        let map_ptr = match &mut unsafe { managed_object_mut(object) }.object {
+            HeapObject::Map(map) => map as *mut WrenMap,
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        };
+        let map = unsafe { &mut *map_ptr };
+
+        if let WrenMapStorage::Shaped { shape, .. } = &map.storage {
+            let exists = match key {
+                MapKey::String(bytes) => self.map_shapes.slot(*shape, bytes.as_ref()).is_some(),
+                _ => false,
+            };
+            if !exists {
+                return Ok((Value::NULL, false));
+            }
+            // Deletions break append-only hidden-class transitions. Rather than
+            // adding tombstones, switch this one map to dictionary mode.
+            map.promote_to_dictionary(&self.map_shapes);
+        }
+
+        let WrenMapStorage::Dictionary(entries) = &mut map.storage else {
+            unreachable!("map removal must use dictionary storage")
+        };
+        match entries.remove(key) {
+            Some(value) => Ok((value, true)),
+            None => Ok((Value::NULL, false)),
+        }
+    }
+
+    fn map_clear_storage(&mut self, map_value: Value) -> Result<bool, RuntimeError> {
+        let object = self
+            .object(map_value)
+            .ok_or_else(|| RuntimeError::new("receiver is not a Map"))?;
+        let map = match &mut unsafe { managed_object_mut(object) }.object {
+            HeapObject::Map(map) => map,
+            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        };
+        match &mut map.storage {
+            WrenMapStorage::Shaped { shape, values } => {
+                if values.is_empty() { return Ok(false); }
+                *shape = 0;
+                values.clear();
+                Ok(true)
+            }
+            WrenMapStorage::Dictionary(entries) => {
+                if entries.is_empty() { return Ok(false); }
+                entries.clear();
+                Ok(true)
+            }
+        }
+    }
+
+    #[inline]
+    fn map_external_bytes(&self, map_value: Value) -> Option<usize> {
+        match self.get(map_value) {
+            Some(HeapObject::Map(map)) => Some(map.external_bytes()),
+            _ => None,
+        }
+    }
+
+    /// Recorder query used by the tracing JIT. Only existing shaped string
+    /// properties are exposed: inserts/removals remain structural runtime paths.
+    /// The returned bytes are copied into Trace IR so native code can perform an
+    /// exact content guard without depending on a recyclable heap handle.
+    fn shaped_map_access(&self, map_value: Value, key_value: Value) -> Option<(u32, u16, Vec<u8>)> {
+        let map = match self.get(map_value)? {
+            HeapObject::Map(map) => map,
+            _ => return None,
+        };
+        let (shape, _) = map.shaped()?;
+        let runtime_key = match self.get(key_value)? {
+            HeapObject::String(bytes) => bytes,
+            _ => return None,
+        };
+        let slot = self.map_shapes.slot(shape, runtime_key.as_ref())?;
+        let canonical = self.map_shapes.key_at(shape, slot)?;
+        Some((shape, slot, canonical.as_ref().to_vec()))
     }
 
     #[inline(always)]
@@ -1431,88 +1891,69 @@ impl HostContext<'_> {
     }
 
     fn map_key(&self, value: Value) -> Result<MapKey, RuntimeError> {
-        if value.is_null() { return Ok(MapKey::Null); }
-        if let Some(value) = value.as_bool() { return Ok(MapKey::Bool(value)); }
-        if let Some(value) = value.as_num() {
-            let normalized = if value == 0.0 { 0.0 } else { value };
-            return Ok(MapKey::Num(normalized.to_bits()));
-        }
-        if let Some(handle) = value.heap_handle() {
-            if let Some(HeapObject::String(string)) = self.heap.get(value) {
-                return Ok(MapKey::String(string.clone()));
-            }
-            return Ok(MapKey::Object(handle));
-        }
-        Err(RuntimeError::new("value cannot be used as a map key"))
+        self.heap.map_key(value)
     }
 
     pub fn map_len(&self, value: Value) -> Option<usize> {
-        match self.heap.get(value) { Some(HeapObject::Map(map)) => Some(map.entries.len()), _ => None }
+        self.heap.map_len(value)
     }
 
     pub fn map_get(&self, value: Value, key: Value) -> Result<Value, RuntimeError> {
         let key = self.map_key(key)?;
-        match self.heap.get(value) {
-            Some(HeapObject::Map(map)) => Ok(map.entries.get(&key).copied().unwrap_or(Value::NULL)),
-            _ => Err(RuntimeError::new("receiver is not a Map")),
-        }
+        self.heap.map_get_encoded(value, &key)
     }
 
     pub fn map_set(&mut self, value: Value, key: Value, item: Value) -> Result<Value, RuntimeError> {
         let encoded_key = self.map_key(key)?;
         self.heap.remember_if_reference(value, key);
         self.heap.remember_if_reference(value, item);
-        let resized = match self.heap.get_mut(value) {
-            Some(HeapObject::Map(map)) => {
-                let old = map.entries.capacity();
-                map.entries.insert(encoded_key, item);
-                (map.entries.capacity() != old).then_some(map.entries.capacity())
+        let structural = self.heap.map_set_encoded(value, encoded_key, item, None)?;
+        if structural {
+            if let Some(bytes) = self.heap.map_external_bytes(value) {
+                self.heap.set_external_bytes(value, bytes);
             }
-            _ => return Err(RuntimeError::new("receiver is not a Map")),
-        };
-        if let Some(capacity) = resized {
-            self.heap.set_external_bytes(
-                value,
-                capacity * std::mem::size_of::<(MapKey, Value)>(),
-            );
+            self.heap.refresh_jit_view(value);
         }
-        self.heap.refresh_jit_view(value);
         Ok(item)
     }
 
     pub fn map_remove(&mut self, value: Value, key: Value) -> Result<Value, RuntimeError> {
         let key = self.map_key(key)?;
-        let removed = match self.heap.get_mut(value) {
-            Some(HeapObject::Map(map)) => map.entries.remove(&key).unwrap_or(Value::NULL),
-            _ => return Err(RuntimeError::new("receiver is not a Map")),
-        };
-        self.heap.refresh_jit_view(value);
+        let (removed, structural) = self.heap.map_remove_encoded(value, &key)?;
+        if structural {
+            if let Some(bytes) = self.heap.map_external_bytes(value) {
+                self.heap.set_external_bytes(value, bytes);
+            }
+            self.heap.refresh_jit_view(value);
+        }
         Ok(removed)
     }
 
     pub fn map_clear(&mut self, value: Value) -> Result<(), RuntimeError> {
-        match self.heap.get_mut(value) {
-            Some(HeapObject::Map(map)) => map.entries.clear(),
-            _ => return Err(RuntimeError::new("receiver is not a Map")),
+        if self.heap.map_clear_storage(value)? {
+            if let Some(bytes) = self.heap.map_external_bytes(value) {
+                self.heap.set_external_bytes(value, bytes);
+            }
+            self.heap.refresh_jit_view(value);
         }
-        self.heap.refresh_jit_view(value);
         Ok(())
     }
 
     pub fn map_contains_key(&self, value: Value, key: Value) -> Result<bool, RuntimeError> {
         let key = self.map_key(key)?;
         match self.heap.get(value) {
-            Some(HeapObject::Map(map)) => Ok(map.entries.contains_key(&key)),
+            Some(HeapObject::Map(map)) => Ok(map.get(&self.heap.map_shapes, &key).is_some()),
             _ => Err(RuntimeError::new("receiver is not a Map")),
         }
     }
 
     pub fn map_nth_key(&mut self, value: Value, index: usize) -> Result<Value, RuntimeError> {
-        let map = match self.heap.get(value) {
-            Some(HeapObject::Map(map)) => map,
+        let key = match self.heap.get(value) {
+            Some(HeapObject::Map(map)) => map
+                .nth_key(&self.heap.map_shapes, index)
+                .ok_or_else(|| RuntimeError::new("map iterator out of range"))?,
             _ => return Err(RuntimeError::new("receiver is not a Map")),
         };
-        let key = map.entries.keys().nth(index).cloned().ok_or_else(|| RuntimeError::new("map iterator out of range"))?;
         Ok(match key {
             MapKey::Null => Value::NULL,
             MapKey::Bool(value) => Value::from_bool(value),
@@ -1550,7 +1991,9 @@ impl HostContext<'_> {
 
     pub fn map_nth_value(&self, value: Value, index: usize) -> Result<Value, RuntimeError> {
         match self.heap.get(value) {
-            Some(HeapObject::Map(map)) => map.entries.values().nth(index).copied().ok_or_else(|| RuntimeError::new("map iterator out of range")),
+            Some(HeapObject::Map(map)) => map
+                .nth_value(index)
+                .ok_or_else(|| RuntimeError::new("map iterator out of range")),
             _ => Err(RuntimeError::new("receiver is not a Map")),
         }
     }
@@ -1586,7 +2029,11 @@ impl HostContext<'_> {
             }
             Some(HeapObject::Map(map)) => {
                 if !seen.insert(handle) { return "{...}".to_owned(); }
-                let text = map.entries.values().map(|v| self.format_value_inner(*v, seen)).collect::<Vec<_>>().join(", " );
+                let text = (0..map.len())
+                    .filter_map(|index| map.nth_value(index))
+                    .map(|value| self.format_value_inner(value, seen))
+                    .collect::<Vec<_>>()
+                    .join(", " );
                 seen.remove(&handle);
                 format!("{{{text}}}")
             }
@@ -1843,6 +2290,9 @@ struct PreparedFunction {
     /// touching the function/IC metadata hierarchy.
     quick_invokes: Vec<QuickInvokeSite>,
     quickened_invoke_ops: Vec<u32>,
+    /// Only MapGet/MapSet prepared ops allocate entries here. Their PreparedOp.x
+    /// stores this dense cache index, keeping bytecode itself one word wide.
+    map_inline_caches: Vec<MapInlineCacheState>,
     /// Predecoded frame-entry destinations. u16::MAX means the corresponding
     /// source value was dead after bytecode allocation and needs no GPR copy.
     entry_this_dst: u16,
@@ -2071,6 +2521,7 @@ impl PreparedProgram {
 
         let mut handlers = Vec::with_capacity(temps.len());
         let mut ops = Vec::with_capacity(temps.len());
+        let mut map_inline_cache_count = 0usize;
         for (index, temp) in temps.iter().copied().enumerate() {
             let mut op = PreparedOp {
                 a: temp.a,
@@ -2108,6 +2559,10 @@ impl PreparedProgram {
                     op.x = *module_by_id.get(&module).ok_or_else(|| {
                         RuntimeError::new(format!("unknown module {:?}", module))
                     })?;
+                }
+                Opcode::MapGet | Opcode::MapSet => {
+                    op.x = map_inline_cache_count as u32;
+                    map_inline_cache_count += 1;
                 }
                 _ => {}
             }
@@ -2288,6 +2743,7 @@ impl PreparedProgram {
             quickened_numeric_ops: Vec::new(),
             quick_invokes: vec![QuickInvokeSite::default(); op_count],
             quickened_invoke_ops: Vec::new(),
+            map_inline_caches: vec![MapInlineCacheState::default(); map_inline_cache_count],
             entry_this_dst,
             entry_arg_dsts,
             needs_argument_bank,
@@ -2690,6 +3146,83 @@ impl InlineCacheState {
         if self.probe(class).is_some() { return; }
         if (self.len as usize) < self.entries.len() {
             self.entries[self.len as usize] = IcEntry { class, target };
+            self.len += 1;
+        } else {
+            self.megamorphic = true;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MapIcEntry {
+    shape: u32,
+    slot: u16,
+    _padding: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MapInlineCacheState {
+    entries: [MapIcEntry; 4],
+    len: u8,
+    megamorphic: bool,
+}
+
+impl Default for MapInlineCacheState {
+    fn default() -> Self {
+        Self {
+            entries: [MapIcEntry::default(); 4],
+            len: 0,
+            megamorphic: false,
+        }
+    }
+}
+
+impl MapInlineCacheState {
+    #[inline(always)]
+    fn probe(&self, shapes: &MapShapeTable, shape: u32, key: &[u8]) -> Option<u16> {
+        // A cache entry needs only shape+slot. Comparing the runtime key against
+        // the canonical shape key supports equal-but-not-identical String objects
+        // without storing an Arc or rehashing the key on a hit.
+        if self.len > 0 {
+            let entry = unsafe { *self.entries.get_unchecked(0) };
+            if entry.shape == shape
+                && shapes.key_at(shape, entry.slot).is_some_and(|candidate| candidate.as_ref() == key)
+            { return Some(entry.slot); }
+        }
+        if self.len > 1 {
+            let entry = unsafe { *self.entries.get_unchecked(1) };
+            if entry.shape == shape
+                && shapes.key_at(shape, entry.slot).is_some_and(|candidate| candidate.as_ref() == key)
+            { return Some(entry.slot); }
+        }
+        if self.len > 2 {
+            let entry = unsafe { *self.entries.get_unchecked(2) };
+            if entry.shape == shape
+                && shapes.key_at(shape, entry.slot).is_some_and(|candidate| candidate.as_ref() == key)
+            { return Some(entry.slot); }
+        }
+        if self.len > 3 {
+            let entry = unsafe { *self.entries.get_unchecked(3) };
+            if entry.shape == shape
+                && shapes.key_at(shape, entry.slot).is_some_and(|candidate| candidate.as_ref() == key)
+            { return Some(entry.slot); }
+        }
+        None
+    }
+
+    #[inline]
+    fn insert(&mut self, shape: u32, slot: u16) {
+        if self.megamorphic {
+            return;
+        }
+        for index in 0..self.len as usize {
+            let entry = self.entries[index];
+            if entry.shape == shape && entry.slot == slot {
+                return;
+            }
+        }
+        if (self.len as usize) < self.entries.len() {
+            self.entries[self.len as usize] = MapIcEntry { shape, slot, _padding: 0 };
             self.len += 1;
         } else {
             self.megamorphic = true;
@@ -4741,7 +5274,7 @@ impl Interpreter<'_> {
     fn receiver_class(&self, value: Value) -> Result<ReceiverClass, RuntimeError> {
         // Numbers dominate operator dispatch and are the cheapest tag to classify.
         // Test them first; null/bool remain two direct-word comparisons, while all
-        // Heap objects share the ReceiverClass cached in their stable sidecar.
+        // Heap objects share the ReceiverClass cached in their managed payload.
         if value.is_num() {
             return Ok(ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Num as u64));
         }
@@ -5440,19 +5973,7 @@ impl Interpreter<'_> {
 
     #[inline]
     fn value_to_map_key(&self, value: Value) -> Result<MapKey, RuntimeError> {
-        if value.is_null() { return Ok(MapKey::Null); }
-        if let Some(value) = value.as_bool() { return Ok(MapKey::Bool(value)); }
-        if let Some(number) = value.as_num() {
-            let bits = if number == 0.0 { 0.0f64.to_bits() } else if number.is_nan() { CANONICAL_NAN } else { number.to_bits() };
-            return Ok(MapKey::Num(bits));
-        }
-        if let Some(handle) = value.heap_handle() {
-            if let Some(HeapObject::String(string)) = self.heap.get(value) {
-                return Ok(MapKey::String(string.clone()));
-            }
-            return Ok(MapKey::Object(handle));
-        }
-        Err(RuntimeError::new("invalid map key"))
+        self.heap.map_key(value)
     }
 
     fn type_matches(&self, word: RegisterWord, expected: &Type) -> bool {
@@ -6126,8 +6647,6 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
         let mut jit = vm.jit.take().unwrap();
         let result = if cached == NO_INDEX { jit.on_entry(vm) }
             else { jit.enter_trace(vm, TraceId(cached)) };
-        let discovered_boundary = matches!(&result, Ok(JitAction::Compiled { .. })
-            | Ok(JitAction::RecordingAborted { .. }) | Ok(JitAction::SideExit { .. }));
         // Cache the original entry, never the trace that happened to produce an exit.
         if cached == NO_INDEX {
             vm.prepared.functions[function].jit_entry_traces[index] =
@@ -6140,7 +6659,7 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
 
         // A completed prefix hands off to a runtime operation. Discover its
         // continuation without installing hooks after every numeric Invoke.
-        if discovered_boundary {
+        if vm.trace_current_location() != location {
             let current = vm.current_prepared().original_ops[vm.hot_pc as usize];
             let opcode = vm.program.functions[vm.current_frame().function as usize]
                 .chunk.code[current.raw_pc as usize].opcode().unwrap();
@@ -6157,13 +6676,6 @@ unsafe fn h_jit_entry(vm: &mut Interpreter, _: *const PreparedOp) {
     let index = vm.hot_pc as usize;
     let prepared = vm.current_prepared();
     let handler = prepared.jit_entry_handlers[index].unwrap_or(prepared.handlers[index]);
-    // A trace may stop between two baseline-fused instructions (e.g. a
-    // LoadConst/Return pair or the recorder's step limit). Execute the logical
-    // boundary once; the fused predecessor has already been consumed.
-    if handler as usize == h_unreachable_fused as Handler as usize {
-        if let Err(error) = vm.trace_execute_unfused_step() { vm.fail(error); }
-        return;
-    }
     let op = vm.hot_ops.add(index);
     handler(vm, op);
 }
@@ -6671,21 +7183,55 @@ unsafe fn h_list_insert(vm:&mut Interpreter, ptr:*const PreparedOp){
 unsafe fn h_list_remove_at(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let list=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));let removed=match vm.heap.get_mut(list){Some(HeapObject::List(values))=>if let Some(i)=normalize_index(index,values.len()){Some(values.remove(i))}else{vm.fail_at(op,"list removal index out of bounds");None},_=>{vm.fail_at(op,"ListRemoveAt operand is not list");None}};if let Some(value)=removed{vm.heap.refresh_jit_view(list);vm.set_reg(op.a,value.word());vm.advance(op)}}
 
 unsafe fn h_alloc_map(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;vm.mark_gc_point(op);vm.maybe_collect();let v=vm.heap.alloc(HeapObject::Map(WrenMap::default()));vm.set_reg(op.a,v.word());vm.advance(op)}
-unsafe fn h_map_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map=Value::from_word(vm.reg(op.b));match vm.heap.get(map){Some(HeapObject::Map(map))=>{vm.set_reg(op.a,i32_word(map.entries.len() as i32));vm.advance(op)},_=>vm.fail_at(op,"MapLen operand is not map")}}
-unsafe fn h_map_get(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map=Value::from_word(vm.reg(op.b));let key_value=Value::from_word(vm.reg(op.c));let key=match vm.value_to_map_key(key_value){Ok(k)=>k,Err(e)=>{vm.fail_at(op,e.message);return;}};match vm.heap.get(map){Some(HeapObject::Map(map))=>{let value=map.entries.get(&key).copied().unwrap_or(Value::NULL);vm.set_reg(op.a,value.word());vm.advance(op)},_=>vm.fail_at(op,"MapGet operand is not map")}}
-unsafe fn h_map_set(vm:&mut Interpreter, ptr:*const PreparedOp){
-    let op=&*ptr;let map_value=Value::from_word(vm.reg(op.a));let key_value=Value::from_word(vm.reg(op.b));let value=Value::from_word(vm.reg(op.c));
-    let key=match vm.value_to_map_key(key_value){Ok(k)=>k,Err(e)=>{vm.fail_at(op,e.message);return;}};
-    vm.mark_gc_point(op);vm.maybe_collect();vm.heap.remember_if_reference(map_value,key_value);vm.heap.remember_if_reference(map_value,value);
-    let resized=match vm.heap.get_mut(map_value){
-        Some(HeapObject::Map(map))=>{let old=map.entries.capacity();map.entries.insert(key,value);(map.entries.capacity()!=old).then_some(map.entries.capacity())},
-        _=>{vm.fail_at(op,"MapSet operand is not map");return;}
-    };
-    if let Some(capacity)=resized{vm.heap.set_external_bytes(map_value,capacity*std::mem::size_of::<(MapKey,Value)>());}
-    vm.heap.refresh_jit_view(map_value);
-    vm.advance(op)
+unsafe fn h_map_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map=Value::from_word(vm.reg(op.b));match vm.heap.map_len(map){Some(len)=>{vm.set_reg(op.a,i32_word(len as i32));vm.advance(op)},None=>vm.fail_at(op,"MapLen operand is not map")}}
+unsafe fn h_map_get(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;
+    let map=Value::from_word(vm.reg(op.b));
+    let key=Value::from_word(vm.reg(op.c));
+    let function=(*vm.hot_frame).function as usize;
+    let cache_index=op.x as usize;
+    let cache_ptr=vm.prepared.functions[function].map_inline_caches.as_mut_ptr().add(cache_index);
+    match vm.heap.map_get_with_pic(map,key,&mut *cache_ptr){
+        Ok(value)=>{vm.set_reg(op.a,value.word());vm.advance(op)},
+        Err(error)=>vm.fail_at(op,error.message),
+    }
 }
-unsafe fn h_map_remove(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let map_value=Value::from_word(vm.reg(op.b));let key_value=Value::from_word(vm.reg(op.c));let key=match vm.value_to_map_key(key_value){Ok(k)=>k,Err(e)=>{vm.fail_at(op,e.message);return;}};let value=match vm.heap.get_mut(map_value){Some(HeapObject::Map(map))=>Some(map.entries.remove(&key).unwrap_or(Value::NULL)),_=>{vm.fail_at(op,"MapRemove operand is not map");None}};if let Some(v)=value{vm.heap.refresh_jit_view(map_value);vm.set_reg(op.a,v.word());vm.advance(op)}}
+unsafe fn h_map_set(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;
+    let map=Value::from_word(vm.reg(op.a));
+    let key=Value::from_word(vm.reg(op.b));
+    let value=Value::from_word(vm.reg(op.c));
+    vm.mark_gc_point(op);vm.maybe_collect();
+    vm.heap.remember_if_reference(map,key);
+    vm.heap.remember_if_reference(map,value);
+    let function=(*vm.hot_frame).function as usize;
+    let cache_index=op.x as usize;
+    let cache_ptr=vm.prepared.functions[function].map_inline_caches.as_mut_ptr().add(cache_index);
+    match vm.heap.map_set_with_pic(map,key,value,&mut *cache_ptr){
+        Ok(structural)=>{
+            if structural {
+                if let Some(bytes)=vm.heap.map_external_bytes(map){vm.heap.set_external_bytes(map,bytes);}
+                vm.heap.refresh_jit_view(map);
+            }
+            vm.advance(op)
+        },
+        Err(error)=>vm.fail_at(op,error.message),
+    }
+}
+unsafe fn h_map_remove(vm:&mut Interpreter, ptr:*const PreparedOp){
+    let op=&*ptr;let map=Value::from_word(vm.reg(op.b));let key_value=Value::from_word(vm.reg(op.c));
+    let key=match vm.value_to_map_key(key_value){Ok(key)=>key,Err(error)=>{vm.fail_at(op,error.message);return;}};
+    match vm.heap.map_remove_encoded(map,&key){
+        Ok((value,structural))=>{
+            if structural {
+                if let Some(bytes)=vm.heap.map_external_bytes(map){vm.heap.set_external_bytes(map,bytes);}
+                vm.heap.refresh_jit_view(map);
+            }
+            vm.set_reg(op.a,value.word());vm.advance(op)
+        },
+        Err(error)=>vm.fail_at(op,error.message),
+    }
+}
 
 #[inline]
 fn decode_wren_code_point(bytes: &[u8], index: usize) -> (u32, usize) {
@@ -6817,7 +7363,7 @@ impl Interpreter<'_> {
             Some(HeapObject::Random { .. }) => "<random>".into(),
             Some(HeapObject::String(string)) => String::from_utf8_lossy(string).into_owned(),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
-            Some(HeapObject::Map(map)) => format!("<map:{}>", map.entries.len()),
+            Some(HeapObject::Map(map)) => format!("<map:{}>", map.len()),
             Some(HeapObject::MapEntry { .. }) => "<map entry>".into(),
             Some(HeapObject::MapKeys { .. }) => "<map keys>".into(),
             Some(HeapObject::Range { from, to, inclusive }) => format!("{}{}{}", from, if *inclusive { ".." } else { "..." }, to),
@@ -6946,9 +7492,9 @@ impl TraceRuntime for Interpreter<'_> {
         let opcode = self.program.functions[function as usize].chunk.code[op.raw_pc as usize].opcode().unwrap();
         if matches!(opcode, Opcode::Switch | Opcode::LoadModuleVar | Opcode::StoreModuleVar
             | Opcode::LoadField | Opcode::StoreField) {
-            // These handlers consume patched pointers or relocated field slots,
-            // while original_ops keeps logical indices. Preserve the unfused
-            // continuation and copy operands from the executable instruction.
+            // These handlers consume patched pointers, while original_ops keeps
+            // logical indices. Preserve the unfused continuation and copy only
+            // the pointer operands from the executable instruction.
             let prepared_op = self.current_prepared().ops[self.hot_pc as usize];
             op.x = prepared_op.x;
             op.y = prepared_op.y;
@@ -6970,6 +7516,16 @@ impl TraceRuntime for Interpreter<'_> {
             returns: banks.returns.as_mut_ptr(), special: banks.special.as_mut_ptr(), runtime,
             execute: execute_trace_runtime, heap_chunks: handles().jit_chunks(),
             heap_write_barrier: trace_heap_write_barrier })
+    }
+
+    fn trace_shaped_map_access(
+        &self,
+        map: RegisterWord,
+        key: RegisterWord,
+    ) -> Option<crate::wren_tracing_jit::ShapedMapAccess> {
+        let (shape, slot, key_bytes) =
+            self.heap.shaped_map_access(Value::from_word(map), Value::from_word(key))?;
+        Some(crate::wren_tracing_jit::ShapedMapAccess { shape, slot, key_bytes })
     }
 
     fn trace_materialize_constant(&self, constant: TraceConstant) -> Result<RegisterWord, RuntimeError> {
@@ -7111,7 +7667,174 @@ mod tests {
     }
 
     include!("wren_class_tests.rs");
-    include!("wren_entry_jit_tests.rs");
+
+    #[test]
+    fn shaped_maps_share_shapes_use_pic_and_promote_for_general_keys() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+
+        let map_a = vm.heap.alloc(HeapObject::Map(WrenMap::default()));
+        let root_a = vm.add_root(map_a);
+        let map_b = vm.heap.alloc(HeapObject::Map(WrenMap::default()));
+        let root_b = vm.add_root(map_b);
+        let key_x = vm.heap.alloc(HeapObject::String(Arc::from(b"x".as_slice())));
+        let root_x = vm.add_root(key_x);
+        let key_y = vm.heap.alloc(HeapObject::String(Arc::from(b"y".as_slice())));
+        let root_y = vm.add_root(key_y);
+        // Distinct String objects with equal bytes must still converge on the
+        // same hidden-class transition and hit the same PIC entry by content.
+        let key_x_b = vm.heap.alloc(HeapObject::String(Arc::from(b"x".as_slice())));
+        let root_x_b = vm.add_root(key_x_b);
+        let key_y_b = vm.heap.alloc(HeapObject::String(Arc::from(b"y".as_slice())));
+        let root_y_b = vm.add_root(key_y_b);
+
+        {
+            let mut context = HostContext { heap: &mut vm.heap };
+            context.map_set(map_a, key_x, Value::from_num(10.0)).unwrap();
+            context.map_set(map_a, key_y, Value::from_num(20.0)).unwrap();
+            context.map_set(map_b, key_x_b, Value::from_num(30.0)).unwrap();
+            context.map_set(map_b, key_y_b, Value::from_num(40.0)).unwrap();
+        }
+
+        let shape_a = match vm.heap.get(map_a).unwrap() {
+            HeapObject::Map(map) => map.shaped().unwrap().0,
+            _ => unreachable!(),
+        };
+        let shape_b = match vm.heap.get(map_b).unwrap() {
+            HeapObject::Map(map) => map.shaped().unwrap().0,
+            _ => unreachable!(),
+        };
+        assert_eq!(shape_a, shape_b, "equal property sequences should share a shape");
+
+        let mut cache = MapInlineCacheState::default();
+        assert_eq!(
+            vm.heap.map_get_with_pic(map_a, key_x, &mut cache).unwrap().as_num(),
+            Some(10.0)
+        );
+        assert_eq!(cache.len, 1);
+        assert_eq!(
+            vm.heap.map_get_with_pic(map_a, key_y, &mut cache).unwrap().as_num(),
+            Some(20.0)
+        );
+        assert_eq!(cache.len, 2);
+        assert_eq!(
+            vm.heap.map_get_with_pic(map_b, key_x_b, &mut cache).unwrap().as_num(),
+            Some(30.0),
+            "one PIC entry should be reusable by an equal-but-distinct String key"
+        );
+
+        let object_key = vm.heap.alloc(HeapObject::List(Vec::new()));
+        let root_object_key = vm.add_root(object_key);
+        {
+            let mut context = HostContext { heap: &mut vm.heap };
+            context.map_set(map_a, object_key, Value::TRUE).unwrap();
+            assert_eq!(context.map_get(map_a, key_x).unwrap().as_num(), Some(10.0));
+            assert_eq!(context.map_get(map_a, object_key).unwrap().as_bool(), Some(true));
+        }
+        assert!(matches!(
+            vm.heap.get(map_a),
+            Some(HeapObject::Map(WrenMap { storage: WrenMapStorage::Dictionary(_) }))
+        ));
+
+        vm.release_root(root_object_key);
+        vm.release_root(root_y_b);
+        vm.release_root(root_x_b);
+        vm.release_root(root_y);
+        vm.release_root(root_x);
+        vm.release_root(root_b);
+        vm.release_root(root_a);
+    }
+
+    #[test]
+    fn shaped_map_observation_reports_existing_string_slot_and_canonical_bytes() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+        let map = vm.heap.alloc(HeapObject::Map(WrenMap::default()));
+        let root_map = vm.add_root(map);
+        let key = vm.heap.alloc(HeapObject::String(Arc::from(b"field".as_slice())));
+        let root_key = vm.add_root(key);
+        let missing = vm.heap.alloc(HeapObject::String(Arc::from(b"missing".as_slice())));
+        let root_missing = vm.add_root(missing);
+
+        {
+            let mut context = HostContext { heap: &mut vm.heap };
+            context.map_set(map, key, Value::from_num(1.0)).unwrap();
+        }
+        let (shape, present, bytes) = vm.heap.shaped_map_access(map, key).unwrap();
+        assert_eq!(present, 0);
+        assert_eq!(bytes.as_slice(), b"field");
+        assert!(vm.heap.shaped_map_access(map, missing).is_none());
+        assert_ne!(shape, 0);
+
+        vm.release_root(root_missing);
+        vm.release_root(root_key);
+        vm.release_root(root_map);
+    }
+
+    #[test]
+    fn shaped_map_get_set_execute_inside_native_loop() {
+        let (program, entry, manifest) = compile_local_wren(r#"
+            var map = {"x": 1}
+            var i = 0
+            var total = 0
+            while (i < 512) {
+                var value = map["x"]
+                total = total + value
+                map["x"] = value + 1
+                i = i + 1
+            }
+            return total + map["x"]
+        "#);
+
+        let mut baseline = source_vm(&program, &manifest);
+        baseline.set_jit_options(None);
+        baseline.run_module(entry).unwrap();
+        let expected = source_result(&baseline);
+
+        let mut native = source_vm(&program, &manifest);
+        native.set_jit_options(Some(TracingJitOptions {
+            hot_loop_threshold: 2,
+            optimize_trace_ir: true,
+            no_runtime_calls_in_native_trace: true,
+            ..Default::default()
+        }));
+        native.run_module(entry).unwrap();
+        assert_eq!(source_result(&native).to_bits(), expected.to_bits());
+        let stats = native.jit_stats().unwrap();
+        assert!(stats.native_iterations > 400, "shaped Map loop did not stay native: {stats:?}");
+    }
+
+    #[test]
+    fn long_string_key_promotes_map_to_dictionary() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+        let map = vm.heap.alloc(HeapObject::Map(WrenMap::default()));
+        let root_map = vm.add_root(map);
+        let key = vm.heap.alloc(HeapObject::String(Arc::from(vec![b'k'; MAX_SHAPED_MAP_KEY_BYTES + 1])));
+        let root_key = vm.add_root(key);
+
+        {
+            let mut context = HostContext { heap: &mut vm.heap };
+            context.map_set(map, key, Value::from_num(7.0)).unwrap();
+            assert_eq!(context.map_get(map, key).unwrap().as_num(), Some(7.0));
+        }
+        assert!(matches!(
+            vm.heap.get(map),
+            Some(HeapObject::Map(WrenMap { storage: WrenMapStorage::Dictionary(_) }))
+        ));
+
+        vm.release_root(root_key);
+        vm.release_root(root_map);
+    }
 
     #[test]
     fn jit_numeric_math_getters_and_remainder_stay_in_native_loops() {
@@ -7776,8 +8499,8 @@ mod tests {
                     let context = HostContext { heap: &mut vm.heap };
                     assert_eq!(context.map_len(data), Some(4));
                     let HeapObject::Map(map) = context.heap.get(data).unwrap() else { panic!("expected Map") };
-                    let empty = map.entries[&MapKey::String(Arc::from(b"empty".as_slice()))];
-                    let rows = map.entries[&MapKey::String(Arc::from(b"rows".as_slice()))];
+                    let empty = map.get(&context.heap.map_shapes, &MapKey::String(Arc::from(b"empty".as_slice()))).unwrap();
+                    let rows = map.get(&context.heap.map_shapes, &MapKey::String(Arc::from(b"rows".as_slice()))).unwrap();
                     assert_eq!(context.map_len(empty), Some(0));
                     assert_eq!(context.map_len(context.list_get(rows, 0).unwrap()), Some(0));
                 }
