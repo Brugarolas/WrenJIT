@@ -329,3 +329,28 @@ var plusOne = async { |value|
 
 var result_closure = await plusOne.call(21)
 System.print(result_closure) //> 22
+
+System.print("***** Fibers! *****")
+
+var child = Fiber.new {
+  123.methodThatDoesNotExist()
+}
+var parent = Fiber.new {
+  child.call()
+}
+var error = parent.try()
+
+System.print(error)
+System.print(parent.error == error) // true
+System.print(child.error == error)  // true
+System.print(parent.isDone)         // true
+System.print(child.isDone)          // true
+
+var fiber = Fiber.new {|first|
+  var resumed = Fiber.yield(first + 1)
+  return resumed + 2
+}
+
+System.print(fiber.call(10)) // 11
+System.print(fiber.call(20)) // 22
+System.print(fiber.isDone)   // true

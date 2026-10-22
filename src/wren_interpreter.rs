@@ -3781,9 +3781,105 @@ impl<'p> Interpreter<'p> {
         }
     }
 
-    fn fail(&mut self, error: RuntimeError) {
+    #[inline]
+    fn fail_terminal(&mut self, error: RuntimeError) {
         self.error = Some(error);
         self.run_state = RunState::Failed;
+    }
+
+    /// Route an ordinary VM runtime error through Wren's Fiber caller chain.
+    ///
+    /// We only materialize the Wren String after reaching a `try()` caller. The
+    /// caller's FiberTry opcode is a GC safepoint, so its exact root map is
+    /// already published. Allocating the String at the original failing opcode
+    /// would be unsound because arbitrary non-GC bytecodes do not carry stack
+    /// maps for a collection triggered by that allocation.
+    fn catch_runtime_error_in_fiber(&mut self, error: &RuntimeError) -> bool {
+        let start = self.current_fiber;
+        if start == 0 || self.fiber(start).async_promise.is_some() {
+            return false;
+        }
+
+        // First prove there is a try() boundary. Do not mutate the fiber graph
+        // for an uncaught/internal VM failure; the terminal path will stop the VM.
+        let mut probe = start;
+        let mut catches = false;
+        while probe != 0 {
+            let Some(link) = self.fiber(probe).link else { break; };
+            if link.catch_error {
+                catches = true;
+                break;
+            }
+            probe = link.caller;
+        }
+        if !catches {
+            return false;
+        }
+
+        let mut failed = Vec::with_capacity(4);
+        let mut current = start;
+        loop {
+            debug_assert_ne!(current, 0, "pre-scan guaranteed a Fiber.try boundary");
+            let link = {
+                let fiber = self.fiber_mut(current);
+                fiber.status = FiberStatus::Failed;
+                fiber.awaiting_promise = None;
+                fiber.suspend_dst = None;
+                fiber.link.take().expect("pre-scanned fiber chain changed")
+            };
+            failed.push(current);
+
+            if !link.catch_error {
+                current = link.caller;
+                continue;
+            }
+
+            // The FiberTry call site published its precise GC map before the
+            // switch. Make all aborted FiberObjects temporary roots as well so
+            // nested called fibers remain alive while the error String allocates.
+            self.switch_current_fiber(link.caller);
+            self.fiber_mut(link.caller).status = FiberStatus::Running;
+            self.refresh_hot_frame();
+
+            let failed_objects = failed
+                .iter()
+                .map(|&id| self.fiber(id).object)
+                .collect::<Vec<_>>();
+            let roots = failed_objects
+                .iter()
+                .copied()
+                .map(|object| self.add_root(object))
+                .collect::<Vec<_>>();
+
+            let bytes: Arc<[u8]> = Arc::from(error.message.as_bytes());
+            let error_value = self.heap.alloc(HeapObject::String(bytes));
+
+            for (&id, &object) in failed.iter().zip(&failed_objects) {
+                self.heap.remember_if_reference(object, error_value);
+                self.fiber_mut(id).error = error_value;
+            }
+
+            {
+                let caller = self.fiber_mut(link.caller);
+                if let Some(frame) = caller.frames.last() {
+                    let index = frame.reg_base + link.dst.index();
+                    caller.registers[index] = error_value.word();
+                }
+            }
+
+            for root in roots {
+                self.release_root(root);
+            }
+            self.refresh_hot_frame();
+            return true;
+        }
+    }
+
+    fn fail(&mut self, error: RuntimeError) {
+        if self.catch_runtime_error_in_fiber(&error) {
+            return;
+        }
+        self.fail_terminal(error);
     }
 
     fn fail_at(&mut self, op: &PreparedOp, message: impl Into<String>) {
@@ -5478,6 +5574,13 @@ impl Interpreter<'_> {
             self.fail_at(op, "fiber cannot call/transfer to itself");
             return;
         }
+        // Wren's root fiber may be transferred to, but it cannot be called.
+        // Calling it would create a structured caller edge into the VM's root
+        // execution, which the reference implementation explicitly rejects.
+        if is_call && target == 0 {
+            self.fail_at(op, "Cannot call root fiber.");
+            return;
+        }
 
         let status = self.fiber(target).status;
         if matches!(status, FiberStatus::Done | FiberStatus::Failed) {
@@ -5672,14 +5775,22 @@ impl Interpreter<'_> {
     fn abort_current_fiber(&mut self, op: &PreparedOp, error: Value) {
         let current = self.current_fiber;
         if current == 0 {
-            self.fail_at(op, format!("fiber aborted: {:?}", error));
+            let (function, pc) = self.current_location(op);
+            self.fail_terminal(
+                RuntimeError::new(format!("fiber aborted: {:?}", error)).at(function, pc),
+            );
             return;
         }
+
+        let owner = self.fiber(current).object;
+        self.heap.remember_if_reference(owner, error);
         self.fiber_mut(current).status = FiberStatus::Failed;
         self.fiber_mut(current).error = error;
+        self.fiber_mut(current).awaiting_promise = None;
+        self.fiber_mut(current).suspend_dst = None;
         let link = self.fiber_mut(current).link.take();
         let Some(link) = link else {
-            self.fail(RuntimeError::new(format!("unhandled fiber error: {:?}", error)));
+            self.fail_terminal(RuntimeError::new(format!("unhandled fiber error: {:?}", error)));
             return;
         };
         self.switch_current_fiber(link.caller);
@@ -8333,6 +8444,144 @@ var result = Sroa.run()
             assert!(matches!(vm.heap.get(child), Some(HeapObject::String(_))));
             vm.release_root(root);
         }
+    }
+
+    #[test]
+    fn wren_fiber_call_yield_resume_and_values() {
+        let source = r#"
+var fiber = Fiber.new {|first|
+  var resumed = Fiber.yield(first + 1)
+  return resumed + 2
+}
+var first = fiber.call(10)
+var second = fiber.call(20)
+var result = first * 100 + second
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 1122.0, "jit={jit}");
+        }
+    }
+
+    #[test]
+    fn wren_fiber_try_catches_ordinary_runtime_errors_through_call_chain() {
+        let source = r#"
+var child = Fiber.new {
+  123.methodThatDoesNotExist()
+}
+var parent = Fiber.new {
+  child.call()
+}
+var caught = parent.try()
+var result = (caught == parent.error && caught == child.error && parent.isDone && child.isDone) ? 1 : 0
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 1.0, "jit={jit}");
+        }
+    }
+
+    #[test]
+    fn wren_fiber_root_cannot_be_called_but_can_be_transferred_to() {
+        let source = r#"
+var root = Fiber.current
+var inner = Fiber.new {
+  root.call()
+}
+var outer = Fiber.new {
+  return inner.try()
+}
+var error = outer.call()
+var result = error != null ? 1 : 0
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 1.0, "jit={jit}");
+        }
+    }
+
+    #[test]
+    fn wren_fiber_transfer_is_peer_to_peer_and_passes_resume_values() {
+        let source = r#"
+var main = Fiber.current
+var fiber = Fiber.new {|first|
+  var resumed = main.transfer(first + 1)
+  main.transfer(resumed + 1)
+}
+var first = fiber.transfer(5)
+var second = fiber.transfer(10)
+var result = first * 100 + second
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 611.0, "jit={jit}");
+        }
+    }
+
+    #[test]
+    fn wren_fiber_transfer_error_reaches_existing_try_caller() {
+        let source = r#"
+var a
+var b
+
+a = Fiber.new {
+  b.transferError("boom")
+}
+
+b = Fiber.new {
+  a.transfer()
+}
+
+var caught = b.try()
+var result = (caught == "boom" && b.error == "boom" && b.isDone) ? 1 : 0
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), 1.0, "jit={jit}");
+        }
+    }
+
+    #[test]
+    fn wren_fiber_abort_null_is_a_noop() {
+        let source = r#"
+Fiber.abort(null)
+var result = 1
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        vm.run_module(entry).unwrap();
+        assert_eq!(source_result(&vm), 1.0);
+    }
+
+    #[test]
+    fn wren_fiber_suspend_returns_control_to_host_and_resume_supplies_value() {
+        let source = r#"
+var resumed = Fiber.suspend()
+var result = resumed
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        vm.set_jit_options(None);
+        let first = vm.run_module(entry).unwrap();
+        assert!(matches!(first, ExecutionResult::Suspended(value) if value.is_null()));
+        let second = vm.resume(Value::from_num(42.0)).unwrap();
+        assert!(matches!(second, ExecutionResult::Returned(value) if value.as_num() == Some(42.0)));
+        assert_eq!(source_result(&vm), 42.0);
     }
 
     #[test]
