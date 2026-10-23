@@ -7,8 +7,14 @@
 use crate::wren_ir::{IntBinOp, IntUnaryOp};
 use crate::wren_trace_ir::*;
 use crate::wren_trace_ir_optimizer::{
-    Optimize, TraceOptimization, alias_value, append_preheader, canonicalize_references,
+    Optimize as TraceOptimize, TraceOptimization, alias_value, append_preheader,
+    canonicalize_references,
 };
+
+// Keep the historical `Optimize` name visible to optimization submodules that
+// import `super::*`, while the public pipeline signatures use an unambiguous
+// Trace-specific name.
+pub(crate) type Optimize = TraceOptimize;
 use hashbrown::{HashMap, HashSet};
 
 mod advanced;
@@ -22,16 +28,21 @@ pub use snapshot_optimizations::*;
 mod peephole;
 pub use peephole::*;
 
-pub fn optimization_passes() -> Optimize {
+// Conventional optimization names used by the higher-level optimizer API.
+// Trace IR is linear-with-guards, so "branch folding" is predicate/guard folding.
+pub use PredicateSimplification as BranchFold;
+pub use SparseConditionalConstantPropagation as ConstantFolding;
+
+pub fn optimization_passes() -> TraceOptimize {
     passes(true)
 }
 
-pub fn conservative_optimization_passes() -> Optimize {
+pub fn conservative_optimization_passes() -> TraceOptimize {
     passes(false)
 }
 
-fn passes(promote_loop_representations: bool) -> Optimize {
-    Optimize::new()
+fn passes(promote_loop_representations: bool) -> TraceOptimize {
+    TraceOptimize::new()
         // Establish compact representations and remove recorder-level boxing noise.
         .with_pass(TraceCanonicalization {
             promote_loop_representations,
@@ -53,6 +64,7 @@ fn passes(promote_loop_representations: bool) -> Optimize {
         .with_pass(GuardCoalescing)
         .with_pass(RedundantGuardElimination)
         .with_pass(ArchitecturalLoadForwarding)
+        .with_pass(DeadStoreElimination)
         .with_pass(DominatorTreeGVN)
         // Loop transforms expose additional canonical expressions and memory PRE.
         .with_pass(LoopInvariantCodeMotion)
@@ -60,8 +72,9 @@ fn passes(promote_loop_representations: bool) -> Optimize {
         .with_pass(StrengthReduction)
         .with_pass(IntegerCanonicalization)
         .with_pass(RangeAnalysis)
-        .with_pass(LoadStorePRE)
-        .with_pass(ArchitecturalLoadForwarding)
+        .with_pass(RedundantLoadElimination)
+        .with_pass(DeadStoreElimination)
+        .with_pass(RedundantLoadElimination)
         .with_pass(LoopInvariantGuardHoisting)
         .with_pass(LoopUnswitching)
         .with_pass(LoopInvariantCodeMotion)
@@ -160,6 +173,7 @@ pub struct GlobalValueNumbering;
 /// The trace dominator tree is a chain (preheader then each successful guard),
 /// with side exits as leaves. Walking execution order is its preorder traversal.
 pub use GlobalValueNumbering as DominatorTreeGVN;
+pub use GlobalValueNumbering as CommonSubexpressionElimination;
 
 impl TraceOptimization for GlobalValueNumbering {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
@@ -213,6 +227,7 @@ impl TraceOptimization for GlobalValueNumbering {
 /// Guards, checked arithmetic, memory operations and runtime loops stay put.
 #[derive(Default)]
 pub struct LoopInvariantCodeMotion;
+pub use LoopInvariantCodeMotion as LICM;
 
 impl TraceOptimization for LoopInvariantCodeMotion {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
@@ -1019,7 +1034,7 @@ pub(crate) mod tests {
         let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(20));
         b.set_terminator(TraceTerminator::Exit(exit));
         let mut trace = b.finish().unwrap();
-        Optimize::new()
+        TraceOptimize::new()
             .with_pass(GlobalValueNumbering)
             .optimize_trace(&mut trace)
             .unwrap();
@@ -1087,7 +1102,7 @@ pub(crate) mod tests {
         }
         b.set_terminator(TraceTerminator::LoopBack);
         let mut trace = b.finish().unwrap();
-        Optimize::new()
+        TraceOptimize::new()
             .with_pass(GlobalValueNumbering)
             .with_pass(LoopInvariantCodeMotion)
             .with_pass(PartialRedundancyElimination)
@@ -1134,7 +1149,7 @@ pub(crate) mod tests {
         );
         b.set_terminator(TraceTerminator::LoopBack);
         let mut trace = b.finish().unwrap();
-        Optimize::new()
+        TraceOptimize::new()
             .with_pass(LoopInvariantCodeMotion)
             .optimize_trace(&mut trace)
             .unwrap();

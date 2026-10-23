@@ -1,5 +1,8 @@
 //! Bounded, replayable leaf inlining. No callee frame is needed on a side exit:
 //! every check resumes at the caller's original call, before any callee effects.
+//! Invoke may guard up to four observed classes sharing the same target. Reads
+//! and scalar computations are replayable; stores, allocations and nested Wren
+//! calls still require the synchronized fallback.
 use super::*;
 use crate::wren_bytecode::{IncomingSource, function_kind_uses_this};
 
@@ -31,8 +34,8 @@ impl TraceRecorder<'_> {
         let receiver = receiver_reg.map(|reg| self.read_gpr(builder, reg.0, TraceType::Any, TraceRep::Tagged)).transpose()?;
         let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
         builder.emit0(TraceInst::GuardMethodEpoch { expected: runtime.trace_method_epoch(), exit });
-        if let Some(class) = class {
-            builder.emit1(TraceInst::GuardClass { value: receiver.ok_or(RecordingAbort::UnsupportedCall)?, classes: vec![class], exit }, TraceType::Any, TraceRep::Tagged);
+        if let Some(classes) = &class {
+            builder.emit1(TraceInst::GuardClass { value: receiver.ok_or(RecordingAbort::UnsupportedCall)?, classes: classes.clone(), exit }, TraceType::Any, TraceRep::Tagged);
         }
         let mut registers = vec![None; 256];
         for binding in &callee.frame.parameters {
@@ -79,6 +82,27 @@ impl TraceRecorder<'_> {
                     let cell = scalar(inst.b, TraceRep::Tagged)?;
                     builder.emit1(TraceInst::HeapLoadCell { cell, exit }, TraceType::Any, TraceRep::Tagged)
                 }
+                ListLen | MapLen | StringLen => {
+                    let object = scalar(inst.b, TraceRep::Tagged)?;
+                    let kind = match inst.opcode {
+                        ListLen => TraceInst::HeapListLen { list: object, exit },
+                        MapLen => TraceInst::HeapMapLen { map: object, exit },
+                        _ => TraceInst::HeapStringLen { string: object, exit },
+                    };
+                    builder.emit1(kind, TraceType::Int32, TraceRep::Int32)
+                }
+                ListGet => {
+                    let list = scalar(inst.b, TraceRep::Tagged)?;
+                    let index = scalar(inst.c, TraceRep::Int32)?;
+                    builder.emit1(TraceInst::HeapListGet { list, index, exit }, TraceType::Any, TraceRep::Tagged)
+                }
+                GuardBounds => {
+                    let index = scalar(inst.a, TraceRep::Int32)?;
+                    let length = scalar(inst.b, TraceRep::Int32)?;
+                    builder.emit0(TraceInst::GuardBounds { index, length, exit });
+                    pc = inst.next_pc;
+                    continue;
+                }
                 NumToF64 | GuardF64 => {
                     let value = scalar(inst.b, TraceRep::Tagged)?;
                     builder.emit1(TraceInst::GuardF64 { value, exit }, TraceType::F64, TraceRep::F64)
@@ -94,6 +118,41 @@ impl TraceRecorder<'_> {
                 F64ToNum => {
                     let value = scalar(inst.b, TraceRep::F64)?;
                     builder.emit1(TraceInst::BoxF64 { value }, TraceType::Num, TraceRep::Tagged)
+                }
+                INeg | IBitNot => {
+                    let value = scalar(inst.b, TraceRep::Int32)?;
+                    let unary = if inst.opcode == INeg { IntUnaryOp::Neg } else { IntUnaryOp::BitNot };
+                    builder.emit1(TraceInst::IntUnary { op: unary, value }, TraceType::Int32, TraceRep::Int32)
+                }
+                IAdd | ISub | IMul | IBitAnd | IBitOr | IBitXor | IShl | IShrU | ISar => {
+                    let (lhs, rhs) = (scalar(inst.b, TraceRep::Int32)?, scalar(inst.c, TraceRep::Int32)?);
+                    let bin = match inst.opcode {
+                        IAdd => IntBinOp::Add, ISub => IntBinOp::Sub, IMul => IntBinOp::Mul,
+                        IBitAnd => IntBinOp::BitAnd, IBitOr => IntBinOp::BitOr, IBitXor => IntBinOp::BitXor,
+                        IShl => IntBinOp::Shl, IShrU => IntBinOp::ShrU, _ => IntBinOp::Sar,
+                    };
+                    builder.emit1(TraceInst::IntBinary { op: bin, lhs, rhs }, TraceType::Int32, TraceRep::Int32)
+                }
+                FNeg => {
+                    let value = scalar(inst.b, TraceRep::F64)?;
+                    builder.emit1(TraceInst::F64Unary { op: F64UnaryOp::Neg, value }, TraceType::F64, TraceRep::F64)
+                }
+                ICmpEq | ICmpNe | ICmpLt | ICmpLe | ICmpGt | ICmpGe
+                | FCmpEq | FCmpNe | FCmpLt | FCmpLe | FCmpGt | FCmpGe => {
+                    let integer = matches!(inst.opcode, ICmpEq | ICmpNe | ICmpLt | ICmpLe | ICmpGt | ICmpGe);
+                    let rep = if integer { TraceRep::Int32 } else { TraceRep::F64 };
+                    let (lhs, rhs) = (scalar(inst.b, rep)?, scalar(inst.c, rep)?);
+                    let cmp = match inst.opcode {
+                        ICmpEq | FCmpEq => CmpKind::Eq, ICmpNe | FCmpNe => CmpKind::Ne,
+                        ICmpLt | FCmpLt => CmpKind::Lt, ICmpLe | FCmpLe => CmpKind::Le,
+                        ICmpGt | FCmpGt => CmpKind::Gt, _ => CmpKind::Ge,
+                    };
+                    let kind = if integer { TraceInst::IntCompare { op: cmp, lhs, rhs } }
+                        else { TraceInst::F64Compare { op: cmp, lhs, rhs } };
+                    let condition = builder.emit1(kind, TraceType::Bool, TraceRep::Bool);
+                    let if_true = builder.constant(TraceConstant::Bool(true));
+                    let if_false = builder.constant(TraceConstant::Bool(false));
+                    builder.emit1(TraceInst::Select { condition, if_true, if_false }, TraceType::Bool, TraceRep::Tagged)
                 }
                 FAdd | FSub | FMul | FDiv | FRem => {
                     let (lhs, rhs) = (scalar(inst.b, TraceRep::F64)?, scalar(inst.c, TraceRep::F64)?);

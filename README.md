@@ -1,414 +1,658 @@
 # WrenJIT
 
-Source compilation uses `wren_pipeline::compile_program(&mut hir)` after AST
-lowering: HIR -> optimization passes -> register bytecode. The CLI and source
-execution tests share this entry point. HIR is optimized in place, and the
-existing IR and bytecode verification remains enabled by default.
+**WrenJIT** is a high-performance, Wren-derived language runtime built around a register VM, a multi-stage optimizing compiler, a tracing JIT backed by Cranelift, precise moving garbage collection, and an extended asynchronous runtime.
 
-Add default passes in `wren_ir_optimizing::optimization_passes()`. For a custom
-configuration, reuse the optimizer builder:
+> **Project status:** WrenJIT is entering its final feature-freeze and documentation/compatibility audit. After that audit, this engine will be preserved as the final Wren-derived release. Further language development will continue separately as **Napalm**, which is free to abandon Wren syntax and compatibility entirely.
 
-```rust,ignore
-let passes = wren_ir_optimizing::optimization_passes()
-    .with_function_pass(MyFunctionPass)
-    .with_pass(my_node_pass);
-let bytecode = wren_pipeline::CompilationPipeline::new(passes)
-    .compile(&mut hir)?;
-```
+WrenJIT began as an attempt to make Wren dramatically faster. It eventually grew beyond that goal: the runtime now contains its own SSA IR, register bytecode, optimizing interpreter, tracing JIT, moving GC integration, structured exceptions, `defer`, `async`/`await`, cancellable Promises, microtasks, timers, and a static module graph.
 
-Pass `wren_ir_optimizer::Optimize::new()` to select an empty HIR optimization
-stage. Bytecode lowering has its own options, configurable through
-`with_bytecode_options(...)`; `compile_with_stats(...)` reports backend statistics
-after HIR optimization. `wren_bytecodecompiler` remains the direct backend API
-for callers that already prepared their HIR.
+WrenJIT should therefore be understood as **Wren-derived, not as a promise of drop-in compatibility with every official Wren embedding or implementation detail**.
 
-### Random numbers and collection getters
+---
 
-`Random` is available as a core global (no import required):
+## Performance comparison
 
-```wren
-var random = Random.new()
-System.print(random.int(3, 10)) // Integer in [3, 10).
-System.print(random.int(4))     // Integer in [0, 4).
-```
+The final release should publish results for three engines:
 
-Each instance has independent SplitMix64 state, seeded from the standard
-library's randomized hash seed. This is a non-cryptographic generator.
-Integer sampling uses rejection to avoid modulo bias. Bounds must be finite,
-exact integers between -9007199254740991 and 9007199254740991, and the upper
-bound must be greater than the lower bound. Random operations execute in the
-interpreter; they are not native JIT intrinsics.
+- **Wren** — official upstream Wren.
+- **WrenLift** — comparison engine; this README intentionally makes no implementation or feature claims about it.
+- **WrenJIT** — this project.
 
-Getters use no parentheses: `"string".count`, `(1..10).count`, `(1..10).min`,
-`1.23.sin`, and `[1, 2, 3].isEmpty`. Range `count` counts unit-step iteration
-in either direction, respecting inclusive/exclusive endpoints. `isEmpty` is
-also available on strings, maps, and map-key views.
+All portable benchmark scripts under `benchmarks/portable/` intentionally stay inside the common Wren language surface so the same source can be executed by all three engines.
 
-### List and string concatenation
+### Absolute times
 
-`list.remove(value)` removes and returns the first matching element, or returns
-`null` without modifying the list if no match exists. Matching dispatches the
-element's `==` operator, including user-defined equality; strings compare by
-contents. `removeAt(index)` remains the index-based alternative.
+Lower is better. Fill these cells with **median wall-clock time for the measured region**, using the methodology below.
 
-`List + List` returns a new list containing the left elements followed by the
-right elements. Neither operand is modified; nested objects remain shared
-(a shallow copy). Empty operands and concatenation of a list with itself are
-supported. `String + String` concatenates strings, including Unicode text.
-Both operators require the right operand to have the same type as the receiver.
-These heap-allocating operations currently execute in the interpreter, not as
-direct native JIT instructions.
+| Benchmark | Wren | WrenLift | WrenJIT |
+|---|---:|---:|---:|
+| `mandelbrot` *(+ others)* | 61410 ms | 10218 m | 2296ms |
+| `classes` | 1050 ms | 1211 ms | 43ms |
+| `gc` | 890 ms | 206 ms | 126ms |
 
-```wren
-var combined = ["a", "b", "c"] + ["d", "e", "f"]
-System.print(combined) // [a, b, c, d, e, f]
-System.print("hello" + " world") // hello world
-```
+### Relative speedups
 
-### Map removal and clearing
+Higher is better. Compute speedup as `comparison_time / WrenJIT_time`.
 
-Iterating a map yields entry objects with read-only `key` and `value` getters.
-`map.keys` returns a live iterable view of its keys, with a `count` getter.
-Iteration order is unspecified; do not structurally modify the map during
-iteration. Entries retain the key/value pair captured when they were produced,
-and may be retained after the map is cleared.
+| Benchmark | WrenJIT vs Wren | WrenJIT vs WrenLift |
+|---|---:|---:|
+| `mandelbrot` *(+ others)* | 26,75x | 4,45x |
+| `classes` | 24,42x | 28,16x |
+| `gc` | 6,825x | 1,635x |
+
+### Benchmark methodology
+
+For published numbers:
+
+1. Build every engine in its fastest supported release configuration.
+2. Use the same machine, OS, CPU governor/power mode, and terminal environment.
+3. Avoid comparing a debug build from one engine with a release build from another.
+4. Run each benchmark at least **7 times**; report the median.
+5. Keep the warm-up embedded in each benchmark. WrenJIT is a JIT and steady-state results without warm-up are not meaningful.
+6. Record CPU model, OS, compiler/toolchain, engine revision, and command line.
+7. Verify checksums before accepting timing results.
+8. Treat process-startup/compile latency as a **separate benchmark**. The in-script `System.clock` measurements intentionally focus on execution throughput.
+9. Report regressions as well as wins. A benchmark table is more valuable if it is reproducible than if every row is flattering.
+
+---
+
+# Language extensions beyond official Wren
+
+Official Wren already has classes, closures, modules and lightweight cooperative Fibers. WrenJIT keeps those concepts, but adds a substantial language/runtime surface of its own.
+
+## `async` methods and closures
+
+WrenJIT adds `async` functions at the method/closure level. Calling an async function returns a Promise instead of recursively entering a second interpreter dispatch loop.
 
 ```wren
-for (entry in birds) {
-  System.print("The state bird of %(entry.key) is %(entry.value)")
+class Service {
+  static async answer() {
+    return 42
+  }
 }
-for (state in birds.keys) {
-  System.print("The state bird of %(state) is " + birds[state])
+
+var work = async {|value|
+  return value * 2
 }
 ```
 
-`map.remove(key)` removes the key and returns its stored value, or `null` if the
-key was absent. A key whose stored value is `null` is still removed.
-`map.clear()` removes all entries in place and returns `null`. All aliases see
-the emptied map, which can immediately be reused.
+Async execution is represented by scheduler-owned VM execution state using the same register/frame machinery as Fibers.
+
+## `await`
+
+`await` suspends the current logical Wren execution until a Promise settles. It is valid inside async code and at module scope.
 
 ```wren
-var capitals = {"Georgia": "Atlanta"}
-System.print(capitals.remove("Georgia")) // Atlanta
-capitals.clear()
-System.print(capitals.count) // 0
+var value = await Service.answer()
 ```
 
-### Nested list and map subscripts
+A pending Promise does **not** block the OS thread. The current execution is marked suspended and the scheduler runs another ready continuation or the event loop.
 
-Comma-separated subscripts traverse nested lists and maps in order. List
-indices start at zero:
+## Promises
+
+WrenJIT has first-class Promises with four terminal/state categories:
+
+```text
+Pending -> Fulfilled
+        -> Rejected
+        -> Cancelled
+```
+
+Public operations include:
 
 ```wren
-var matrix = [
-    [1, 2, 3],
-    [4, 5, 6],
-    [7, 8, 9]
-]
-System.print(matrix[0, 1]) // 2, like matrix[0][1]
-matrix[1, 2] = 60
-System.print(matrix[-1, -1]) // 9
-System.print(matrix[1, 0..2]) // [4, 5, 60]
+Promise.resolve(value)
+Promise.reject(error)
+
+promise.cancel()
+promise.isPending
+promise.isFulfilled
+promise.isRejected
+promise.isCancelled
 ```
 
-Each intermediate value must be a List or Map. List indices must be finite
-integers within that list's bounds; negative indices count from its end,
-including for ragged lists. Invalid indices such as `matrix[3, 5]` raise a
-runtime error. Maps use their normal key semantics at every step:
+Returning a Promise from async code adopts the inner Promise rather than producing a nested Promise.
+
+Promise settlement does not recursively execute awaiters. Continuations are queued through the microtask mechanism, avoiding re-entrant execution during `resolve`, `reject`, or `cancel`.
+
+## Cancellable asynchronous operations
+
+A Promise is also the handle for its asynchronous producer. Cancellation is therefore uniform instead of requiring a second timer/task handle type.
+
+`cancel()` returns `true` when cancellation was accepted and `false` when the operation was already terminal or too far into execution to cancel safely.
+
+WrenJIT does not asynchronously tear down arbitrary running Wren code. Cancellation is cooperative and producer-specific.
+
+## Timer/event-loop API
+
+WrenJIT exposes timer primitives through the static `Timer` class:
 
 ```wren
-var map_list = [{}, {}]
-map_list[1, "source"] = [10, 20, 30]
-System.print(map_list[1, "source", 0]) // 10
+await Timer.delay(100)
 
-var data = {"rows": map_list}
-data["rows", 1, "source", -1] = 99
-System.print(data["rows", 1, "source"]) // [10, 20, 99]
+var value = await Timer.delay(100) {
+  return 42
+}
+
+var micro = Timer.microtask {
+  return doWork()
+}
+
+var interval = Timer.every(1000) {
+  System.print("tick")
+}
+interval.cancel()
 ```
 
-A missing final map key returns `null` when read and is inserted on assignment.
-Missing or non-container intermediate values raise a runtime error; nested
-containers are not created automatically. Use `var` only to declare the root
-variable, then assign its elements without `var`.
+All Timer operations return Promises.
 
-Additional indices support deeper nesting (`cube[x, y, z]`). Reads accept up to
-16 indices, and assignments up to 15, leaving one argument for the assigned
-value. Assignments update the innermost container in place and return that value.
-A read's final index on a List can also be a range to slice it. Classes
-can still define their own multi-argument subscript getters and setters.
+The runtime uses a microtask queue and deadline heap rather than a fixed polling sleep. Idle execution can park until the next deadline. `Timer.every()` deliberately prevents overlapping ticks; a slow callback finishes before the interval is re-armed, and missed periods are skipped instead of creating a catch-up storm.
 
-### Ranges and list slices
+## Structured exceptions
 
-Numeric `from..to` ranges include the endpoint; `from...to` ranges exclude it.
-Both ascending and descending ranges support `for` iteration and the `from`,
-`to`, `min`, `max`, and `isInclusive` getters.
-
-Use a range as a list subscript to create a new, shallow-copy list:
+Official Wren handles runtime errors through Fibers and intentionally has no language-level exception handling. WrenJIT adds conventional structured exceptions:
 
 ```wren
-var trees = ["cedar", "birch", "oak", "willow"]
-trees[1..2]    // [birch, oak]
-trees[1..-1]   // [birch, oak, willow]
-trees[0...2]   // [cedar, birch]
-trees[3..1]    // [willow, oak, birch]
-trees[0...0]   // []
+try {
+  dangerousOperation()
+} catch (error) {
+  System.print(error)
+} finally {
+  cleanup()
+}
+
+throw value
 ```
 
-Negative bounds count from the end. Slice bounds must be finite integers and
-within bounds; an exclusive endpoint may be just beyond the selected elements.
-`list[0..-1]` and `list[0...list.count]` copy even an empty list. Slices do not
-modify the original list, but nested objects remain shared. Subscript assignment
-accepts integer indices only, not ranges.
+`throw` can throw an arbitrary Wren value. Runtime errors may also enter a `catch` path.
 
-### HIR escape analysis and scalar replacement
+The implementation uses **zero-cost protected bytecode ranges**: normal execution does not execute `EnterTry` / `LeaveTry` opcodes. Handler metadata is consulted only when an exception actually occurs.
 
-`wren_ir_escape.rs` implements partial escape analysis (Graal-style) plus full
-SROA over HIR. `ScalarReplacement` runs at the end of the default
-`InterpreterOptimizationBundle`; if it changes anything, simplify/copy/DCE run
-once more. `EscapeAnalysis::analyze(&function)` exposes the per-allocation
-classification (`NoEscape`, `PartialEscape`, `GlobalEscape`) without rewriting.
+## `defer` and `errdefer`
 
-- Candidates: `AllocInstance`, `AllocCell`, `AllocList` (constant capacity),
-  `MakeRange` (numeric bounds), `MakeClosure` and `AllocMap`.
-- Field, cell and list accesses (`LoadField`/`StoreField`, `LoadCell`/`StoreCell`,
-  `ListLen`, constant-index `ListGet`/`ListSet`, `ListAppend`) become SSA values
-  (block parameters built with Braun-style lazy SSA construction). Write
-  barriers on virtual objects are dropped, and `RefEq` folds to a constant.
-- `NoEscape` allocations disappear entirely. On `PartialEscape` paths the object
-  is materialized (allocation plus stores of its current virtual state) only
-  right before the first escaping use, or at a merge with an already
-  materialized path. Reads before that point are still forwarded from SSA.
-- Nested virtual objects are resolved over several rounds (up to 4).
-- Allocations referenced by deopt snapshots or inlined frames are pinned.
-  Out-of-range virtual list accesses and other error-preserving cases also
-  force materialization, so runtime errors are not lost.
+Lexical cleanup is built into the language:
 
-There is no HIR inliner yet. Any `Invoke` with the object as receiver or
-argument (including `Fn.new { ... }` and list/range methods) is a real escape,
-so today's main wins are forwarded field reads in constructors, dead
-allocations, and branches where the object escapes on only one path.
-`ScalarReplacement::stats` reports the removed, sunk and forwarded allocations.
+```wren
+defer {
+  alwaysRun()
+}
 
-Trace compilation has the same split: `wren_trace_ir_optimizer.rs` owns the
-extensible, verified pass runner, while `wren_trace_ir_optimizing.rs` owns the
-default list and transforms. The recorder runs this list for root and side
-traces before Cranelift lowering when `optimize_trace_ir` is enabled.
-
-The default sequence preserves numeric representation specialization, then runs
-GVN, LICM, PRE and another GVN cleanup. GVN reuses pure scalar expressions;
-LICM moves safe invariant computations into the native preheader. PRE uses the
-loop's entry/backedge join: `e(phi(initial, next))` becomes
-`phi(e(initial), e(next))` when `e(next)` is already computed in the body. It is
-loop-edge PRE for this linear Trace IR, not arbitrary-CFG PRE. Loads, runtime
-effects, checked operations and trapping integer division are excluded from
-code motion; runtime calls also reset GVN availability.
-
-```rust,ignore
-use wren_trace_ir_optimizer::Optimize;
-use wren_trace_ir_optimizing::{GlobalValueNumbering, LoopInvariantCodeMotion};
-
-Optimize::new()
-    .with_pass(GlobalValueNumbering)
-    .with_pass(LoopInvariantCodeMotion)
-    .optimize_trace(&mut trace)?;
+errdefer (error) {
+  rollback(error)
+}
 ```
 
-Add default passes in `wren_trace_ir_optimizing::optimization_passes()`, or append
-custom implementations of `TraceOptimization` with `.with_pass(...)`.
-`TraceStats` exposes `gvn_eliminated`, `licm_hoisted` and `pre_eliminated`.
-The old `wren_trace_ir::TraceOptimizer` API remains available for compatibility.
+- `defer` runs in LIFO order on scope exit.
+- `errdefer` runs only while unwinding an error.
+- `return`, `break`, and `continue` execute required pending cleanup first.
+- `finally` runs on both normal and exceptional exit.
+- control transfers from inside cleanup bodies are rejected when they would make cleanup semantics ambiguous.
 
-Run performance workloads with an optimized build:
+## Extended module resolver
 
-```powershell
-cargo run --release -- scripts/jit.wren
+Wren source syntax remains familiar, but WrenJIT owns a real filesystem/package resolver and compiles the reachable module graph before bytecode generation.
+
+```wren
+import "./local"
+import "../shared.wren" for Thing
+import "@lib/http/client" for Client
+import "@std/io" for File
 ```
 
-`cargo run -- scripts/jit.wren` builds an unoptimized debug interpreter and
-Cranelift compiler. Use that configuration for debugging, not comparisons with
-the bundled optimized Wren executable.
+Resolution supports:
 
-To exclude Cargo's build time, build once and run the executables directly:
+- importer-relative paths;
+- optional `.wren` suffix;
+- `<path>/index.wren` fallback;
+- `@lib/...` package roots;
+- `@std/...` standard-library roots;
+- canonical physical-path deduplication;
+- stable logical module identities;
+- cyclic module initialization;
+- project-root discovery;
+- environment-configurable package/std roots;
+- traversal/symlink escape rejection for package namespaces.
 
-```powershell
-cargo build --release
-.\target\release\WrenJIT.exe scripts/jit.wren
-.\scripts\wren_cli.exe scripts/jit.wren
+Because imports are statically named string literals, WrenJIT discovers and lowers the complete reachable graph before execution. Filesystem/package lookup therefore does not sit in the interpreter/JIT hot path.
+
+---
+
+# Performance architecture
+
+WrenJIT's performance does not come from a single optimization. The engine is designed as a pipeline where each layer exposes information to the next one while keeping the baseline interpreter fast enough to be useful before native code is generated.
+
+## 1. Fast frontend and whole-program preparation
+
+- The lexer is implemented with **Logos**.
+- Source locations are byte-accurate through the frontend and lowerer.
+- Parser recovery reports multiple syntax errors in one pass instead of stopping at the first typo.
+- **Ariadne** diagnostics are emitted only on cold error paths.
+- The static module graph is resolved before VM execution, eliminating filesystem/package resolution from runtime import hot paths.
+- Modules are canonicalized so multiple import spellings of one file share one runtime module object.
+
+These are mostly compile-time engineering choices, but they keep runtime metadata compact and predictable.
+
+## 2. Wren IR: SSA for a dynamic language
+
+The high-level/mid-level IR (WIR) is SSA-based and keeps Wren semantics explicit long enough for safe specialization.
+
+Key properties:
+
+- separate `ValueId` SSA for data and `EffectId` SSA for memory/control effects;
+- block parameters instead of explicit Phi instructions;
+- explicit effect tokens on CFG edges;
+- generic dynamic `Invoke` until later devirtualization/speculation;
+- fixed instance-field slots;
+- explicit cells for captured mutable variables;
+- immutable captures passed directly by value;
+- internal `Int32`, `F64`, and raw-pointer representations that are not exposed as Wren source types;
+- explicit guards, OSR/resume metadata, and deoptimization snapshots;
+- structured exception regions represented as metadata, not normal-path control opcodes.
+
+### Baseline HIR optimization pipeline
+
+The cold-start-oriented optimizer performs bounded passes rather than running expensive analyses to a huge fixed point:
+
+- constant folding;
+- local value numbering / common-subexpression elimination;
+- local algebraic and peephole simplification;
+- copy propagation;
+- dead-code elimination;
+- dead/redundant memory forwarding where legal;
+- CFG cleanup and branch simplification;
+- guard cleanup;
+- partial escape analysis and scalar replacement.
+
+### Partial escape analysis / SROA
+
+WrenJIT implements flow-sensitive partial escape analysis over WIR.
+
+Supported virtualizable allocations include instances, cells, lists, ranges, closures, and maps where their state can be represented field-by-field.
+
+The analysis can:
+
+- remove allocations that never escape;
+- sink allocations to only the control-flow paths that actually escape;
+- replace field/cell/list accesses with SSA values;
+- forward stores to later loads across blocks and loops;
+- reconnect scalarized fields across merges using new block parameters;
+- materialize virtual objects immediately before an escaping use;
+- preserve objects that must remain materialized for deoptimization/exception correctness.
+
+This is not merely a local "stack allocation" pass: non-escaping objects can disappear completely.
+
+### Aggressive HIR mode
+
+A throughput-oriented pipeline is available for hot/AOT-style use and benchmarks. It additionally pays for global analyses such as dominator-based CSE and repeats cleanup/SROA to a bounded fixed point.
+
+Independent WIR functions can also be optimized concurrently, with one optimizer instance per worker.
+
+## 3. Register bytecode instead of a stack machine
+
+WrenJIT lowers WIR to a compact register bytecode designed around interpreter throughput.
+
+### Architectural register model
+
+- **256 frame-local GPRs** (`R0..R255`);
+- **16 argument-transfer registers**;
+- **2 return-transfer registers**;
+- a small special-register bank for `this`, closure, module, Fiber, error/resume values and scratch state.
+
+General registers are raw 64-bit slots and can contain either NaN-boxed Wren values or internal unboxed representations.
+
+### Encoding
+
+- logical bytecode words are 32 bits;
+- the first word uses compact `[opcode, A, B, C]` encoding;
+- hot instructions remain one word;
+- wide IDs/immediates use extension words only when required;
+- call/closure register lists are packed four GPR IDs per word;
+- relative branches are measured from the end of the branch instruction.
+
+### Bytecode compiler optimizations
+
+The bytecode compiler performs work specifically to reduce interpreter overhead:
+
+- dead pure SSA nodes are removed before allocation;
+- global hole-aware register allocation reuses all 256 GPRs aggressively;
+- move, guard and block-parameter affinities bias allocation toward coalescing;
+- block parameters become edge parallel copies, never runtime Phi instructions;
+- parallel-copy cycles use a special scratch register instead of reserving a GPR globally;
+- fallthrough layout removes unnecessary branches;
+- critical-edge copies can be emitted in shared out-of-line trampolines;
+- constants, guard descriptors and IC descriptors are deduplicated;
+- frame-entry parameter/capture moves are encoded in `FrameLayout`, eliminating a bytecode prologue;
+- precise physical-liveness GC maps are emitted at every GC-capable PC;
+- bytecode carries resume/deopt/source/exception metadata in side tables rather than burdening common opcodes.
+
+The current architecture intentionally has no spill opcodes: functions whose live values truly exceed all 256 GPRs fail compilation rather than imposing spill overhead on every ordinary function.
+
+## 4. Prepared token-threaded interpreter
+
+Bytecode is decoded once when an `Interpreter` is created. Each prepared instruction stores a direct Rust handler pointer and compact decoded operands.
+
+The hot loop therefore avoids:
+
+- a giant opcode `match`/switch on every dispatch;
+- variable-width bytecode decoding on every iteration;
+- repeated FuncId/ClassId/ModuleId resolution;
+- repeated switch-table preparation;
+- repeated frame-layout decoding.
+
+### Hot interpreter state
+
+Current frame, registers, function and PC are cached in hot raw pointers/indices and refreshed at frame/Fiber/runtime boundaries. Normal GPR access is effectively a pointer add/load/store.
+
+Frames use a contiguous register stack rather than allocating a fresh register vector for every call. Per-frame argument/return/special banks are retained at the Fiber high-water mark and reused.
+
+### Superinstructions
+
+During preparation, common safe instruction pairs are fused when the second instruction is not a control-flow/deopt/resume target. Existing combinations include:
+
+- compare + conditional branch;
+- `Move` + `Move`;
+- `Move` + `Return`;
+- `Move` + `Jump`;
+- constant/load + `Return` variants;
+- field/static/module/cell load + `Return` variants;
+- redundant explicit write-barrier removal after mutation handlers that already perform the StickyImmix barrier.
+
+This reduces dispatch count without changing the persistent bytecode format.
+
+### Adaptive switches
+
+Prepared switch tables choose among:
+
+- linear search for very small case counts;
+- dense jump tables for compact ranges;
+- sorted/binary lookup for sparse larger switches.
+
+### NaN-boxed values
+
+Source-visible values use a 64-bit NaN-box representation. Numbers remain ordinary IEEE-754 doubles; special tags represent null, booleans and heap handles. NaNs are canonicalized so they cannot collide with tag space.
+
+Internal numeric bytecodes may use raw unboxed `i32`/`f64` register representations and box only at semantic boundaries.
+
+## 5. Quickening and inline caches
+
+The baseline interpreter is adaptive even before the tracing JIT takes over.
+
+### Numeric quickening
+
+Repeated generic numeric invokes can be rewritten to direct numeric handlers for:
+
+- arithmetic;
+- comparisons;
+- bitwise operations;
+- shifts;
+- unary numeric operations.
+
+This removes repeated generic Wren method lookup on stable numeric sites.
+
+### Method dispatch caches
+
+Generic method invokes use compact polymorphic inline caches (PICs):
+
+- up to four receiver-class/target pairs are kept inline;
+- probes are manually unrolled;
+- sites fall back to a megamorphic path instead of endlessly patching/depatching;
+- method-table epochs invalidate speculative assumptions when required.
+
+Dense `MethodSymbol`-indexed class method tables avoid hashing on cache misses.
+
+### Map shapes and Map PICs
+
+String-key Maps can use a shape/slot representation and their own four-entry PIC. A hit can resolve shape + slot without rehashing the key. Maps can fall back to the general dictionary representation when shape assumptions no longer fit.
+
+This makes repeated object-like Map access substantially cheaper while preserving Wren Map semantics.
+
+## 6. Precise moving StickyImmix GC
+
+The current runtime integrates a **StickyImmix** collector with precise roots and generational barriers.
+
+Important design choices:
+
+- per-PC reference maps identify exactly which VM registers contain managed references;
+- VM roots, Fiber state, globals, async state and event-loop payloads participate in root discovery;
+- a stable handle table lets a compact NaN-boxed `Value` survive object movement without rewriting every Wren value;
+- moving object addresses are reloaded after safepoints;
+- object descriptors precisely trace Lists, Maps, Cells, closures, instances, Fibers/async state and other managed object layouts;
+- object-remembering write barriers support generational collection;
+- native/JIT stores can elide the barrier when the stored value is statically known not to be a heap reference;
+- external Rust/native buffers are accounted separately so large backing stores can contribute to GC pressure;
+- root providers expose VM/JIT stack-map roots to the collector;
+- GC workers can process tracing/copy work in parallel according to collector configuration;
+- `System.gc()` requests an explicit full collection.
+
+Current collector tuning is configurable through environment variables such as heap size, worker count and external-memory threshold in the GC integration.
+
+## 7. Tracing JIT with Cranelift
+
+Hot execution can leave the baseline interpreter and enter native Cranelift code.
+
+The JIT is deliberately split into four layers:
+
+1. the interpreter exposes a small `TraceRuntime` interface;
+2. the recorder observes original, **unfused** bytecode and builds Trace SSA;
+3. Trace IR optimizations specialize the recorded path;
+4. Cranelift lowers optimized traces to native code.
+
+### Native loop state stays native
+
+A compiled trace receives one compact activation structure containing pointers to architectural register banks and side-exit storage.
+
+Loop values such as induction variables and accumulators can remain in native registers for the entire native loop. Wren architectural registers do **not** need to be written back on every iteration.
+
+### Sparse side exits
+
+Each guard/exit knows exactly which architectural values must be reconstructed. Cold side-exit blocks materialize only that sparse snapshot before returning to Rust/baseline execution.
+
+### Root, entry and side traces
+
+The tier supports hot loop traces and hot acyclic entry traces. Repeated side exits may grow child side traces. Eligible edges can be **stitched native-to-native**, avoiding a manager/interpreter round-trip after the child is installed.
+
+Side-trace depth is bounded to prevent uncontrolled trace-tree growth.
+
+### Bounded Wren-call inlining
+
+The recorder can inline bounded Wren calls when it can prove the call target and safely reproduce the call/return path. Method-table epoch guards protect inlined dynamic dispatch assumptions.
+
+### Trace IR optimizations
+
+The current Trace optimizer includes a broad set of loop/speculation passes, including:
+
+- canonicalization and copy cleanup;
+- box/guard cancellation;
+- loop representation promotion (`f64`, signed `i32`, unsigned `u32` loop phis);
+- sparse conditional constant propagation (SCCP);
+- induction-variable simplification;
+- class/type propagation;
+- dominator-tree GVN/CSE;
+- loop-invariant code motion (LICM);
+- partial redundancy elimination (PRE);
+- strength reduction;
+- range analysis;
+- load/store PRE;
+- loop-invariant guard hoisting;
+- loop unswitching;
+- dead box/copy cleanup.
+
+The optimizer is careful not to move assumptions across full runtime synchronization boundaries where heap/register state may have changed.
+
+### Direct native heap fast paths
+
+Selected hot heap operations lower directly to Cranelift instead of invoking the Rust opcode handler, including fast paths for operations such as:
+
+- instance-field load/store;
+- captured-cell load/store;
+- List length/get/set;
+- Map length;
+- String length;
+- read/write barrier interactions where legal.
+
+Generated code uses a small JIT-visible heap sidecar rather than depending on the private Rust `HeapObject` enum layout.
+
+### Runtime leaf calls
+
+Some uncommon non-GC operations can use synchronized **leaf** runtime helpers. These commit the required architectural state but preserve unrelated SSA/native values. A small per-trace leaf budget prevents mixed traces from turning into native-to-Rust trampoline loops.
+
+Full GC/frame-changing runtime calls remain hard synchronization epochs.
+
+### Cranelift configuration and verification
+
+The native tier supports Cranelift speed optimization, optional verifier checks, IR/VCode diagnostics, trace verification, configurable hotness thresholds, watchdog exits and detailed JIT statistics.
+
+## 8. Async scheduler and event loop
+
+Async functions reuse the VM's explicit frame/register state rather than native OS stacks.
+
+Current scheduling is cooperative and keeps:
+
+- a FIFO queue of ready async executions;
+- suspended awaiters attached to Promises;
+- a dedicated microtask queue;
+- a deadline heap for timers;
+- Promise forwarding/adoption edges;
+- cancellation producers for events/tasks/promises.
+
+When the VM has no runnable work, it can park until the next timer deadline instead of polling at fixed intervals.
+
+Promise settlement and cancellation enqueue continuation work as microtasks instead of recursively resuming Fibers from inside settlement code.
+
+This subsystem is intentionally the foundation that the later Napalm runtime can evolve into a larger N:M scheduler without changing Promise/`await` semantics again.
+
+## 9. Structured errors without normal-path tax
+
+WrenJIT's `try`/`catch` implementation uses protected ranges and handler metadata. There are no normal-path enter/leave-try dispatches.
+
+- catch blocks are cold handler entries;
+- exact error state is materialized at the catch safepoint;
+- call frames retain enough call-site information to unwind across Wren calls;
+- hot code inside a protected region remains traceable/JIT-able;
+- an actual exceptional edge returns to the baseline interpreter when required;
+- escape/SROA conservatively preserves objects whose exceptional state must remain observable.
+
+`defer`, `errdefer`, `finally`, `return`, `break`, and `continue` are lowered so required cleanup runs exactly once in lexical LIFO order.
+
+## 10. Verification and differential testing
+
+The engine contains verifier/test infrastructure for:
+
+- WIR structural invariants;
+- bytecode instruction boundaries and register ranges;
+- precise GC maps;
+- deoptimization/resume metadata;
+- exception handler ranges;
+- trace SSA and side-exit state;
+- interpreter/JIT differential execution;
+- original Wren checksum compatibility for core benchmark kernels.
+
+For the existing `jit.wren`, the test suite already checks known Wren-compatible results for `integratePi`, `xorshift` and Mandelbrot with the JIT both disabled and enabled.
+
+---
+
+# Tests included with this release-document package
+
+## Portable cross-engine performance tests
+
+`benchmarks/portable/` contains:
+
+- `bench_fields.wren`
+- `bench_dispatch_pic.wren`
+- `bench_closures.wren`
+- `bench_recursion.wren`
+- `bench_list.wren`
+- `bench_map.wren`
+- `bench_strings.wren`
+- `bench_fibers.wren`
+- `bench_inheritance.wren`
+- `bench_mixed_runtime.wren`
+
+Every measured workload prints:
+
+```text
+BENCH|benchmark_name|seconds|checksum
 ```
 
-Run each several times without other builds running. The script's `elapsed`
-line measures execution (including trace recording and compilation). Use an
-external stopwatch if you also want process startup and source compilation.
+The checksum is part of the benchmark contract. Never publish a timing from an engine that produces a different checksum.
 
-Inspect JIT activity with:
+## WrenJIT-only feature tests
 
-```powershell
-$env:WREN_JIT_STATS = "1"
-.\target\release\WrenJIT.exe scripts/jit.wren
-Remove-Item Env:WREN_JIT_STATS
+`tests/wrenjit/` contains focused regression scripts for language/runtime features that official Wren does not parse or expose:
+
+- `test_async_promises.wren` — async methods/closures, top-level await and Promise adoption;
+- `test_timer_event_loop.wren` — microtask ordering, delay callbacks and non-overlapping/cancellable intervals;
+- `test_promise_cancel.wren` — terminal/idempotent cancellation and cancelled-await behavior;
+- `test_defer_exceptions.wren` — `defer`, `errdefer`, `throw`, `catch`, `finally`, return cleanup;
+- `modules/main.wren` — extensionless relative resolution, aliases and `index.wren` resolution.
+
+The project's existing GC stress, algorithm/JIT, and hot-function tests should remain part of the final release suite instead of being duplicated here.
+
+---
+
+# Features deliberately not claimed by this final WrenJIT release
+
+The following belong to the next language/runtime phase and should **not** be advertised as WrenJIT features until they actually land and pass the final audit:
+
+- true parallel Wren/Napalm execution through isolates/tasks;
+- the planned web-service DSL;
+- the TypeScript-like Napalm frontend;
+- arbitrary shared mutable state between parallel isolates;
+- any compatibility claim not verified by the final source-by-source documentation audit.
+
+---
+
+# Project lineage
+
+```text
+official Wren
+     |
+     v
+  WrenJIT
+  - new compiler/runtime architecture
+  - optimizing register interpreter
+  - StickyImmix GC
+  - Cranelift tracing JIT
+  - language/runtime extensions
+     |
+     | final feature freeze + release
+     v
+Napalm (Reloaded)
+  - new syntax
+  - no Wren compatibility constraint
+  - future parallelism / web DSL / further language work
 ```
 
-`WREN_JIT_EVENTS=1` also logs recording/compilation events. `WREN_NO_JIT=1`
-selects this project's interpreter for a comparison without native traces.
+The original implementation of Napalm is retained separately as `napalm_old` for historical/reference purposes.
 
-The JIT also records hot function entries and continuations after calls. The
-default `hot_entry_threshold` is 64 visits; setting it to zero disables this tier
-without changing loop tracing. The CLI exposes this comparison as
-`WREN_NO_ENTRY_JIT=1`. `WREN_NO_JIT` takes precedence over that switch.
+---
 
-Entry traces compile bounded acyclic paths and return to the interpreter before
-calls, returns, unsupported runtime operations or loop headers. Numeric builtin
-invocations with native lowering can remain inside the trace. Recording executes
-the path once; compiled code starts on subsequent visits, preserving effects.
-Branch/type mismatches restore the snapshot at the exact bytecode boundary.
-Entry traces have separate hotness and failure backoff and do not use the loop
-tier's short-iteration cooldown or loop side-trace recording policy.
-`entry_traces_compiled` and `entry_native_entries` expose their activity in
-`WREN_JIT_STATS`; `native_iterations` still counts native loop iterations only.
+# Upstream Wren
 
-`GuardClass` lowers to heap-tag validation and comparisons against `ReceiverClass`
-in the stable handle sidecar, with no interpreter callback. Class IDs are resolved
-to runtime slots at recording time; class objects, instances, foreign objects and
-class sets retain the interpreter's guard semantics. GC preserves this class key
-when moving objects, and reclaiming a handle clears it before reuse. Native field
-accesses use the slots relocated when the declaring class is linked.
+WrenJIT exists because Wren provided an unusually small, elegant and understandable language/runtime to experiment on. Official Wren documentation is available at <https://wren.io/>.
 
-Use `scripts/jit_entries.wren` to compare repeated calls to a loop-free arithmetic
-method with the entry tier enabled, disabled, and with `WREN_NO_JIT=1`.
-Run the dedicated regressions with `cargo test jit_entry_` and
-`cargo test native_class_guards` (also supported with `--release`).
+In particular, upstream Wren's concurrency model is based on cooperative Fibers, and upstream runtime error handling deliberately uses Fiber abort/`try()` instead of language-level exceptions. WrenJIT preserves Fibers while adding a second structured async/error layer on top.
 
-The tracing tier specializes numeric operations on local registers, including
-arithmetic, comparisons, unsigned bitwise methods, and floating remainder
-(`%` and the typed `FRem` bytecode).
+Before publishing WrenJIT, keep the upstream copyright/license notices required by the Wren code or assets actually carried by the repository.
 
-Numeric getters `abs`, `floor`, `ceil`, and `sqrt` lower to native Cranelift
-operations. `round`, `sin`, `cos`, `tan`, `log`, and `exp` use scalar-only native
-helpers with the same Rust `f64` semantics as the interpreter. Remainder also
-uses a scalar helper, preserving signed zero, NaN, infinity, and division-by-zero
-behavior without approximating it as `a - trunc(a / b) * b`. These helpers
-neither reenter the interpreter nor allocate or access the GC heap.
-`isNan`, `isInfinity`, and `isInteger` lower to native comparisons and selection;
-infinities and NaN are not integers. Num specialization requires the host to
-confirm the standard builtin implementation and guards receivers as numbers.
-All these operations work with the default `no_runtime_calls_in_native_trace`
-restriction; pure scalar math helpers are not VM runtime calls.
+---
 
-Heap operations such as range creation and list slicing still require the
-interpreter. The optional synchronized runtime bridge can execute other
-bytecodes from a trace when `no_runtime_calls_in_native_trace` is false, but it
-is not direct native lowering and remains disabled by default.
+# Final-release checklist
 
-The performance fixes cover three cases:
+Before tagging the frozen WrenJIT release:
 
-- Exhausting the native iteration budget yields to the interpreter without
-  discarding the trace. Long loops can reenter native code.
-- Repeated short exits temporarily cool a trace down. A later invocation can
-  still benefit from native execution.
-- Recording an inner loop stops if execution takes an enclosing loop's
-  backedge. This transient outcome backs off and retries; it does not install
-  the enclosing path as an inner trace or permanently blacklist the header.
-
-Bitwise primitives in both interpreter paths now use unsigned 32-bit semantics,
-as in [original Wren](https://github.com/wren-lang/wren/blob/main/src/vm/wren_core.c).
-
-Run the JIT regressions, including numerical comparisons with the interpreter
-and reference benchmark checksums:
-
-```powershell
-cargo test wren_interpreter::
-cargo test wren_traceir::
-cargo test wren_tracingjit::
-cargo test --release wren_interpreter::
-```
-
-## StickyImmix memory management
-
-The VM uses the local MMTk 0.33 binding in `src/wren_gc.rs`, with StickyImmix
-selected explicitly. NaN-boxed values contain stable handles; their canonical
-atomic slots are updated when Immix defragments. Interpreter and native traces
-share this representation, so moving GC does not change the JIT value ABI.
-
-Objects are promoted by nursery collections. Mutations of lists, maps,
-instances, cells and fiber stacks remember mature owners before storing young
-references. The binding claims MMTk's object log bit once per collection epoch;
-it does not use the probable-write hook that can enqueue duplicate owners.
-Native-resource tracking is also generational: minor collections inspect young
-owners only, while full collections reclaim unreachable mature owners.
-`System.gc()` requests a full collection. Automatic heap pressure can request a
-nursery collection; native-buffer growth requests a full collection because
-small GC owners can retain large external buffers.
-Explicit binding collections wait for completion, retrying when an already
-scheduled nursery collection subsumes a full-heap request.
-
-Compiler-generated reference maps also cover HIR instruction boundaries.
-Interpreter backedges poll the GC request flag, including after a native trace
-yields, without adding a runtime helper to each native loop iteration. Keep the
-native loop/dispatcher budget finite when other mutators need bounded GC
-cooperation. Hand-assembled bytecode must provide reference maps or explicit
-`Safepoint` instructions at its polling boundaries.
-
-Configuration is process-wide and must be identical for every VM:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `WREN_GC_HEAP_MB` | `256` | Fixed managed heap size in MiB; minimum 8. |
-| `WREN_GC_WORKERS` | `2` | Positive number of GC workers. |
-| `WREN_GC_EXTERNAL_MB` | `64` | External-memory growth between GCs that triggers a full collection; 0 disables this trigger, not accounting. |
-| `WREN_GC_STATS` | unset | Print collection counts, pause/rendezvous time, allocation, copying and barrier counters. |
-
-Invalid numeric configuration fails explicitly. Heap size does not cap native
-buffers, handle-table storage, JIT code or compiler metadata. Statistics are
-process-wide, including the querying mutator's unflushed allocation/barrier
-counters; other running mutators flush theirs at collection or detach.
-
-### Embedding and unsafe contracts
-
-- `Value` is not a root. Native callbacks retaining a value across allocations
-  must hold `HostContext::root(value)` and use its `value()` afterward. Use
-  `Interpreter::add_root` / `set_root` / `release_root` for embedding roots.
-- Never retain a payload pointer or Rust reference into a managed object across
-  an allocation, collection or safepoint. Reload the current address from its
-  root/handle. Constructor scratch roots protect outgoing references while
-  allocating their owner.
-- A mutator is thread-affine. Threads waiting on I/O or another mutator must
-  enter `Mutator::with_native` rather than block while Running. Its unsafe
-  callback must not access managed memory, mutate root providers or call GC
-  APIs. Idle mutators on the same OS thread park together, including during
-  attachment of another VM.
-- Custom descriptors must enumerate every strong edge using stable atomic
-  slots. Payloads must be byte-relocatable; use stable external storage for
-  address-sensitive resources. All mutating threads must participate in the
-  safepoint protocol, and writes must use the binding's barriers.
-- Weak handles clear only when their referent is actually reclaimed; a nursery
-  collection may retain an unreachable mature referent. Deferred finalizers
-  run only through `Mutator::run_finalizers`, once, with a rooted argument.
-  Resurrection preserves native resources until actual reclamation. Cleanup
-  callbacks run during GC and must not panic, allocate, resurrect or inspect
-  children.
-
-Run the GC regressions, including old-to-young edges, large objects, finalizer
-resurrection, constructor roots, suspended fibers and multi-mutator rendezvous:
-
-```powershell
-cargo test sticky_
-$env:WREN_GC_HEAP_MB = "8"
-$env:WREN_GC_EXTERNAL_MB = "1"
-$env:MMTK_IMMIX_ALWAYS_DEFRAG = "true"
-$env:MMTK_IMMIX_DEFRAG_EVERY_BLOCK = "true"
-cargo test --release sticky_ -- --test-threads=1
-Remove-Item Env:MMTK_IMMIX_ALWAYS_DEFRAG, Env:MMTK_IMMIX_DEFRAG_EVERY_BLOCK
-```
-
-For an allocation-heavy performance workload with an old-to-young reference
-ring (expected checksum `125000250256`):
-
-```powershell
-cargo build --release
-$env:WREN_GC_STATS = "1"
-.\target\release\WrenJIT.exe scripts/gc.wren
-Remove-Item Env:WREN_GC_STATS, Env:WREN_GC_HEAP_MB, Env:WREN_GC_EXTERNAL_MB
-```
-
-Time repeated runs without other builds or tests running. Defragment-every-block
-is a correctness stress setting, not a performance configuration.
+- [ ] audit README claims against every current source module;
+- [ ] audit every Wren language feature for compatibility or document deviations;
+- [ ] run the full Rust unit/integration suite in release mode;
+- [ ] run all existing GC/JIT/hot-function scripts;
+- [ ] run every new portable benchmark on Wren, WrenLift and WrenJIT;
+- [ ] verify checksums match before recording timing data;
+- [ ] run WrenJIT-only async/timer/exception/module regressions;
+- [ ] fill the performance tables with reproducible medians;
+- [ ] record hardware, OS, compiler versions and git revisions;
+- [ ] verify GC stress with small heaps and repeated forced collections;
+- [ ] verify JIT-off mode separately from JIT-on mode;
+- [ ] verify final package/module search paths on each supported OS;
+- [ ] verify license/attribution files;
+- [ ] tag and freeze WrenJIT;
+- [ ] begin Napalm (Reloaded).

@@ -2319,6 +2319,113 @@ impl FunctionEmitter<'_> {
                 };
                 pc
             }
+            // Tail calls are WIR terminators and therefore have no SSA result
+            // register. Until the bytecode VM grows frame-reusing TailCall opcodes,
+            // lower them exactly as the corresponding call followed by Return. R0
+            // is safe as the dead destination: a tail terminator has no normal-path
+            // live values after the call, and call operands are consumed before the
+            // destination is written on return.
+            TailInvoke {
+                site,
+                receiver,
+                method,
+                args,
+            } => {
+                let dst = Reg(0);
+                let cache = self.inline_cache(*site, *method, None);
+                let arg_regs = args
+                    .iter()
+                    .map(|value| self.reg(*value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let pc = self
+                    .assembler
+                    .emit_invoke(dst, self.reg(*receiver)?, &arg_regs, cache)
+                    .map_err(|error| self.assemble_error(error))?;
+                self.record_safepoint(
+                    node.id,
+                    pc,
+                    CallTransfer::Invoke {
+                        receiver: *receiver,
+                        args,
+                    },
+                )?;
+                self.assembler.emit_a(Opcode::Return, dst.0);
+                return Ok(());
+            }
+            TailInvokeSuper {
+                site,
+                home_class,
+                receiver,
+                method,
+                args,
+            } => {
+                let dst = Reg(0);
+                let cache = self.inline_cache(*site, *method, Some(*home_class));
+                let arg_regs = args
+                    .iter()
+                    .map(|value| self.reg(*value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let pc = self
+                    .assembler
+                    .emit_invoke_super(dst, self.reg(*receiver)?, &arg_regs, cache)
+                    .map_err(|error| self.assemble_error(error))?;
+                self.record_safepoint(
+                    node.id,
+                    pc,
+                    CallTransfer::Invoke {
+                        receiver: *receiver,
+                        args,
+                    },
+                )?;
+                self.assembler.emit_a(Opcode::Return, dst.0);
+                return Ok(());
+            }
+            TailCallDirect { conv, callee, args } => {
+                let dst = Reg(0);
+                let arg_regs = args
+                    .iter()
+                    .map(|value| self.reg(*value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let pc = self
+                    .assembler
+                    .emit_call_direct(dst, *conv, &arg_regs, *callee)
+                    .map_err(|error| self.assemble_error(error))?;
+                self.record_safepoint(
+                    node.id,
+                    pc,
+                    CallTransfer::Direct {
+                        callee: *callee,
+                        args,
+                    },
+                )?;
+                self.assembler.emit_a(Opcode::Return, dst.0);
+                return Ok(());
+            }
+            TailCallClosure {
+                conv,
+                closure,
+                args,
+            } => {
+                let dst = Reg(0);
+                let arg_regs = args
+                    .iter()
+                    .map(|value| self.reg(*value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let pc = self
+                    .assembler
+                    .emit_call_closure(dst, self.reg(*closure)?, *conv, &arg_regs)
+                    .map_err(|error| self.assemble_error(error))?;
+                self.record_safepoint(
+                    node.id,
+                    pc,
+                    CallTransfer::Closure {
+                        closure: *closure,
+                        args,
+                    },
+                )?;
+                self.assembler.emit_a(Opcode::Return, dst.0);
+                return Ok(());
+            }
             CallPrimitive { primitive, args } => {
                 let arg_regs = args
                     .iter()

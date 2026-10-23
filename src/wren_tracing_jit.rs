@@ -52,6 +52,8 @@ use std::mem::offset_of;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod inlining;
+#[cfg(test)]
+mod heap_proof_tests;
 
 use cranelift::codegen::ir::{Type as ClifType, UserFuncName};
 use cranelift::jit::{JITBuilder, JITModule};
@@ -188,6 +190,7 @@ pub const TRACE_MAP_DICTIONARY_SHAPE: u32 = TRACE_HEAP_METADATA_MAX;
 pub const TRACE_PROMISE_PENDING: u32 = 1;
 pub const TRACE_PROMISE_FULFILLED: u32 = 2;
 pub const TRACE_PROMISE_REJECTED: u32 = 3;
+pub const TRACE_PROMISE_CANCELLED: u32 = 4;
 
 /// Stable object kinds exposed to generated code. This is deliberately separate
 /// from the Rust `HeapObject` enum: Cranelift must never depend on Rust enum layout.
@@ -408,9 +411,10 @@ pub trait TraceRuntime {
     fn trace_standard_numeric_method(&self, _function: FuncId, _cache: u32) -> bool { false }
 
     fn trace_method_epoch(&self) -> u64 { 0 }
-    /// Actual bytecode method selected for this receiver, plus its stable class
-    /// key. The native trace must guard both class and method-table version.
-    fn trace_inline_target(&self, _function: FuncId, _cache: u32, _receiver: RegisterWord) -> Option<(FuncId, u64)> { None }
+    /// Actual bytecode method selected for this receiver, plus up to four
+    /// observed receiver classes sharing that target. The native trace must
+    /// guard both the class set and method-table epoch against rebinding.
+    fn trace_inline_target(&self, _function: FuncId, _cache: u32, _receiver: RegisterWord) -> Option<(FuncId, Vec<u64>)> { None }
 
     /// Resolve a GuardClass descriptor to stable runtime receiver-class keys.
     fn trace_class_guard(&self, _function: FuncId, _guard: u32) -> Option<Vec<u64>> { None }
@@ -3470,6 +3474,13 @@ struct CraneliftLoweringState<'a, 'p> {
     /// until the next full runtime/GC epoch. This is a backend-local lowering
     /// cache, not a Trace IR optimization pass.
     heap_addresses: Vec<Option<Value>>,
+    /// Dominating kind/liveness proofs for tagged operands within a GC epoch.
+    /// Metadata is reloaded separately because promise state can change.
+    heap_entries: HashMap<(TraceValueId, u32), (Value, Value)>,
+    /// Successful normalized list indices. Native element stores preserve length;
+    /// all runtime calls invalidate these facts, including non-GC leaf calls.
+    list_indices: HashMap<(TraceValueId, TraceValueId), Value>,
+    list_lengths: HashMap<TraceValueId, TraceValueId>,
     exit_plans: &'p [CompiledExitPlan],
     /// Current loop budget block parameter. The manager derives completed native
     /// iterations from it only when a side exit is materialized.
@@ -3573,6 +3584,9 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 heap_barrier_signature,
                 values: vec![None; self.trace.values.len()],
                 heap_addresses: vec![None; self.trace.values.len()],
+                heap_entries: HashMap::new(),
+                list_indices: HashMap::new(),
+                list_lengths: HashMap::new(),
                 exit_plans: &self.exit_plans,
                 native_budget_remaining: None,
                 native_budget_initial: self.options.native_loop_iteration_budget,
@@ -3648,6 +3662,14 @@ impl<'a> CraneliftTraceCompiler<'a> {
 
             state.builder.ins().jump(loop_block, &[]);
             state.builder.switch_to_block(loop_block);
+
+            // A runtime operation in the body may invalidate preheader proofs on
+            // the backedge, even though it follows their first body consumer.
+            if self.trace.nodes.iter().any(|node| matches!(node.kind,
+                TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. }))
+            {
+                state.invalidate_heap_proofs();
+            }
 
             for (phi, variable) in self.trace.loop_phis.iter().zip(phi_vars.iter().copied()) {
                 let value = state.builder.use_var(variable);
@@ -4534,6 +4556,9 @@ impl CraneliftLoweringState<'_, '_> {
         exit: SideExitId,
     ) -> Result<(Value, Value), TracingJitError> {
         let canonical = self.trace.canonical_value(value);
+        if let Some(&entry) = self.heap_entries.get(&(canonical, expected as u32)) {
+            return Ok(entry);
+        }
         let proven = self
             .proven_heap_entry_kind(canonical)
             .map(Self::runtime_heap_kind)
@@ -4562,7 +4587,9 @@ impl CraneliftLoweringState<'_, '_> {
             return Ok((entry, address));
         }
         let tagged = self.lower_value(canonical)?;
-        self.guard_heap_entry(tagged, expected, exit)
+        let entry = self.guard_heap_entry(tagged, expected, exit)?;
+        self.heap_entries.insert((canonical, expected as u32), entry);
+        Ok(entry)
     }
 
     fn heap_entry_with_metadata_for_value(
@@ -4571,23 +4598,10 @@ impl CraneliftLoweringState<'_, '_> {
         expected: TraceHeapKind,
         exit: SideExitId,
     ) -> Result<(Value, Value, Value), TracingJitError> {
-        let canonical = self.trace.canonical_value(value);
-        let proven = self
-            .proven_heap_entry_kind(canonical)
-            .map(Self::runtime_heap_kind)
-            == Some(expected);
-        if proven {
-            let (entry, address) = self.heap_entry_for_value(canonical, expected, exit)?;
-            let metadata = self.builder.ins().load(
-                types::I32,
-                Self::trusted_mem(),
-                entry,
-                offset_of!(TraceHeapEntry, kind) as i32,
-            );
-            return Ok((entry, address, metadata));
-        }
-        let tagged = self.lower_value(canonical)?;
-        self.guard_heap_entry_with_metadata(tagged, expected, exit)
+        let (entry, address) = self.heap_entry_for_value(value, expected, exit)?;
+        let metadata = self.builder.ins().load(types::I32, Self::trusted_mem(), entry,
+            offset_of!(TraceHeapEntry, kind) as i32);
+        Ok((entry, address, metadata))
     }
 
     /// Resolve a value already proven to carry the heap tag. The returned
@@ -4819,6 +4833,27 @@ impl CraneliftLoweringState<'_, '_> {
         Ok(normalized)
     }
 
+    fn invalidate_heap_proofs(&mut self) {
+        self.heap_addresses.fill(None);
+        self.heap_entries.clear();
+        self.list_indices.clear();
+        self.list_lengths.clear();
+    }
+
+    fn validated_list_index(
+        &mut self, list: TraceValueId, index: TraceValueId, entry: Value, exit: SideExitId,
+    ) -> Result<Value, TracingJitError> {
+        let key = (self.trace.canonical_value(list), self.trace.canonical_value(index));
+        if let Some(&normalized) = self.list_indices.get(&key) {
+            return Ok(normalized);
+        }
+        let value = self.lower_value(index)?;
+        let len = self.heap_entry_len(entry);
+        let normalized = self.normalize_list_index(value, len, exit)?;
+        self.list_indices.insert(key, normalized);
+        Ok(normalized)
+    }
+
     fn heap_element_address(&mut self, data: Value, index: Value) -> Value {
         let scale = self.builder.ins().iconst(types::I64, std::mem::size_of::<RegisterWord>() as i64);
         let offset = self.builder.ins().imul(index, scale);
@@ -4897,7 +4932,7 @@ impl CraneliftLoweringState<'_, '_> {
             } => {
                 // A full runtime boundary may collect and move objects. Do not let
                 // any backend-local moving address flow past this epoch.
-                self.heap_addresses.fill(None);
+                self.invalidate_heap_proofs();
                 let callee = self.builder.ins().load(
                     self.pointer_type,
                     Self::trusted_mem(),
@@ -4945,7 +4980,7 @@ impl CraneliftLoweringState<'_, '_> {
             RuntimeCall { location, next } => {
                 // Calls may allocate/collect even when they synchronously return to
                 // the same Wren frame, so moving addresses die at this boundary.
-                self.heap_addresses.fill(None);
+                self.invalidate_heap_proofs();
                 if next.0 & TRACE_RUNTIME_CALL_FLAG != 0 {
                     return Err(self.error("RuntimeCall continuation PC uses reserved high bit"));
                 }
@@ -5183,6 +5218,8 @@ impl CraneliftLoweringState<'_, '_> {
                 length,
                 exit,
             } => {
+                let index_id = self.trace.canonical_value(*index);
+                let length_id = self.trace.canonical_value(*length);
                 let index = self.lower_value(*index)?;
                 let length = self.lower_value(*length)?;
                 let negative = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, index, 0);
@@ -5194,6 +5231,10 @@ impl CraneliftLoweringState<'_, '_> {
                 let too_large = self.bool32(too_large);
                 let failure = self.bool_or(negative, too_large);
                 self.emit_side_exit(*exit, failure)?;
+                if let Some(&list) = self.list_lengths.get(&length_id) {
+                    let normalized = self.builder.ins().uextend(types::I64, index);
+                    self.list_indices.insert((list, index_id), normalized);
+                }
             }
 
             GuardEq { lhs, rhs, exit } => {
@@ -5617,9 +5658,8 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             GuardHeapObject { value, kind, exit } => {
-                let tagged = self.lower_value(*value)?;
-                let (entry, address, _) = self.guard_heap_entry_with_metadata(
-                    tagged,
+                let (entry, address) = self.heap_entry_for_value(
+                    *value,
                     Self::runtime_heap_kind(*kind),
                     *exit,
                 )?;
@@ -5683,13 +5723,12 @@ impl CraneliftLoweringState<'_, '_> {
                 let len = self.heap_entry_len(entry);
                 let len = self.builder.ins().ireduce(types::I32, len);
                 self.cache_value(one_result(node)?, len);
+                self.list_lengths.insert(one_result(node)?, self.trace.canonical_value(*list));
             }
 
             HeapListGet { list, index, exit } => {
-                let index = self.lower_value(*index)?;
                 let (entry, _) = self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
-                let len = self.heap_entry_len(entry);
-                let index = self.normalize_list_index(index, len, *exit)?;
+                let index = self.validated_list_index(*list, *index, entry, *exit)?;
                 let data = self.heap_entry_data(entry);
                 let address = self.heap_element_address(data, index);
                 let result = self.builder.ins().load(
@@ -5702,12 +5741,10 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             HeapListSet { list, index, value, exit } => {
-                let index = self.lower_value(*index)?;
                 let tagged_value = self.lower_value(*value)?;
                 let (entry, owner_address) =
                     self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
-                let len = self.heap_entry_len(entry);
-                let index = self.normalize_list_index(index, len, *exit)?;
+                let index = self.validated_list_index(*list, *index, entry, *exit)?;
                 let data = self.heap_entry_data(entry);
                 let address = self.heap_element_address(data, index);
                 self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
@@ -5784,6 +5821,7 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             ReadBarrier { value } => {
+                self.invalidate_heap_proofs();
                 let value = self.lower_value(*value)?;
                 self.cache_value(one_result(node)?, value);
             }

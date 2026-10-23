@@ -23,6 +23,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::time::Duration;
 use crate::wren_gc::{
     Collector as GcCollector, Config as GcConfig, Descriptor as GcDescriptor, Mutator as GcMutator,
     Object as GcObject, RootProvider as GcRootProvider, RootRegistration as GcRootRegistration,
@@ -30,11 +31,14 @@ use crate::wren_gc::{
     RAW_CODEC as GC_RAW_CODEC,
 };
 use crate::wren_trace_ir::{FrameSlot, TraceConstant, TraceId, TraceLocation};
+#[path = "wren_event_loop.rs"]
+pub mod wren_event_loop;
+use self::wren_event_loop::{CancelOutcome, EventId, FiredEvent, WrenEventLoop};
 use crate::wren_tracing_jit::{
     JitAction, TraceActivation, TraceActivationInputs, TraceHeapEntry,
     TraceHeapKind, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats,
     TRACE_HEAP_CHUNK_BITS, TRACE_HEAP_CHUNK_MASK, TRACE_HEAP_CHUNK_SIZE,
-    TRACE_PROMISE_FULFILLED, TRACE_PROMISE_PENDING, TRACE_PROMISE_REJECTED,
+    TRACE_PROMISE_CANCELLED, TRACE_PROMISE_FULFILLED, TRACE_PROMISE_PENDING, TRACE_PROMISE_REJECTED,
 };
 
 use crate::wren_bytecode::{
@@ -529,6 +533,29 @@ impl WrenMap {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum CancelHandle {
+    Event(EventId),
+    Task(u32),
+    Promise(Value),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PromiseOutcome {
+    Fulfilled(Value),
+    Rejected(Value),
+    Cancelled(Value),
+}
+
+impl PromiseOutcome {
+    #[inline]
+    fn value(self) -> Value {
+        match self {
+            Self::Fulfilled(value) | Self::Rejected(value) | Self::Cancelled(value) => value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum PromiseWaiter {
     Resume {
         fiber: u32,
@@ -540,6 +567,45 @@ enum PromiseWaiter {
     Forward {
         promise: Value,
     },
+    /// Completion edge for one non-overlapping Timer.every() callback.
+    IntervalTick {
+        promise: Value,
+        timer: EventId,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RuntimeEvent {
+    PromiseWaiter {
+        promise: Value,
+        waiter: PromiseWaiter,
+        outcome: PromiseOutcome,
+    },
+    TimerFire {
+        promise: Value,
+        callback: Option<Value>,
+        interval: bool,
+    },
+}
+
+impl RuntimeEvent {
+    fn visit_values(self, mut visit: impl FnMut(Value)) {
+        match self {
+            RuntimeEvent::PromiseWaiter { promise, waiter, outcome } => {
+                visit(promise);
+                visit(outcome.value());
+                match waiter {
+                    PromiseWaiter::Resume { fiber_object, .. } => visit(fiber_object),
+                    PromiseWaiter::Forward { promise }
+                    | PromiseWaiter::IntervalTick { promise, .. } => visit(promise),
+                }
+            }
+            RuntimeEvent::TimerFire { promise, callback, .. } => {
+                visit(promise);
+                if let Some(callback) = callback { visit(callback); }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -547,9 +613,12 @@ enum PromiseState {
     Pending {
         producer: Option<Value>,
         waiters: Vec<PromiseWaiter>,
+        cancel: Option<CancelHandle>,
+        cancel_requested: bool,
     },
     Fulfilled(Value),
     Rejected(Value),
+    Cancelled(Value),
 }
 
 struct PromiseCell {
@@ -815,6 +884,10 @@ impl HandleTable {
                         promise_value = value.raw_bits();
                         TRACE_PROMISE_REJECTED
                     }
+                    PromiseState::Cancelled(value) => {
+                        promise_value = value.raw_bits();
+                        TRACE_PROMISE_CANCELLED
+                    }
                 };
                 (TraceHeapKind::Promise, 0, 0, metadata)
             }
@@ -1056,18 +1129,21 @@ unsafe fn trace_promise(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     let HeapObject::Promise { state } = &managed.object else { return; };
     // SAFETY: GC invokes custom tracing only while all mutators are stopped.
     match unsafe { state.get() } {
-        PromiseState::Pending { producer, waiters } => {
+        PromiseState::Pending { producer, waiters, .. } => {
             if let Some(value) = producer {
                 visit_value(*value, visitor);
             }
             for waiter in waiters {
                 match *waiter {
                     PromiseWaiter::Resume { fiber_object, .. } => visit_value(fiber_object, visitor),
-                    PromiseWaiter::Forward { promise } => visit_value(promise, visitor),
+                    PromiseWaiter::Forward { promise }
+                    | PromiseWaiter::IntervalTick { promise, .. } => visit_value(promise, visitor),
                 }
             }
         }
-        PromiseState::Fulfilled(value) | PromiseState::Rejected(value) => {
+        PromiseState::Fulfilled(value)
+        | PromiseState::Rejected(value)
+        | PromiseState::Cancelled(value) => {
             visit_value(*value, visitor);
         }
     }
@@ -1166,7 +1242,7 @@ fn external_bytes_for(object: &HeapObject) -> usize {
             match unsafe { state.get() } {
                 PromiseState::Pending { waiters, .. } =>
                     waiters.capacity() * std::mem::size_of::<PromiseWaiter>(),
-                PromiseState::Fulfilled(_) | PromiseState::Rejected(_) => 0,
+                PromiseState::Fulfilled(_) | PromiseState::Rejected(_) | PromiseState::Cancelled(_) => 0,
             }
         }
         HeapObject::AsyncTaskObject { state, .. } | HeapObject::FiberObject { state, .. } => {
@@ -1322,16 +1398,19 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         HeapObject::Promise { state } => {
             // SAFETY: allocation root collection runs on the owning mutator.
             match unsafe { state.get() } {
-                PromiseState::Pending { producer, waiters } => {
+                PromiseState::Pending { producer, waiters, .. } => {
                     if let Some(value) = producer { push_value_handle(*value, roots); }
                     for waiter in waiters {
                         match *waiter {
                             PromiseWaiter::Resume { fiber_object, .. } => push_value_handle(fiber_object, roots),
-                            PromiseWaiter::Forward { promise } => push_value_handle(promise, roots),
+                            PromiseWaiter::Forward { promise }
+                            | PromiseWaiter::IntervalTick { promise, .. } => push_value_handle(promise, roots),
                         }
                     }
                 }
-                PromiseState::Fulfilled(value) | PromiseState::Rejected(value) => {
+                PromiseState::Fulfilled(value)
+                | PromiseState::Rejected(value)
+                | PromiseState::Cancelled(value) => {
                     push_value_handle(*value, roots);
                 }
             }
@@ -2163,6 +2242,7 @@ impl HostContext<'_> {
                 PromiseState::Pending { .. } => "<promise:pending>".to_owned(),
                 PromiseState::Fulfilled(_) => "<promise:fulfilled>".to_owned(),
                 PromiseState::Rejected(_) => "<promise:rejected>".to_owned(),
+                PromiseState::Cancelled(_) => "<promise:cancelled>".to_owned(),
             },
             Some(HeapObject::AsyncTaskObject { task, .. }) => format!("<async-task#{task}>"),
             Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber#{fiber}>"),
@@ -3081,9 +3161,14 @@ pub enum NativeBuiltin {
     FiberIsDone,
     PromiseResolve,
     PromiseReject,
+    PromiseCancel,
     PromiseIsPending,
     PromiseIsFulfilled,
     PromiseIsRejected,
+    PromiseIsCancelled,
+    TimerDelay,
+    TimerMicrotask,
+    TimerEvery,
     SystemGc,
 }
 
@@ -3610,6 +3695,13 @@ pub struct Interpreter<'p> {
     free_fibers: Vec<u32>,
     /// Cooperative FIFO run queue for internal async tasks and resumed awaiters.
     ready_async: VecDeque<u32>,
+    /// Microtasks and timer deadlines. Runtime events hold managed Values and are
+    /// therefore included in both active and persistent GC root snapshots.
+    event_loop: WrenEventLoop<RuntimeEvent>,
+    /// Stable Wren error value used by the fourth Promise terminal state.
+    /// Allocated once so cancellation never needs a managed allocation while a
+    /// runtime event is temporarily outside the event-loop root set.
+    cancelled_error: Value,
     fiber_trace_metadata: Arc<FiberTraceMetadata>,
     current_fiber: u32,
     run_state: RunState,
@@ -3695,6 +3787,8 @@ unsafe impl GcRootProvider for VmRootProvider {
                 root(unsafe { fiber.get() }.object);
             }
         }
+        vm.event_loop.for_each_payload(|event| (*event).visit_values(&mut root));
+        root(vm.cancelled_error);
         root(vm.result);
     }
 }
@@ -3886,6 +3980,11 @@ impl<'p> Interpreter<'p> {
         init_roots.push(main_object);
         unsafe { main.get_mut() }.object = main_object;
         heap.set_stack_owner(main_object);
+
+        let cancelled_error = heap.alloc(HeapObject::String(WrenString::new(Arc::from(
+            &b"CancelledError: Promise cancelled"[..],
+        ))));
+        init_roots.push(cancelled_error);
         let last_gc_collections = heap.collection_count();
 
         Ok(Self {
@@ -3904,6 +4003,8 @@ impl<'p> Interpreter<'p> {
             fibers: vec![Some(main)],
             free_fibers: Vec::new(),
             ready_async: VecDeque::new(),
+            event_loop: WrenEventLoop::default(),
+            cancelled_error,
             fiber_trace_metadata,
             current_fiber: 0,
             run_state: RunState::Running,
@@ -3951,6 +4052,7 @@ impl<'p> Interpreter<'p> {
                 + self.classes.len()
                 + self.modules.len()
                 + self.roots.len()
+                + self.event_loop.len() * 3
                 + 8,
         );
         let mut push = |value: Value| {
@@ -3981,6 +4083,8 @@ impl<'p> Interpreter<'p> {
                 push(unsafe { fiber.get() }.object);
             }
         }
+        self.event_loop.for_each_payload(|event| (*event).visit_values(&mut push));
+        push(self.cancelled_error);
         push(self.result);
         self.persistent_roots.replace(roots);
     }
@@ -4267,25 +4371,34 @@ impl<'p> Interpreter<'p> {
 
     #[inline(never)]
     fn dispatch_loop(&mut self) {
-        while self.run_state == RunState::Running {
-            if self.hot_frame.is_null() {
-                self.fail(RuntimeError::new("running fiber has no frame"));
-                break;
+        loop {
+            while self.run_state == RunState::Running {
+                if self.hot_frame.is_null() {
+                    self.fail(RuntimeError::new("running fiber has no frame"));
+                    break;
+                }
+
+                let pc = self.hot_pc as usize;
+
+                let prepared = unsafe { &*self.hot_function };
+                if pc >= prepared.ops.len() {
+                    self.fail(RuntimeError::new("program counter is outside function"));
+                    break;
+                }
+                // The vector bases are cached when a frame becomes hot, mirroring
+                // Wren's cached ip/fn/stackStart locals. Normal dispatch is now two
+                // pointer adds and one indirect call, with no Vec traversal.
+                let handler = unsafe { *self.hot_handlers.add(pc) };
+                let op = unsafe { self.hot_ops.add(pc) };
+                unsafe { handler(self, op) };
             }
 
-            let pc = self.hot_pc as usize;
-
-            let prepared = unsafe { &*self.hot_function };
-            if pc >= prepared.ops.len() {
-                self.fail(RuntimeError::new("program counter is outside function"));
+            if self.run_state == RunState::Failed {
                 break;
             }
-            // The vector bases are cached when a frame becomes hot, mirroring
-            // Wren's cached ip/fn/stackStart locals. Normal dispatch is now two
-            // pointer adds and one indirect call, with no Vec traversal.
-            let handler = unsafe { *self.hot_handlers.add(pc) };
-            let op = unsafe { self.hot_ops.add(pc) };
-            unsafe { handler(self, op) };
+            if !self.drive_event_loop_until_runnable() {
+                break;
+            }
         }
     }
 
@@ -5102,9 +5215,7 @@ impl<'p> Interpreter<'p> {
         self.ready_async.push_back(id);
     }
 
-    /// Select the next runnable async continuation. The public Fiber API never
-    /// uses this queue; it keeps its explicit call/transfer graph unchanged.
-    fn schedule_next_ready(&mut self) -> bool {
+    fn schedule_next_ready_raw(&mut self) -> bool {
         while let Some(id) = self.ready_async.pop_front() {
             let is_ready = self
                 .fibers
@@ -5123,6 +5234,53 @@ impl<'p> Interpreter<'p> {
             return true;
         }
         false
+    }
+
+    /// Select the next runnable continuation. Promise deliveries and explicit
+    /// Timer.microtask jobs have priority at every cooperative task boundary.
+    fn schedule_next_ready(&mut self) -> bool {
+        self.drain_runtime_microtasks();
+        if self.run_state == RunState::Failed {
+            return false;
+        }
+        self.schedule_next_ready_raw()
+    }
+
+    fn drain_runtime_microtasks(&mut self) {
+        while let Some(event) = self.event_loop.pop_microtask() {
+            self.process_runtime_event(event);
+            if self.run_state == RunState::Failed {
+                break;
+            }
+        }
+    }
+
+    /// Drive timers only when no ordinary continuation is runnable. The current
+    /// single-thread runtime parks until the nearest deadline instead of polling.
+    /// The future N:M scheduler can replace park_timeout with worker unpark/reactor
+    /// integration without changing Timer/Promise semantics.
+    fn drive_event_loop_until_runnable(&mut self) -> bool {
+        loop {
+            self.drain_runtime_microtasks();
+            if self.run_state == RunState::Failed {
+                return false;
+            }
+            if self.schedule_next_ready_raw() {
+                return true;
+            }
+
+            if let Some(event) = self.event_loop.pop_due_timer() {
+                self.process_runtime_event(event);
+                continue;
+            }
+
+            let Some(wait) = self.event_loop.time_until_next() else {
+                return false;
+            };
+            if !wait.is_zero() {
+                std::thread::park_timeout(wait);
+            }
+        }
     }
 
     fn install_execution_cell(&mut self, id: u32, cell: Arc<FiberCell>) {
@@ -5147,6 +5305,8 @@ impl<'p> Interpreter<'p> {
         let promise = self.allocate_promise(PromiseState::Pending {
             producer: None,
             waiters: Vec::new(),
+            cancel: None,
+            cancel_requested: false,
         });
         // A second managed allocation follows before the Promise becomes reachable
         // from either caller registers or its producer task.
@@ -5157,6 +5317,10 @@ impl<'p> Interpreter<'p> {
         } else {
             self.fibers.len() as u32
         };
+        let promise_cell = self.promise_cell(promise)?;
+        if let PromiseState::Pending { cancel, .. } = unsafe { promise_cell.get_mut() } {
+            *cancel = Some(CancelHandle::Task(id));
+        }
         let mut task_state = FiberState::new(Value::NULL, FiberStatus::Ready);
         task_state.async_promise = Some(promise);
         let task = Arc::new(FiberCell::new(task_state));
@@ -5172,7 +5336,6 @@ impl<'p> Interpreter<'p> {
         // The pending Promise owns its producer while the task is runnable or
         // suspended. This edge is removed when the Promise settles.
         self.heap.remember_owner(promise);
-        let promise_cell = self.promise_cell(promise)?;
         if let PromiseState::Pending { producer, .. } = unsafe { promise_cell.get_mut() } {
             *producer = Some(task_object);
         }
@@ -5284,7 +5447,7 @@ impl<'p> Interpreter<'p> {
         self.ready_async.push_back(fiber);
     }
 
-    fn reject_execution(&mut self, id: u32, reason: Value) {
+    fn fail_execution_from_promise(&mut self, id: u32, reason: Value, cancelled: bool) {
         let owner = match self.fibers.get(id as usize).and_then(|slot| slot.as_ref()) {
             Some(cell) => unsafe { cell.get() }.object,
             None => return,
@@ -5307,8 +5470,9 @@ impl<'p> Interpreter<'p> {
 
         if id == 0 {
             self.switch_current_fiber(0);
+            let label = if cancelled { "cancelled" } else { "rejected" };
             self.error = Some(RuntimeError::new(format!(
-                "awaited Promise rejected: {:?}", reason
+                "awaited Promise {label}: {:?}", reason
             )));
             self.run_state = RunState::Failed;
             self.clear_hot_frame();
@@ -5316,8 +5480,21 @@ impl<'p> Interpreter<'p> {
         }
 
         if let Some(promise) = result_promise {
-            let _ = self.settle_promise(promise, true, reason);
+            let outcome = if cancelled {
+                PromiseOutcome::Cancelled(reason)
+            } else {
+                PromiseOutcome::Rejected(reason)
+            };
+            let _ = self.settle_promise_outcome(promise, outcome);
         }
+    }
+
+    fn reject_execution(&mut self, id: u32, reason: Value) {
+        self.fail_execution_from_promise(id, reason, false);
+    }
+
+    fn cancel_execution(&mut self, id: u32, reason: Value) {
+        self.fail_execution_from_promise(id, reason, true);
     }
 
     fn reject_promise_waiter(
@@ -5340,18 +5517,51 @@ impl<'p> Interpreter<'p> {
         }
     }
 
+    fn cancel_promise_waiter(
+        &mut self,
+        promise: Value,
+        fiber: u32,
+        fiber_object: Value,
+        reason: Value,
+    ) {
+        let valid = self
+            .fibers
+            .get(fiber as usize)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|cell| {
+                let state = unsafe { cell.get() };
+                state.object == fiber_object && state.awaiting_promise == Some(promise)
+            });
+        if valid {
+            self.cancel_execution(fiber, reason);
+        }
+    }
+
     fn settle_promise(
         &mut self,
         promise: Value,
         rejected: bool,
         value: Value,
     ) -> Result<(), RuntimeError> {
+        let outcome = if rejected {
+            PromiseOutcome::Rejected(value)
+        } else {
+            PromiseOutcome::Fulfilled(value)
+        };
+        self.settle_promise_outcome(promise, outcome)
+    }
+
+    fn settle_promise_outcome(
+        &mut self,
+        promise: Value,
+        outcome: PromiseOutcome,
+    ) -> Result<(), RuntimeError> {
         let cell = self.promise_cell(promise)?;
         self.heap.remember_owner(promise);
-        let replacement = if rejected {
-            PromiseState::Rejected(value)
-        } else {
-            PromiseState::Fulfilled(value)
+        let replacement = match outcome {
+            PromiseOutcome::Fulfilled(value) => PromiseState::Fulfilled(value),
+            PromiseOutcome::Rejected(value) => PromiseState::Rejected(value),
+            PromiseOutcome::Cancelled(value) => PromiseState::Cancelled(value),
         };
         let previous = unsafe { std::mem::replace(cell.get_mut(), replacement) };
         let waiters = match previous {
@@ -5361,28 +5571,387 @@ impl<'p> Interpreter<'p> {
                 return Err(RuntimeError::new("Promise has already been settled"));
             }
         };
-        // Publish settled state/value to the JIT sidecar before waking waiters.
+
+        // Publish settled state/value to the JIT sidecar immediately, but defer
+        // every continuation edge through the microtask queue. Settlement and
+        // execution are intentionally separate to avoid recursive re-entrancy.
         self.heap.refresh_jit_view(promise);
         self.heap.set_external_bytes(promise, 0);
-
         for waiter in waiters {
-            match waiter {
-                PromiseWaiter::Resume { fiber, fiber_object, dst } => {
-                    if rejected {
-                        self.reject_promise_waiter(promise, fiber, fiber_object, value);
+            self.event_loop.enqueue_microtask(RuntimeEvent::PromiseWaiter {
+                promise,
+                waiter,
+                outcome,
+            });
+        }
+        Ok(())
+    }
+
+    fn set_promise_cancel_handle(
+        &mut self,
+        promise: Value,
+        handle: Option<CancelHandle>,
+    ) -> Result<(), RuntimeError> {
+        let cell = self.promise_cell(promise)?;
+        match unsafe { cell.get_mut() } {
+            PromiseState::Pending { cancel, .. } => {
+                *cancel = handle;
+                Ok(())
+            }
+            _ => Err(RuntimeError::new("cannot attach cancellation to a settled Promise")),
+        }
+    }
+
+    fn promise_cancel_requested(&self, promise: Value) -> bool {
+        self.promise_cell(promise)
+            .ok()
+            .is_some_and(|cell| matches!(unsafe { cell.get() }, PromiseState::Pending { cancel_requested: true, .. }))
+    }
+
+    #[inline]
+    fn cancellation_reason(&self) -> Value {
+        self.cancelled_error
+    }
+
+    fn cancel_async_task(&mut self, id: u32) -> bool {
+        let Some(cell) = self.fibers.get(id as usize).and_then(|slot| slot.as_ref()).cloned() else {
+            return false;
+        };
+        let state = unsafe { cell.get_mut() };
+        if state.async_promise.is_none() || state.status == FiberStatus::Running {
+            return false;
+        }
+        if matches!(state.status, FiberStatus::Done | FiberStatus::Failed) {
+            return false;
+        }
+
+        state.status = FiberStatus::Failed;
+        state.error = Value::NULL;
+        state.awaiting_promise = None;
+        state.suspend_dst = None;
+        state.frames.clear();
+        state.register_top = 0;
+        state.async_promise = None;
+        true
+    }
+
+    fn cancel_promise_value(&mut self, promise: Value) -> Result<bool, RuntimeError> {
+        let cell = self.promise_cell(promise)?;
+        let handle = match unsafe { cell.get() } {
+            PromiseState::Pending {
+                cancel: Some(handle),
+                cancel_requested: false,
+                ..
+            } => *handle,
+            _ => return Ok(false),
+        };
+
+        match handle {
+            CancelHandle::Event(id) => match self.event_loop.cancel(id) {
+                CancelOutcome::Cancelled => {
+                    let reason = self.cancellation_reason();
+                    let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
+                    Ok(true)
+                }
+                CancelOutcome::InFlightInterval => {
+                    let cell = self.promise_cell(promise)?;
+                    if let PromiseState::Pending { cancel, cancel_requested, .. } = unsafe { cell.get_mut() } {
+                        *cancel = None;
+                        *cancel_requested = true;
+                        Ok(true)
                     } else {
-                        self.resume_promise_waiter(promise, fiber, fiber_object, dst, value);
+                        Ok(false)
                     }
                 }
-                PromiseWaiter::Forward { promise: target } => {
-                    // A Forward waiter is installed only on a still-pending target.
-                    // If user/runtime code has already settled it, preserve that
-                    // first settlement and ignore the stale forwarding edge.
-                    let _ = self.settle_promise(target, rejected, value);
+                CancelOutcome::NotFound => {
+                    let cell = self.promise_cell(promise)?;
+                    if let PromiseState::Pending { cancel, .. } = unsafe { cell.get_mut() } {
+                        *cancel = None;
+                    }
+                    Ok(false)
+                }
+            },
+            CancelHandle::Task(id) => {
+                if !self.cancel_async_task(id) {
+                    return Ok(false);
+                }
+                let reason = self.cancellation_reason();
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
+                Ok(true)
+            }
+            CancelHandle::Promise(inner) => {
+                // Cancel the adopted producer, but settle the observable outer
+                // Promise immediately once cancellation is accepted. The stale
+                // Forward waiter becomes harmless because Promise settlement is
+                // first-wins. This keeps `cancel(); isCancelled` intuitive even
+                // when the producer needs cooperative cleanup of its own.
+                if !self.cancel_promise_value(inner)? {
+                    return Ok(false);
+                }
+                let reason = self.cancellation_reason();
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
+                Ok(true)
+            }
+        }
+    }
+
+    fn timer_duration(value: Value, require_positive: bool) -> Result<Duration, RuntimeError> {
+        let millis = value
+            .as_num()
+            .ok_or_else(|| RuntimeError::new("Timer duration must be a Num"))?;
+        if !millis.is_finite() || millis < 0.0 {
+            return Err(RuntimeError::new("Timer duration must be a finite non-negative number of milliseconds"));
+        }
+        if require_positive && millis == 0.0 {
+            return Err(RuntimeError::new("Timer.every duration must be greater than zero"));
+        }
+        let nanos = millis * 1_000_000.0;
+        if nanos > u64::MAX as f64 {
+            return Err(RuntimeError::new("Timer duration is too large"));
+        }
+        Ok(Duration::from_nanos(nanos.round() as u64))
+    }
+
+    fn timer_callback_function(&self, callback: Value) -> Result<u32, RuntimeError> {
+        let function = match self.heap.get(callback) {
+            Some(HeapObject::Closure { function_index, .. }) => *function_index,
+            _ => return Err(RuntimeError::new("Timer callback must be a function")),
+        };
+        if self.prepared.functions[function as usize].arity != 0 {
+            return Err(RuntimeError::new("Timer callback must take zero arguments"));
+        }
+        Ok(function)
+    }
+
+    fn spawn_timer_callback(&mut self, callback: Value) -> Result<Value, RuntimeError> {
+        let function = self.timer_callback_function(callback)?;
+        self.spawn_async_task(function, None, &[], Some(callback))
+    }
+
+    fn allocate_pending_promise(&mut self) -> Value {
+        self.allocate_promise(PromiseState::Pending {
+            producer: None,
+            waiters: Vec::new(),
+            cancel: None,
+            cancel_requested: false,
+        })
+    }
+
+    fn schedule_timer_delay(
+        &mut self,
+        delay: Duration,
+        callback: Option<Value>,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(callback) = callback {
+            self.timer_callback_function(callback)?;
+        }
+        let promise = self.allocate_pending_promise();
+        let id = self
+            .event_loop
+            .set_timeout(
+                delay,
+                RuntimeEvent::TimerFire { promise, callback, interval: false },
+            )
+            .ok_or_else(|| RuntimeError::new("Timer.delay duration exceeds the platform timer range"))?;
+        self.set_promise_cancel_handle(promise, Some(CancelHandle::Event(id)))?;
+        Ok(promise)
+    }
+
+    fn schedule_timer_microtask(&mut self, callback: Value) -> Result<Value, RuntimeError> {
+        self.timer_callback_function(callback)?;
+        let promise = self.allocate_pending_promise();
+        let id = self.event_loop.enqueue_microtask(RuntimeEvent::TimerFire {
+            promise,
+            callback: Some(callback),
+            interval: false,
+        });
+        self.set_promise_cancel_handle(promise, Some(CancelHandle::Event(id)))?;
+        Ok(promise)
+    }
+
+    fn schedule_timer_every(
+        &mut self,
+        period: Duration,
+        callback: Value,
+    ) -> Result<Value, RuntimeError> {
+        self.timer_callback_function(callback)?;
+        let promise = self.allocate_pending_promise();
+        let id = self
+            .event_loop
+            .set_interval(
+                period,
+                RuntimeEvent::TimerFire { promise, callback: Some(callback), interval: true },
+            )
+            .ok_or_else(|| RuntimeError::new("Timer.every duration is zero or exceeds the platform timer range"))?;
+        self.set_promise_cancel_handle(promise, Some(CancelHandle::Event(id)))?;
+        Ok(promise)
+    }
+
+    fn attach_interval_tick_waiter(
+        &mut self,
+        tick: Value,
+        interval: Value,
+        timer: EventId,
+    ) -> Result<(), RuntimeError> {
+        let cell = self.promise_cell(tick)?;
+        match unsafe { cell.get_mut() } {
+            PromiseState::Pending { waiters, .. } => {
+                self.heap.remember_owner(tick);
+                waiters.push(PromiseWaiter::IntervalTick { promise: interval, timer });
+                self.heap.set_external_bytes(
+                    tick,
+                    waiters.capacity() * std::mem::size_of::<PromiseWaiter>(),
+                );
+                Ok(())
+            }
+            PromiseState::Fulfilled(value) => {
+                let value = *value;
+                self.handle_interval_tick(interval, timer, PromiseOutcome::Fulfilled(value));
+                Ok(())
+            }
+            PromiseState::Rejected(value) => {
+                let value = *value;
+                self.handle_interval_tick(interval, timer, PromiseOutcome::Rejected(value));
+                Ok(())
+            }
+            PromiseState::Cancelled(value) => {
+                let value = *value;
+                self.handle_interval_tick(interval, timer, PromiseOutcome::Cancelled(value));
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_interval_tick(&mut self, promise: Value, timer: EventId, outcome: PromiseOutcome) {
+        let pending = self.promise_cell(promise).ok().is_some_and(|cell| {
+            matches!(unsafe { cell.get() }, PromiseState::Pending { .. })
+        });
+        if !pending {
+            let _ = self.event_loop.cancel(timer);
+            return;
+        }
+
+        if self.promise_cancel_requested(promise) {
+            let reason = self.cancellation_reason();
+            let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
+            return;
+        }
+
+        match outcome {
+            PromiseOutcome::Fulfilled(_) => {
+                if !self.event_loop.complete_interval(timer) {
+                    // A live interval Promise must never remain pending after its
+                    // scheduling handle disappears. Cancellation normally sets
+                    // cancel_requested and is handled above; this is the stale-
+                    // handle safety net.
+                    let reason = self.cancellation_reason();
+                    let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
+                }
+            }
+            PromiseOutcome::Rejected(reason) => {
+                let _ = self.event_loop.cancel(timer);
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Rejected(reason));
+            }
+            PromiseOutcome::Cancelled(reason) => {
+                let _ = self.event_loop.cancel(timer);
+                let _ = self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(reason));
+            }
+        }
+    }
+
+    fn deliver_promise_waiter(
+        &mut self,
+        promise: Value,
+        waiter: PromiseWaiter,
+        outcome: PromiseOutcome,
+    ) {
+        match waiter {
+            PromiseWaiter::Resume { fiber, fiber_object, dst } => match outcome {
+                PromiseOutcome::Fulfilled(value) => {
+                    self.resume_promise_waiter(promise, fiber, fiber_object, dst, value)
+                }
+                PromiseOutcome::Rejected(reason) => {
+                    self.reject_promise_waiter(promise, fiber, fiber_object, reason)
+                }
+                PromiseOutcome::Cancelled(reason) => {
+                    self.cancel_promise_waiter(promise, fiber, fiber_object, reason)
+                }
+            },
+            PromiseWaiter::Forward { promise: target } => {
+                let _ = self.settle_promise_outcome(target, outcome);
+            }
+            PromiseWaiter::IntervalTick { promise: interval, timer } => {
+                self.handle_interval_tick(interval, timer, outcome);
+            }
+        }
+    }
+
+    fn process_runtime_event(&mut self, fired: FiredEvent<RuntimeEvent>) {
+        match fired.payload {
+            RuntimeEvent::PromiseWaiter { promise, waiter, outcome } => {
+                self.deliver_promise_waiter(promise, waiter, outcome);
+            }
+            RuntimeEvent::TimerFire { promise, callback, interval } => {
+                let still_pending = self.promise_cell(promise).ok().is_some_and(|cell| {
+                    matches!(unsafe { cell.get() }, PromiseState::Pending { .. })
+                });
+                if !still_pending {
+                    if interval {
+                        let _ = self.event_loop.cancel(fired.id);
+                    }
+                    return;
+                }
+
+                if !interval {
+                    let _ = self.set_promise_cancel_handle(promise, None);
+                }
+
+                let Some(callback) = callback else {
+                    let _ = self.settle_promise_outcome(promise, PromiseOutcome::Fulfilled(Value::NULL));
+                    return;
+                };
+
+                // A timeout/microtask is removed from the loop before this method,
+                // so keep both managed values explicitly rooted across task setup.
+                let promise_root = self.add_root(promise);
+                let callback_root = self.add_root(callback);
+                let spawned = self.spawn_timer_callback(callback);
+                self.release_root(callback_root);
+                self.release_root(promise_root);
+
+                match spawned {
+                    Ok(tick) if interval => {
+                        if let Err(error) = self.attach_interval_tick_waiter(tick, promise, fired.id) {
+                            let _ = self.event_loop.cancel(fired.id);
+                            let _ = self.settle_promise_outcome(
+                                promise,
+                                PromiseOutcome::Rejected(Value::NULL),
+                            );
+                            self.fail(error);
+                        }
+                    }
+                    Ok(result) => {
+                        if let Err(error) = self.resolve_async_result(promise, result) {
+                            self.fail(error);
+                            return;
+                        }
+                        // Timer.delay/microtask cancellation is only accepted before
+                        // the callback starts. Adoption here is result-only.
+                        if let Ok(cell) = self.promise_cell(promise) {
+                            if let PromiseState::Pending { cancel, .. } = unsafe { cell.get_mut() } {
+                                *cancel = None;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if interval {
+                            let _ = self.event_loop.cancel(fired.id);
+                        }
+                        self.fail(error);
+                    }
                 }
             }
         }
-        Ok(())
     }
 
     /// Resolve an async function's result Promise. Returning another Promise
@@ -5405,6 +5974,9 @@ impl<'p> Interpreter<'p> {
         match unsafe { inner_cell.get_mut() } {
             PromiseState::Fulfilled(result) => self.settle_promise(promise, false, *result),
             PromiseState::Rejected(reason) => self.settle_promise(promise, true, *reason),
+            PromiseState::Cancelled(reason) => {
+                self.settle_promise_outcome(promise, PromiseOutcome::Cancelled(*reason))
+            }
             PromiseState::Pending { waiters, .. } => {
                 self.heap.remember_owner(value);
                 waiters.push(PromiseWaiter::Forward { promise });
@@ -5418,11 +5990,35 @@ impl<'p> Interpreter<'p> {
                 self.heap.remember_if_reference(promise, value);
                 let outer = self.promise_cell(promise)?;
                 match unsafe { outer.get_mut() } {
-                    PromiseState::Pending { producer, .. } => *producer = Some(value),
+                    PromiseState::Pending { producer, cancel, .. } => {
+                        *producer = Some(value);
+                        *cancel = Some(CancelHandle::Promise(value));
+                    }
                     _ => return Err(RuntimeError::new("async result Promise settled before adoption")),
                 }
                 Ok(())
             }
+        }
+    }
+
+    fn fail_awaited_promise(&mut self, op: &PreparedOp, reason: Value, cancelled: bool) {
+        self.mark_gc_point(op);
+        unsafe { self.advance(op); }
+        self.flush_hot_pc();
+        let current = self.current_fiber;
+        if cancelled {
+            self.cancel_execution(current, reason);
+        } else {
+            self.reject_execution(current, reason);
+        }
+        if self.run_state != RunState::Failed && !self.schedule_next_ready() {
+            self.switch_current_fiber(0);
+            self.run_state = if self.fiber(0).status == FiberStatus::Done {
+                RunState::Returned
+            } else {
+                RunState::Suspended
+            };
+            self.clear_hot_frame();
         }
     }
 
@@ -5443,21 +6039,10 @@ impl<'p> Interpreter<'p> {
                 self.advance(op);
             },
             PromiseState::Rejected(reason) => {
-                let reason = *reason;
-                self.mark_gc_point(op);
-                unsafe { self.advance(op); }
-                self.flush_hot_pc();
-                let current = self.current_fiber;
-                self.reject_execution(current, reason);
-                if self.run_state != RunState::Failed && !self.schedule_next_ready() {
-                    self.switch_current_fiber(0);
-                    self.run_state = if self.fiber(0).status == FiberStatus::Done {
-                        RunState::Returned
-                    } else {
-                        RunState::Suspended
-                    };
-                    self.clear_hot_frame();
-                }
+                self.fail_awaited_promise(op, *reason, false);
+            }
+            PromiseState::Cancelled(reason) => {
+                self.fail_awaited_promise(op, *reason, true);
             }
             PromiseState::Pending { waiters, .. } => {
                 self.mark_gc_point(op);
@@ -6208,9 +6793,26 @@ impl Interpreter<'_> {
                 let promise = self.allocate_promise(PromiseState::Rejected(reason));
                 unsafe { self.set_reg(op.a, promise.word()); self.advance(op); }
             }
+            NativeBuiltin::PromiseCancel => {
+                let promise = Value::from_word(receiver);
+                if !matches!(self.heap.get(promise), Some(HeapObject::Promise { .. })) {
+                    self.fail_at(op, "Promise.cancel receiver is not a Promise");
+                    return;
+                }
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                match self.cancel_promise_value(promise) {
+                    Ok(cancelled) => unsafe {
+                        self.set_reg(op.a, Value::from_bool(cancelled).word());
+                        self.advance(op);
+                    },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
             NativeBuiltin::PromiseIsPending
             | NativeBuiltin::PromiseIsFulfilled
-            | NativeBuiltin::PromiseIsRejected => {
+            | NativeBuiltin::PromiseIsRejected
+            | NativeBuiltin::PromiseIsCancelled => {
                 let promise = Value::from_word(receiver);
                 let state = match self.heap.get(promise) {
                     Some(HeapObject::Promise { state }) => state.clone(),
@@ -6220,9 +6822,45 @@ impl Interpreter<'_> {
                     NativeBuiltin::PromiseIsPending => matches!(unsafe { state.get() }, PromiseState::Pending { .. }),
                     NativeBuiltin::PromiseIsFulfilled => matches!(unsafe { state.get() }, PromiseState::Fulfilled(_)),
                     NativeBuiltin::PromiseIsRejected => matches!(unsafe { state.get() }, PromiseState::Rejected(_)),
+                    NativeBuiltin::PromiseIsCancelled => matches!(unsafe { state.get() }, PromiseState::Cancelled(_)),
                     _ => false,
                 };
                 unsafe { self.set_reg(op.a, Value::from_bool(matches).word()); self.advance(op); }
+            }
+            NativeBuiltin::TimerDelay => {
+                let delay = match Self::timer_duration(arg(0), false) {
+                    Ok(delay) => delay,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let callback = (args.len() > 1).then(|| arg(1));
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                match self.schedule_timer_delay(delay, callback) {
+                    Ok(promise) => unsafe { self.set_reg(op.a, promise.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::TimerMicrotask => {
+                let callback = arg(0);
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                match self.schedule_timer_microtask(callback) {
+                    Ok(promise) => unsafe { self.set_reg(op.a, promise.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::TimerEvery => {
+                let period = match Self::timer_duration(arg(0), true) {
+                    Ok(period) => period,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let callback = arg(1);
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                match self.schedule_timer_every(period, callback) {
+                    Ok(promise) => unsafe { self.set_reg(op.a, promise.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
             }
             NativeBuiltin::SystemGc => {
                 // System.gc() is itself a GC-capable call. Publish the exact
@@ -7775,6 +8413,7 @@ impl Interpreter<'_> {
                 PromiseState::Pending { .. } => "<promise:pending>".into(),
                 PromiseState::Fulfilled(_) => "<promise:fulfilled>".into(),
                 PromiseState::Rejected(_) => "<promise:rejected>".into(),
+                PromiseState::Cancelled(_) => "<promise:cancelled>".into(),
             },
             Some(HeapObject::AsyncTaskObject { task, .. }) => format!("<async-task#{task}>"),
             Some(HeapObject::FiberObject { fiber, .. }) => format!("<fiber:{fiber}>") ,
@@ -7797,11 +8436,26 @@ impl TraceRuntime for Interpreter<'_> {
 
     fn trace_method_epoch(&self) -> u64 { self.method_epoch }
 
-    fn trace_inline_target(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<(FuncId, u64)> {
+    fn trace_inline_target(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<(FuncId, Vec<u64>)> {
         let class = self.heap.receiver_class(Value::from_word(receiver))?;
-        let cache = self.program.function(function)?.chunk.inline_caches.get(cache as usize)?;
-        let CallTarget::Bytecode(index) = self.lookup_method(class, cache.method, None)? else { return None };
-        Some((self.prepared.functions.get(index as usize)?.id, class.0))
+        let descriptor = self.program.function(function)?.chunk.inline_caches.get(cache as usize)?;
+        let CallTarget::Bytecode(index) = self.lookup_method(class, descriptor.method, None)? else { return None };
+        let mut classes = vec![class.0];
+        let function_index = *self.prepared.function_by_id.get(&function)? as usize;
+        let pic = self.inline_caches.get(function_index)?.get(cache as usize)?;
+        if !pic.megamorphic {
+            for entry in &pic.entries[..pic.len as usize] {
+                // Revalidate against the current method table: cached entries are
+                // observations, not authority for an inlining proof.
+                if classes.len() < 4 && !classes.contains(&entry.class.0)
+                    && matches!(self.lookup_method(entry.class, descriptor.method, None),
+                        Some(CallTarget::Bytecode(target)) if target == index)
+                {
+                    classes.push(entry.class.0);
+                }
+            }
+        }
+        Some((self.prepared.functions.get(index as usize)?.id, classes))
     }
 
     fn trace_standard_numeric_method(&self, function: FuncId, cache: u32) -> bool {
@@ -7822,7 +8476,7 @@ impl TraceRuntime for Interpreter<'_> {
         Ok(match self.heap.get(value) {
             Some(HeapObject::Promise { state }) => match unsafe { state.get() } {
                 PromiseState::Fulfilled(value) => Some(value.word()),
-                PromiseState::Pending { .. } | PromiseState::Rejected(_) => None,
+                PromiseState::Pending { .. } | PromiseState::Rejected(_) | PromiseState::Cancelled(_) => None,
             },
             _ => None,
         })
@@ -9612,7 +10266,7 @@ var result = ProtectedLoop.run()
     fn generic_invoke_inside_hot_loop_returns_to_same_native_trace() {
         let source = r#"
 class CallLoop {
-  static inc(x) { return x + 1 }
+  static inc(x) { x + 1 }
   static run() {
     var i = 0
     var total = 0
@@ -9642,6 +10296,7 @@ var result = CallLoop.run()
         assert_eq!(source_result(&native), source_result(&baseline));
         let stats = native.jit_stats().unwrap();
         assert!(stats.native_entries > 0, "call-containing loop should enter native code: {stats:?}");
+        assert!(stats.inlined_calls > 0, "hot calls should be inlined: {stats:?}");
     }
 
     #[test]
@@ -10456,4 +11111,136 @@ var result = GcTest.run()
         let result = vm.run_function(FuncId(0), &[]).unwrap();
         match result { ExecutionResult::Returned(value) => assert_eq!(value.as_num(), Some(1.0)), _ => panic!() }
     }
+    #[test]
+    fn live_timer_keeps_event_loop_running_after_module_body_returns() {
+        let source = r#"
+var result = 0
+Timer.delay(0) { result = 42 }
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 42.0);
+    }
+
+    #[test]
+    fn timer_delay_resumes_module_await() {
+        let source = r#"
+class TimerTest {
+  static async run() {
+    await Timer.delay(0)
+    return 42
+  }
+}
+var result = await TimerTest.run()
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
+            panic!("expected Timer.delay to keep the VM alive until the await resumes");
+        };
+        assert_eq!(source_result(&vm), 42.0);
+    }
+
+    #[test]
+    fn timer_microtask_runs_after_current_job_and_before_await_resume() {
+        let source = r#"
+class TimerTest {
+  static async run() {
+    var result = 0
+    var work = Timer.microtask {
+      result = result * 10 + 2
+      return 7
+    }
+    result = result * 10 + 1
+    var value = await work
+    result = result * 10 + 3
+    return result + value
+  }
+}
+var result = await TimerTest.run()
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 130.0); // 123 + callback result 7
+    }
+
+    #[test]
+    fn timer_delay_callback_promise_adopts_callback_result() {
+        let source = r#"
+class TimerTest {
+  static async run() {
+    var work = Timer.delay(0) { return 42 }
+    return await work
+  }
+}
+var result = await TimerTest.run()
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 42.0);
+    }
+
+    #[test]
+    fn timer_promise_cancel_is_idempotent_and_prevents_callback() {
+        let source = r#"
+class TimerTest {
+  static run() {
+    var fired = false
+    var work = Timer.delay(60000) { fired = true }
+    var first = work.cancel()
+    var second = work.cancel()
+    if (fired) { return -1 }
+    if (!first) { return -2 }
+    if (second) { return -3 }
+    if (!work.isCancelled) { return -4 }
+    return 42
+  }
+}
+var result = TimerTest.run()
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 42.0);
+    }
+
+    #[test]
+    fn async_result_promises_are_cancellable_before_the_task_runs() {
+        let source = r#"
+class TimerTest {
+  static async work() {
+    await Timer.delay(60000)
+    return -1
+  }
+}
+var work = TimerTest.work()
+var first = work.cancel()
+var second = work.cancel()
+var result = first && !second && work.isCancelled ? 42 : -1
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 42.0);
+    }
+
+    #[test]
+    fn timer_every_is_non_overlapping_and_can_cancel_in_flight() {
+        let source = r#"
+var interval = null
+var result = 0
+interval = Timer.every(1) {
+  result = result + 1
+  if (result >= 3) interval.cancel()
+}
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        let mut vm = source_vm(&program, &manifest);
+        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!() };
+        assert_eq!(source_result(&vm), 3.0);
+    }
+
 }

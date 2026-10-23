@@ -212,6 +212,156 @@ fn floating_remainder_executes_without_interpreter_callbacks() {
     }
 }
 
+fn inline_program(body: BytecodeChunk) -> BytecodeProgram {
+    let mut program = program_for(Opcode::CallDirect);
+    let mut caller = Assembler::new();
+    caller.emit_call_direct(Reg(0), crate::wren_ir::CallConv::Wren, &[Reg(1), Reg(2)], FuncId(1)).unwrap();
+    caller.emit_a(Opcode::Return, 0);
+    let mut chunk = caller.finish().unwrap();
+    chunk.safepoints = program.functions[0].chunk.safepoints.clone();
+    program.functions[0].chunk = chunk;
+    let callee = &mut program.functions[1];
+    callee.chunk = body;
+    callee.arity = 2;
+    callee.frame.parameters = (0..2).map(|i| ParameterBinding {
+        source: IncomingSource::Argument(ArgReg(i)), destination: Reg(i), kind: RegisterKind::Value,
+    }).collect();
+    program.rebuild_indexes().unwrap();
+    program
+}
+
+fn assert_native_inline(program: &BytecodeProgram, lhs: f64, rhs: f64) {
+    let mut baseline = setup(program, Opcode::CallDirect);
+    let mut native = setup(program, Opcode::CallDirect);
+    for vm in [&mut baseline, &mut native] {
+        vm.trace_write_slot(FrameSlot::General(Reg(1)), Value::from_num(lhs).word()).unwrap();
+        vm.trace_write_slot(FrameSlot::General(Reg(2)), Value::from_num(rhs).word()).unwrap();
+    }
+    baseline.trace_execute_call_to_return().unwrap();
+    let mut jit = TracingJit::new(TracingJitOptions::default());
+    jit.execute_one_for_test(&mut native).unwrap();
+    let trace = jit.trace(TraceId(0)).unwrap();
+    assert_eq!(trace.stats.inlined_calls, 1);
+    assert!(!trace.nodes.iter().any(|n| matches!(n.kind,
+        crate::wren_trace_ir::TraceInst::Runtime { .. } | crate::wren_trace_ir::TraceInst::RuntimeCall { .. })));
+    assert_eq!(native.trace_read_slot(FrameSlot::General(Reg(0))).unwrap(),
+        baseline.trace_read_slot(FrameSlot::General(Reg(0))).unwrap());
+    assert_eq!(native.trace_current_location(), baseline.trace_current_location());
+}
+
+#[test]
+fn native_inlining_handles_integer_math_comparisons_and_float_negation() {
+    use Opcode::*;
+    for opcode in [INeg, IBitNot, IAdd, ISub, IMul, IBitAnd, IBitOr, IBitXor, IShl, IShrU, ISar,
+        ICmpEq, ICmpNe, ICmpLt, ICmpLe, ICmpGt, ICmpGe,
+        FNeg, FCmpEq, FCmpNe, FCmpLt, FCmpLe, FCmpGt, FCmpGe]
+    {
+        let float = matches!(opcode, FNeg | FCmpEq | FCmpNe | FCmpLt | FCmpLe | FCmpGt | FCmpGe);
+        let compare = matches!(opcode, ICmpEq | ICmpNe | ICmpLt | ICmpLe | ICmpGt | ICmpGe
+            | FCmpEq | FCmpNe | FCmpLt | FCmpLe | FCmpGt | FCmpGe);
+        let mut body = Assembler::new();
+        body.emit_ab(if float { NumToF64 } else { NumToInt32 }, 2, 0);
+        body.emit_ab(if float { NumToF64 } else { NumToInt32 }, 3, 1);
+        body.emit_abc(opcode, 4, 2, 3);
+        if !compare { body.emit_ab(if float { F64ToNum } else { Int32ToNum }, 4, 4); }
+        body.emit_a(Return, 4);
+        let program = inline_program(body.finish().unwrap());
+        for (lhs, rhs) in [(7.0, 2.0), (-7.0, 33.0), (i32::MAX as f64, 1.0), (i32::MIN as f64, -1.0)] {
+            assert_native_inline(&program, lhs, rhs);
+        }
+        if float {
+            for (lhs, rhs) in [(-0.0, 0.0), (f64::NAN, 1.0), (f64::INFINITY, f64::NEG_INFINITY)] {
+                assert_native_inline(&program, lhs, rhs);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_inlining_reads_lists_and_replays_failed_bounds_at_the_call() {
+    for index in [-1i32, 0, 2, 3, -4] {
+        let mut body = Assembler::new();
+        body.emit_ab(Opcode::NumToInt32, 2, 1);
+        body.emit_abc(Opcode::ListGet, 3, 0, 2);
+        body.emit_a(Opcode::Return, 3);
+        let program = inline_program(body.finish().unwrap());
+        let mut native = setup(&program, Opcode::CallDirect);
+        let list = native.heap.alloc(HeapObject::List(vec![Value::TRUE, Value::FALSE, Value::NULL]));
+        native.trace_write_slot(FrameSlot::General(Reg(1)), list.word()).unwrap();
+        native.trace_write_slot(FrameSlot::General(Reg(2)), Value::from_num(index as f64).word()).unwrap();
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        jit.execute_one_for_test(&mut native).unwrap();
+        assert_eq!(jit.trace(TraceId(0)).unwrap().stats.inlined_calls, 1);
+        if (-3..3).contains(&index) {
+            let expected = [Value::TRUE, Value::FALSE, Value::NULL][(if index < 0 { index + 3 } else { index }) as usize];
+            assert_eq!(native.trace_read_slot(FrameSlot::General(Reg(0))).unwrap(), expected.word());
+        } else {
+            assert_eq!(native.trace_current_location(), TraceLocation::new(FuncId(0), BytecodePc(0)));
+            assert!(native.trace_execute_call_to_return().is_err() || native.run_state == RunState::Failed);
+        }
+    }
+}
+
+#[test]
+fn native_inlining_reads_list_map_and_string_lengths() {
+    for opcode in [Opcode::ListLen, Opcode::MapLen, Opcode::StringLen] {
+        let mut body = Assembler::new();
+        body.emit_ab(opcode, 2, 0);
+        body.emit_ab(Opcode::Int32ToNum, 2, 2);
+        body.emit_a(Opcode::Return, 2);
+        let program = inline_program(body.finish().unwrap());
+        let mut baseline = setup(&program, opcode);
+        let mut native = setup(&program, opcode);
+        baseline.trace_execute_call_to_return().unwrap();
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        jit.execute_one_for_test(&mut native).unwrap();
+        assert_eq!(jit.trace(TraceId(0)).unwrap().stats.inlined_calls, 1);
+        assert_eq!(native.trace_read_slot(FrameSlot::General(Reg(0))).unwrap(),
+            baseline.trace_read_slot(FrameSlot::General(Reg(0))).unwrap());
+    }
+}
+
+#[test]
+fn native_inlining_groups_observed_classes_with_the_same_target_only() {
+    let mut program = program_for(Opcode::Invoke);
+    for id in 2..5 {
+        let mut class = program.metadata.classes[0].clone();
+        class.id = ClassId(id);
+        program.metadata.classes.push(class);
+    }
+    program.rebuild_indexes().unwrap();
+    let mut vm = setup(&program, Opcode::Invoke);
+    let mut receivers = Vec::new();
+    for slot in 0..5 {
+        vm.classes[slot].instance_methods[0] = Some(CallTarget::Bytecode(1));
+        let value = vm.heap.alloc(HeapObject::Instance { class_slot: slot as u32, fields: Box::new([]) });
+        vm.add_root(value);
+        receivers.push(value);
+        if slot < 4 {
+            let class = vm.heap.receiver_class(value).unwrap();
+            vm.inline_caches[0][0].insert(class, CallTarget::Bytecode(1));
+        }
+    }
+    let mut jit = TracingJit::new(TracingJitOptions::default());
+    for receiver in &receivers[..4] {
+        vm.trace_write_slot(FrameSlot::General(Reg(1)), receiver.word()).unwrap();
+        // A fresh recorder still sees the complete warmed four-class PIC.
+        vm.current_frame_mut().pc = 0;
+        vm.refresh_hot_frame();
+        jit.execute_one_for_test(&mut vm).unwrap();
+        let trace = jit.trace(TraceId(0)).unwrap();
+        assert_eq!(trace.stats.inlined_calls, 1);
+        assert!(trace.nodes.iter().any(|n| matches!(&n.kind,
+            crate::wren_trace_ir::TraceInst::GuardClass { classes, .. } if classes.len() == 4)));
+        assert_eq!(vm.trace_read_slot(FrameSlot::General(Reg(0))).unwrap(), Value::TRUE.word());
+    }
+    vm.classes[1].instance_methods[0] = Some(CallTarget::Primitive(PrimitiveId(0)));
+    let (_, classes) = vm.trace_inline_target(FuncId(0), 0, receivers[0].word()).unwrap();
+    assert_eq!(classes.len(), 3, "a stale PIC must not authorize a different method");
+    vm.inline_caches[0][0].megamorphic = true;
+    assert_eq!(vm.trace_inline_target(FuncId(0), 0, receivers[0].word()).unwrap().1.len(), 1);
+}
+
 #[test]
 fn all_122_opcodes_execute_in_native_traces_like_the_interpreter() {
     let mut count = 0;

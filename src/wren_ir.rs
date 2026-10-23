@@ -644,6 +644,35 @@ pub enum Inst {
         closure: ValueId,
         args: Vec<ValueId>,
     },
+    /// Tail-position generic Wren dispatch. Semantically identical to
+    /// `return receiver.method(args...)`, but represented as a terminator so the
+    /// interpreter/JIT may reuse or elide the current frame.
+    TailInvoke {
+        site: SiteId,
+        receiver: ValueId,
+        method: MethodSymbol,
+        args: Vec<ValueId>,
+    },
+    /// Tail-position `super.method(...)`.
+    TailInvokeSuper {
+        site: SiteId,
+        home_class: ClassId,
+        receiver: ValueId,
+        method: MethodSymbol,
+        args: Vec<ValueId>,
+    },
+    /// Tail-position call to a statically known internal function.
+    TailCallDirect {
+        conv: CallConv,
+        callee: FuncId,
+        args: Vec<ValueId>,
+    },
+    /// Tail-position call through a proven closure value.
+    TailCallClosure {
+        conv: CallConv,
+        closure: ValueId,
+        args: Vec<ValueId>,
+    },
     /// Call a core VM primitive. The primitive table is runtime-owned.
     CallPrimitive {
         primitive: PrimitiveId,
@@ -923,6 +952,10 @@ impl Inst {
 
         match self {
             Return(_) | Unreachable => B::Sink(E::Control),
+            TailInvoke { .. }
+            | TailInvokeSuper { .. }
+            | TailCallDirect { .. }
+            | TailCallClosure { .. } => B::Sink(E::Call),
             Bailout { .. } => B::Sink(E::Guard),
             FiberAbort { .. } => B::Sink(E::Fiber),
 
@@ -1035,6 +1068,10 @@ impl Inst {
                 | InvokeSuper { .. }
                 | CallDirect { .. }
                 | CallClosure { .. }
+                | TailInvoke { .. }
+                | TailInvokeSuper { .. }
+                | TailCallDirect { .. }
+                | TailCallClosure { .. }
                 | CallPrimitive { .. }
                 | CallForeign { .. }
 
@@ -1100,6 +1137,10 @@ impl Inst {
             | Switch { .. }
             | Return(_)
             | Unreachable
+            | TailInvoke { .. }
+            | TailInvokeSuper { .. }
+            | TailCallDirect { .. }
+            | TailCallClosure { .. }
             | Safepoint
             | OSRPoint
             | GuardBounds { .. }
@@ -1185,6 +1226,10 @@ impl Inst {
                 | Inst::Branch { .. }
                 | Inst::Switch { .. }
                 | Inst::Return(_)
+                | Inst::TailInvoke { .. }
+                | Inst::TailInvokeSuper { .. }
+                | Inst::TailCallDirect { .. }
+                | Inst::TailCallClosure { .. }
                 | Inst::Bailout { .. }
                 | Inst::Unreachable
                 | Inst::FiberAbort { .. }
@@ -1266,14 +1311,22 @@ impl Inst {
             }
             | InvokeSuper {
                 receiver, args, ..
+            }
+            | TailInvoke {
+                receiver, args, ..
+            }
+            | TailInvokeSuper {
+                receiver, args, ..
             } => {
                 out.push(*receiver);
                 out.extend_from_slice(args);
             }
             CallDirect { args, .. }
+            | TailCallDirect { args, .. }
             | CallPrimitive { args, .. }
             | CallForeign { args, .. } => out.extend_from_slice(args),
-            CallClosure { closure, args, .. } => {
+            CallClosure { closure, args, .. }
+            | TailCallClosure { closure, args, .. } => {
                 out.push(*closure);
                 out.extend_from_slice(args);
             }
@@ -1455,6 +1508,12 @@ impl Inst {
             }
             | InvokeSuper {
                 receiver, args, ..
+            }
+            | TailInvoke {
+                receiver, args, ..
+            }
+            | TailInvokeSuper {
+                receiver, args, ..
             } => {
                 f(receiver);
                 for value in args {
@@ -1462,13 +1521,15 @@ impl Inst {
                 }
             }
             CallDirect { args, .. }
+            | TailCallDirect { args, .. }
             | CallPrimitive { args, .. }
             | CallForeign { args, .. } => {
                 for value in args {
                     f(value);
                 }
             }
-            CallClosure { closure, args, .. } => {
+            CallClosure { closure, args, .. }
+            | TailCallClosure { closure, args, .. } => {
                 f(closure);
                 for value in args {
                     f(value);
@@ -1824,6 +1885,11 @@ impl Program {
         self.function_index
             .get(&id)
             .and_then(|index| self.functions.get(*index))
+    }
+
+    pub fn function_mut(&mut self, id: FuncId) -> Option<&mut Function> {
+        let index = *self.function_index.get(&id)?;
+        self.functions.get_mut(index)
     }
 
     pub fn add_module(&mut self, name: impl AsRef<str>, variable_count: u32) -> ModuleId {

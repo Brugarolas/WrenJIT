@@ -425,6 +425,25 @@ pub struct RangeAnalysis;
 impl TraceOptimization for RangeAnalysis {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
         let mut ranges = HashMap::new();
+        // Checked monotone recurrences cannot wrap on the successful backedge.
+        // Unchecked arithmetic must retain the full range, even for i = i + 1.
+        for phi in &trace.loop_phis {
+            if phi.rep != TraceRep::Int32 || phi.entry_exit.is_some() { continue; }
+            let Some(initial) = constant(trace, phi.initial).and_then(integer) else { continue };
+            let Some((_, TraceInst::IntBinaryChecked { op, lhs, rhs, .. })) = phi.backedge
+                .and_then(|value| TraceCanonicalization::producer(trace, value)) else { continue };
+            if !same_value(trace, lhs, phi.value) { continue; }
+            let Some(step) = constant(trace, rhs).and_then(integer) else { continue };
+            let delta = match op {
+                IntBinOp::Add => step as i64,
+                IntBinOp::Sub => -(step as i64),
+                _ => continue,
+            };
+            let bounds = if delta > 0 { Range { lo: initial as i64, hi: Range::FULL.hi } }
+                else if delta < 0 { Range { lo: Range::FULL.lo, hi: initial as i64 } }
+                else { Range::point(initial) };
+            ranges.insert(phi.value, bounds);
+        }
         let mut less_than = HashSet::new();
         let mut changed = false;
         for id in order(trace) {
@@ -1688,6 +1707,28 @@ mod tests {
         assert_eq!(trace.stats.eliminated_bounds_checks, 2);
         assert_eq!(trace.stats.eliminated_overflow_checks, 1);
         assert_eq!(trace.nodes.iter().filter(|n| matches!(n.kind, TraceInst::IntBinaryChecked { .. })).count(), 1);
+    }
+
+    #[test]
+    fn ranges_use_checked_inductions_but_never_assume_wrapping_counters_are_positive() {
+        for checked in [false, true] {
+            let mut b = builder(TraceKind::Loop);
+            let zero = int(&mut b, 0);
+            let one = int(&mut b, 1);
+            let index = b.add_loop_phi(FrameSlot::General(Reg(0)), zero, TraceType::Int32, TraceRep::Int32);
+            let length = input(&mut b, 1, TraceRep::Int32);
+            let exit = b.add_side_exit(ExitReason::GuardBounds, BytecodePc(0));
+            let below = b.emit1(TraceInst::IntCompare { op: CmpKind::Lt, lhs: index, rhs: length }, TraceType::Bool, TraceRep::Bool);
+            b.emit0(TraceInst::GuardTruthy { value: below, exit });
+            b.emit0(TraceInst::GuardBounds { index, length, exit });
+            let kind = if checked { TraceInst::IntBinaryChecked { op: IntBinOp::Add, lhs: index, rhs: one, exit } }
+                else { TraceInst::IntBinary { op: IntBinOp::Add, lhs: index, rhs: one } };
+            let next = b.emit1(kind, TraceType::Int32, TraceRep::Int32);
+            b.set_loop_backedge(index, next).unwrap();
+            let mut trace = finish(b);
+            Optimize::new().with_pass(RangeAnalysis).verify_after_each_pass(true).optimize_trace(&mut trace).unwrap();
+            assert_eq!(trace.stats.eliminated_bounds_checks, checked as usize);
+        }
     }
 
     #[test]
