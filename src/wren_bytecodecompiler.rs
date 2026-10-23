@@ -28,7 +28,8 @@
 #![allow(clippy::type_complexity)]
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, VecDeque};
+use hashbrown::HashMap;
+use std::collections::VecDeque;
 use std::fmt;
 
 use crate::wren_bytecode::{

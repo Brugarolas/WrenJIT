@@ -17,9 +17,10 @@
 #![allow(clippy::identity_op)]
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use hashbrown::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::fmt;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use crate::wren_gc::{
@@ -229,16 +230,104 @@ impl Hasher for FastHasher {
     fn write_usize(&mut self, value: usize) { self.write_u64(value as u64); }
 }
 
-type FastBuildHasher = BuildHasherDefault<FastHasher>;
-type FastMap<K, V> = HashMap<K, V, FastBuildHasher>;
+type FastMap<K, V> = HashMap<K, V>;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[inline]
+fn fast_hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = FastHasher::default();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+/// Immutable Wren string payload with its content hash computed once. Strings are
+/// immutable, so dictionary lookups can reuse this hash instead of rescanning UTF-8
+/// bytes on every Map access.
+#[derive(Clone, Debug)]
+pub struct WrenString {
+    bytes: Arc<[u8]>,
+    hash: u64,
+    code_points: usize,
+}
+
+impl WrenString {
+    #[inline]
+    fn new(bytes: Arc<[u8]>) -> Self {
+        let hash = fast_hash_bytes(bytes.as_ref());
+        let code_points = wren_code_point_count(bytes.as_ref());
+        Self { bytes, hash, code_points }
+    }
+}
+
+impl std::ops::Deref for WrenString {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &Self::Target { self.bytes.as_ref() }
+}
+
+impl AsRef<[u8]> for WrenString {
+    #[inline]
+    fn as_ref(&self) -> &[u8] { self.bytes.as_ref() }
+}
+
+#[derive(Clone, Debug)]
+struct MapStringKey {
+    bytes: Arc<[u8]>,
+    hash: u64,
+}
+
+impl MapStringKey {
+    #[inline]
+    fn new(bytes: Arc<[u8]>) -> Self {
+        let hash = fast_hash_bytes(bytes.as_ref());
+        Self { bytes, hash }
+    }
+
+    #[inline]
+    fn from_wren(value: &WrenString) -> Self {
+        Self { bytes: value.bytes.clone(), hash: value.hash }
+    }
+
+    #[inline]
+    fn arc(&self) -> Arc<[u8]> { self.bytes.clone() }
+}
+
+impl AsRef<[u8]> for MapStringKey {
+    #[inline]
+    fn as_ref(&self) -> &[u8] { self.bytes.as_ref() }
+}
+
+impl PartialEq for MapStringKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.bytes.as_ref() == other.bytes.as_ref()
+    }
+}
+impl Eq for MapStringKey {}
+impl Hash for MapStringKey {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) { state.write_u64(self.hash); }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum MapKey {
     Null,
     Bool(bool),
     Num(u64),
-    String(Arc<[u8]>),
+    String(MapStringKey),
     Object(u32),
+}
+
+impl Hash for MapKey {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Null => state.write_u8(0),
+            Self::Bool(value) => { state.write_u8(1); state.write_u8(*value as u8); }
+            Self::Num(bits) => { state.write_u8(2); state.write_u64(*bits); }
+            Self::String(value) => { state.write_u8(3); state.write_u64(value.hash); }
+            Self::Object(handle) => { state.write_u8(4); state.write_u32(*handle); }
+        }
+    }
 }
 
 const MAX_SHAPED_MAP_SLOTS: usize = 16;
@@ -251,7 +340,7 @@ struct MapShape {
     /// Property order is also the physical value-slot order.
     keys: Box<[Arc<[u8]>]>,
     /// Shared hidden-class transitions. Only string keys participate.
-    transitions: FastMap<Arc<[u8]>, u32>,
+    transitions: FastMap<MapStringKey, u32>,
 }
 
 impl MapShape {
@@ -299,24 +388,24 @@ impl MapShapeTable {
     }
 
     /// Return the shared child shape and the slot introduced by `key`.
-    fn transition(&mut self, shape: u32, key: Arc<[u8]>) -> Option<(u32, u16)> {
+    fn transition(&mut self, shape: u32, key: MapStringKey) -> Option<(u32, u16)> {
         let parent_index = shape as usize;
         if let Some(slot) = self.shapes.get(parent_index)?.slot(key.as_ref()) {
             return Some((shape, slot));
         }
         let slot = self.shapes.get(parent_index)?.keys.len();
-        if key.len() > MAX_SHAPED_MAP_KEY_BYTES
+        if key.as_ref().len() > MAX_SHAPED_MAP_KEY_BYTES
             || slot >= MAX_SHAPED_MAP_SLOTS
             || self.shapes.len() >= MAX_MAP_SHAPES
         {
             return None;
         }
-        if let Some(&child) = self.shapes.get(parent_index)?.transitions.get(key.as_ref()) {
+        if let Some(&child) = self.shapes.get(parent_index)?.transitions.get(&key) {
             return Some((child, slot as u16));
         }
 
         let mut keys = self.shapes.get(parent_index)?.keys.to_vec();
-        keys.push(key.clone());
+        keys.push(key.arc());
         let child = self.shapes.len() as u32;
         self.shapes.push(MapShape {
             keys: keys.into_boxed_slice(),
@@ -408,7 +497,7 @@ impl WrenMap {
                 let mut entries = FastMap::default();
                 entries.reserve(values.len());
                 for (key, value) in keys.iter().cloned().zip(values.into_iter()) {
-                    entries.insert(MapKey::String(key), value);
+                    entries.insert(MapKey::String(MapStringKey::new(key)), value);
                 }
                 self.storage = WrenMapStorage::Dictionary(entries);
             }
@@ -425,7 +514,7 @@ impl WrenMap {
                     .keys(*shape)?
                     .get(index)
                     .cloned()
-                    .map(MapKey::String)
+                    .map(|key| MapKey::String(MapStringKey::new(key)))
             }
             WrenMapStorage::Dictionary(entries) => entries.keys().nth(index).cloned(),
         }
@@ -495,7 +584,7 @@ impl fmt::Debug for PromiseCell {
 #[derive(Debug)]
 enum HeapObject {
     Random { state: u64 },
-    String(Arc<[u8]>),
+    String(WrenString),
     List(Vec<Value>),
     Map(WrenMap),
     MapEntry { key: Value, value: Value },
@@ -680,7 +769,7 @@ impl HandleTable {
             HeapObject::String(bytes) => (
                 TraceHeapKind::String,
                 bytes.as_ptr() as usize,
-                wren_code_point_count(bytes),
+                bytes.code_points,
                 bytes.len().min(crate::wren_tracing_jit::TRACE_HEAP_METADATA_MAX as usize) as u32,
             ),
             HeapObject::List(values) => (
@@ -1394,7 +1483,7 @@ impl Heap {
         }
         if let Some(handle) = value.heap_handle() {
             if let Some(HeapObject::String(string)) = self.get(value) {
-                return Ok(MapKey::String(string.clone()));
+                return Ok(MapKey::String(MapStringKey::from_wren(string)));
             }
             return Ok(MapKey::Object(handle));
         }
@@ -1795,11 +1884,11 @@ impl HostContext<'_> {
     }
 
     pub fn allocate_string(&mut self, value: impl AsRef<str>) -> Value {
-        self.heap.alloc(HeapObject::String(Arc::<[u8]>::from(value.as_ref().as_bytes())))
+        self.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(value.as_ref().as_bytes()))))
     }
 
     pub fn allocate_bytes(&mut self, value: impl AsRef<[u8]>) -> Value {
-        self.heap.alloc(HeapObject::String(Arc::<[u8]>::from(value.as_ref())))
+        self.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(value.as_ref()))))
     }
 
     pub fn allocate_list(&mut self, values: Vec<Value>) -> Value {
@@ -2037,7 +2126,7 @@ impl HostContext<'_> {
         let Some(handle) = value.heap_handle() else { return format!("{value:?}"); };
         match self.heap.get(value) {
             Some(HeapObject::Random { .. }) => "<random>".to_owned(),
-            Some(HeapObject::String(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+            Some(HeapObject::String(bytes)) => String::from_utf8_lossy(bytes.as_ref()).into_owned(),
             Some(HeapObject::List(values)) => {
                 if !seen.insert(handle) { return "[...]".to_owned(); }
                 let text = values.iter().map(|v| self.format_value_inner(*v, seen)).collect::<Vec<_>>().join(", " );
@@ -3654,7 +3743,7 @@ impl<'p> Interpreter<'p> {
 
         let mut strings = Vec::with_capacity(program.metadata.strings.len());
         for string in &program.metadata.strings {
-            let value = heap.alloc(HeapObject::String(Arc::<[u8]>::from(string.as_bytes())));
+            let value = heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(string.as_bytes()))));
             init_roots.push(value);
             strings.push(value);
         }
@@ -4654,7 +4743,7 @@ impl<'p> Interpreter<'p> {
                 .collect::<Vec<_>>();
 
             let bytes: Arc<[u8]> = Arc::from(error.message.as_bytes());
-            let error_value = self.heap.alloc(HeapObject::String(bytes));
+            let error_value = self.heap.alloc(HeapObject::String(WrenString::new(bytes)));
 
             for (&id, &object) in failed.iter().zip(&failed_objects) {
                 self.heap.remember_if_reference(object, error_value);
@@ -7558,10 +7647,10 @@ fn normalize_byte_index(index: i32, len: usize, allow_end: bool) -> Option<usize
     if index >= 0 && index <= upper && (allow_end || index < len as i64) { Some(index as usize) } else { None }
 }
 
-unsafe fn h_string_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));match vm.heap.get(string){Some(HeapObject::String(s))=>{vm.set_reg(op.a,i32_word(wren_code_point_count(s) as i32));vm.advance(op)},_=>vm.fail_at(op,"StringLen operand is not string")}}
-unsafe fn h_string_concat(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let left=Value::from_word(vm.reg(op.b));let right=Value::from_word(vm.reg(op.c));let (a,b)=match(vm.heap.get(left),vm.heap.get(right)){(Some(HeapObject::String(a)),Some(HeapObject::String(b)))=>(a.clone(),b.clone()),_=>{vm.fail_at(op,"StringConcat operands must be strings");return;}};vm.mark_gc_point(op);vm.maybe_collect();let mut out=Vec::with_capacity(a.len()+b.len());out.extend_from_slice(&a);out.extend_from_slice(&b);let value=vm.heap.alloc(HeapObject::String(Arc::<[u8]>::from(out)));vm.set_reg(op.a,value.word());vm.advance(op)}
-unsafe fn h_string_slice(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));let start=word_i32(vm.reg(op.c));let count=word_i32(vm.reg(op.x as u8));if count<0{vm.fail_at(op,"negative string slice length");return;}let source=match vm.heap.get(string){Some(HeapObject::String(s))=>s.clone(),_=>{vm.fail_at(op,"StringSlice operand is not string");return;}};let Some(begin)=normalize_byte_index(start,source.len(),true)else{vm.fail_at(op,"string byte offset out of bounds");return;};let Some(end)=begin.checked_add(count as usize).filter(|end|*end<=source.len())else{vm.fail_at(op,"string slice out of bounds");return;};vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::String(Arc::<[u8]>::from(&source[begin..end])));vm.set_reg(op.a,value.word());vm.advance(op)}
-unsafe fn h_string_code_point_at(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));let code=match vm.heap.get(string){Some(HeapObject::String(bytes))=>normalize_byte_index(index,bytes.len(),false).map(|i|decode_wren_code_point(bytes,i).0 as i32),_=>None};match code{Some(c)=>{vm.set_reg(op.a,i32_word(c));vm.advance(op)},None=>vm.fail_at(op,"string byte offset out of bounds")}}
+unsafe fn h_string_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));match vm.heap.get(string){Some(HeapObject::String(s))=>{vm.set_reg(op.a,i32_word(s.code_points as i32));vm.advance(op)},_=>vm.fail_at(op,"StringLen operand is not string")}}
+unsafe fn h_string_concat(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let left=Value::from_word(vm.reg(op.b));let right=Value::from_word(vm.reg(op.c));let (a,b)=match(vm.heap.get(left),vm.heap.get(right)){(Some(HeapObject::String(a)),Some(HeapObject::String(b)))=>(a.clone(),b.clone()),_=>{vm.fail_at(op,"StringConcat operands must be strings");return;}};vm.mark_gc_point(op);vm.maybe_collect();let mut out=Vec::with_capacity(a.len()+b.len());out.extend_from_slice(a.as_ref());out.extend_from_slice(b.as_ref());let value=vm.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(out))));vm.set_reg(op.a,value.word());vm.advance(op)}
+unsafe fn h_string_slice(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));let start=word_i32(vm.reg(op.c));let count=word_i32(vm.reg(op.x as u8));if count<0{vm.fail_at(op,"negative string slice length");return;}let source=match vm.heap.get(string){Some(HeapObject::String(s))=>s.clone(),_=>{vm.fail_at(op,"StringSlice operand is not string");return;}};let Some(begin)=normalize_byte_index(start,source.len(),true)else{vm.fail_at(op,"string byte offset out of bounds");return;};let Some(end)=begin.checked_add(count as usize).filter(|end|*end<=source.len())else{vm.fail_at(op,"string slice out of bounds");return;};vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(&source[begin..end]))));vm.set_reg(op.a,value.word());vm.advance(op)}
+unsafe fn h_string_code_point_at(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));let code=match vm.heap.get(string){Some(HeapObject::String(bytes))=>normalize_byte_index(index,bytes.len(),false).map(|i|decode_wren_code_point(bytes.as_ref(),i).0 as i32),_=>None};match code{Some(c)=>{vm.set_reg(op.a,i32_word(c));vm.advance(op)},None=>vm.fail_at(op,"string byte offset out of bounds")}}
 unsafe fn h_make_range(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let from=Value::from_word(vm.reg(op.b)).as_num();let to=Value::from_word(vm.reg(op.c)).as_num();let(Some(from),Some(to))=(from,to)else{vm.fail_at(op,"range endpoints must be numbers");return;};vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::Range{from,to,inclusive:op.x!=0});vm.set_reg(op.a,value.word());vm.advance(op)}
 
 macro_rules! int_bin_handler {($name:ident,$expr:expr)=>{unsafe fn $name(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let a=word_i32(vm.reg(op.b));let b=word_i32(vm.reg(op.c));let r: i32=($expr)(a,b);vm.set_reg(op.a,i32_word(r));vm.advance(op)}}}
@@ -7615,7 +7704,7 @@ unsafe fn h_catch(vm: &mut Interpreter, ptr: *const PreparedOp) {
     let value = if let Some(error) = vm.pending_native_exception.take() {
         vm.maybe_collect();
         let bytes: Arc<[u8]> = Arc::from(error.message.as_bytes());
-        vm.heap.alloc(HeapObject::String(bytes))
+        vm.heap.alloc(HeapObject::String(WrenString::new(bytes)))
     } else {
         Value::from_word(vm.current_banks().special[SpecialReg::Error.index()])
     };
@@ -7662,7 +7751,7 @@ impl Interpreter<'_> {
         if let Some(number) = value.as_num() { return number.to_string(); }
         match self.heap.get(value) {
             Some(HeapObject::Random { .. }) => "<random>".into(),
-            Some(HeapObject::String(string)) => String::from_utf8_lossy(string).into_owned(),
+            Some(HeapObject::String(string)) => String::from_utf8_lossy(string.as_ref()).into_owned(),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
             Some(HeapObject::Map(map)) => format!("<map:{}>", map.len()),
             Some(HeapObject::MapEntry { .. }) => "<map entry>".into(),
@@ -7771,6 +7860,65 @@ impl TraceRuntime for Interpreter<'_> {
             .map_or(local_slot, |op| op.x)
     }
 
+    fn trace_module_slot_address(&self, location: TraceLocation) -> Option<usize> {
+        let prepared = self.current_prepared();
+        if prepared.id != location.function {
+            return None;
+        }
+        let index = *prepared.word_to_op.get(location.pc.0 as usize)?;
+        if index == NO_INDEX {
+            return None;
+        }
+        let op = prepared.ops.get(index as usize)?;
+        let raw = (op.x as u64) | ((op.y as u64) << 32);
+        (raw != 0).then_some(raw as usize)
+    }
+
+    fn trace_static_field_access(
+        &self,
+        class: RegisterWord,
+        slot: u32,
+    ) -> Option<(u64, usize)> {
+        let class = Value::from_word(class);
+        let class_slot = match self.heap.get(class)? {
+            HeapObject::ClassObject { class_slot } => *class_slot,
+            _ => return None,
+        };
+        let runtime_class = self.classes.get(class_slot as usize)?;
+        let field = runtime_class.static_fields.get(slot as usize)?;
+        let address = field as *const Value as usize;
+        Some((CLASS_KIND_STATIC | class_slot as u64, address))
+    }
+
+    fn trace_is_instance_observation(
+        &self,
+        class: RegisterWord,
+    ) -> Option<(u64, Vec<u64>, Vec<u64>)> {
+        let class = Value::from_word(class);
+        let target = match self.heap.get(class)? {
+            HeapObject::ClassObject { class_slot } => *class_slot,
+            _ => return None,
+        };
+        if !self.classes.get(target as usize)?.layout_finalized {
+            return None;
+        }
+        let mut accepted = Vec::new();
+        let mut known = Vec::new();
+        for slot in 0..self.classes.len() as u32 {
+            let class = &self.classes[slot as usize];
+            if !class.layout_finalized {
+                continue;
+            }
+            let kind = if class.is_foreign { CLASS_KIND_FOREIGN } else { CLASS_KIND_INSTANCE };
+            let key = kind | slot as u64;
+            known.push(key);
+            if self.is_subclass(slot, target) {
+                accepted.push(key);
+            }
+        }
+        Some((CLASS_KIND_STATIC | target as u64, accepted, known))
+    }
+
     fn trace_read_slot(&self, slot: FrameSlot) -> Result<RegisterWord, RuntimeError> {
         let frame = self.current_frame();
         let banks = self.current_banks();
@@ -7815,10 +7963,13 @@ impl TraceRuntime for Interpreter<'_> {
         let mut op = self.current_prepared().original_ops[self.hot_pc as usize];
         let opcode = self.program.functions[function as usize].chunk.code[op.raw_pc as usize].opcode().unwrap();
         if matches!(opcode, Opcode::Switch | Opcode::LoadModuleVar | Opcode::StoreModuleVar
-            | Opcode::LoadField | Opcode::StoreField) {
-            // These handlers consume patched pointers, while original_ops keeps
-            // logical indices. Preserve the unfused continuation and copy only
-            // the pointer operands from the executable instruction.
+            | Opcode::LoadField | Opcode::StoreField | Opcode::CallDirect
+            | Opcode::MakeClosure | Opcode::CreateClass | Opcode::AllocInstance
+            | Opcode::AllocForeign | Opcode::MapGet | Opcode::MapSet) {
+            // These handlers consume preparation-time patched operands (direct
+            // function/class indices, slot pointers, relocated fields or PIC ids),
+            // while original_ops keeps logical bytecode operands. Preserve the
+            // unfused continuation and copy only x/y from the executable op.
             let prepared_op = self.current_prepared().ops[self.hot_pc as usize];
             op.x = prepared_op.x;
             op.y = prepared_op.y;
@@ -7844,6 +7995,97 @@ impl TraceRuntime for Interpreter<'_> {
         let frame_changed = self.current_fiber != fiber || self.fiber(self.current_fiber).frames.len() != depth
             || self.hot_frame.is_null() || self.current_frame().function != function;
         Ok(TraceStep { before, after, frame_changed, running })
+    }
+
+
+    fn trace_execute_call_to_return(&mut self) -> Result<TraceStep, RuntimeError> {
+        let before = self.trace_current_location();
+        if self.hot_frame.is_null() {
+            return Err(RuntimeError::new("trace call boundary has no active frame"));
+        }
+
+        let caller_fiber = self.current_fiber;
+        let caller_depth = self.fiber(caller_fiber).frames.len();
+        let caller_function = self.current_frame().function;
+        let mut op = self.current_prepared().original_ops[self.hot_pc as usize];
+        let opcode = self.program.functions[caller_function as usize]
+            .chunk
+            .code[op.raw_pc as usize]
+            .opcode()
+            .ok_or_else(|| RuntimeError::new("trace call boundary has invalid opcode"))?;
+        if opcode == Opcode::CallDirect {
+            let prepared_op = self.current_prepared().ops[self.hot_pc as usize];
+            op.x = prepared_op.x;
+        }
+
+        if !matches!(
+            opcode,
+            Opcode::Invoke
+                | Opcode::InvokeSuper
+                | Opcode::CallDirect
+                | Opcode::CallClosure
+                | Opcode::CallPrimitive
+                | Opcode::CallForeign
+                | Opcode::ImportModule
+        ) {
+            return Err(RuntimeError::new("trace call-to-return used for non-call opcode"));
+        }
+
+        // Use an unfused logical call handler. In particular, do not let a
+        // prepared tail-call superinstruction consume the caller's continuation:
+        // the helper's contract is to stop exactly at the logical `next` PC.
+        let handler = match opcode {
+            Opcode::CallDirect | Opcode::CallClosure => handler_for_prepared(opcode, op.c as u8),
+            Opcode::Invoke => {
+                let prepared = self.current_prepared();
+                let index = self.hot_pc as usize;
+                let current = prepared.jit_entry_handlers[index]
+                    .unwrap_or(prepared.handlers[index]);
+                if is_unfused_monomorphic_invoke_handler(current) {
+                    current
+                } else {
+                    h_invoke
+                }
+            }
+            _ => handler_for(opcode),
+        };
+
+        unsafe { handler(self, &op); }
+
+        // A primitive/foreign/async call may complete without pushing a frame.
+        // Ordinary bytecode calls leave us in the callee; run baseline dispatch
+        // until that temporary call stack has unwound back to the caller.
+        while self.run_state == RunState::Running
+            && self.current_fiber == caller_fiber
+            && self.fiber(caller_fiber).frames.len() > caller_depth
+        {
+            if self.hot_frame.is_null() {
+                break;
+            }
+            let pc = self.hot_pc as usize;
+            let prepared = unsafe { &*self.hot_function };
+            if pc >= prepared.ops.len() {
+                self.fail(RuntimeError::new("program counter is outside function"));
+                break;
+            }
+            let handler = unsafe { *self.hot_handlers.add(pc) };
+            let op = unsafe { self.hot_ops.add(pc) };
+            unsafe { handler(self, op); }
+        }
+
+        let running = self.run_state == RunState::Running;
+        let after = self.trace_current_location();
+        let frame_changed = self.current_fiber != caller_fiber
+            || self.hot_frame.is_null()
+            || self.fiber(self.current_fiber).frames.len() != caller_depth
+            || self.current_frame().function != caller_function;
+
+        Ok(TraceStep {
+            before,
+            after,
+            frame_changed,
+            running,
+        })
     }
 
     fn trace_activation_inputs(&mut self) -> Result<TraceActivationInputs, RuntimeError> {
@@ -7899,20 +8141,31 @@ unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, fun
     // Rust unwinding must never cross generated code (it has no unwind metadata).
     let activation = unsafe { &mut *activation };
     let vm = unsafe { &mut *(activation.runtime as *mut Interpreter<'_>) };
+    let call_to_return = next & crate::wren_tracing_jit::TRACE_RUNTIME_CALL_FLAG != 0;
+    let next_pc = next & !crate::wren_tracing_jit::TRACE_RUNTIME_CALL_FLAG;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         vm.trace_set_location(TraceLocation::new(FuncId(function), BytecodePc(pc)))?;
-        vm.trace_execute_unfused_step()
+        if call_to_return {
+            vm.trace_execute_call_to_return()
+        } else {
+            vm.trace_execute_unfused_step()
+        }
     }));
     match result {
         Ok(Ok(step)) if step.running && !step.frame_changed
-            && step.after == TraceLocation::new(FuncId(function), BytecodePc(next)) => {
-                let inputs = vm.trace_activation_inputs().unwrap();
-                activation.general = inputs.general;
-                activation.arguments = inputs.arguments;
-                activation.returns = inputs.returns;
-                activation.special = inputs.special;
-                activation.method_epoch = vm.method_epoch;
-                0
+            && step.after == TraceLocation::new(FuncId(function), BytecodePc(next_pc)) => {
+                match vm.trace_activation_inputs() {
+                    Ok(inputs) => {
+                        activation.general = inputs.general;
+                        activation.arguments = inputs.arguments;
+                        activation.returns = inputs.returns;
+                        activation.special = inputs.special;
+                        activation.heap_chunks = inputs.heap_chunks;
+                        activation.method_epoch = vm.method_epoch;
+                        0
+                    }
+                    Err(error) => { vm.fail(error); 1 }
+                }
             },
         Ok(Ok(_)) => 1,
         Ok(Err(error)) => { vm.fail(error); 1 },
@@ -8088,15 +8341,15 @@ var result = Runner.run()
         let root_a = vm.add_root(map_a);
         let map_b = vm.heap.alloc(HeapObject::Map(WrenMap::default()));
         let root_b = vm.add_root(map_b);
-        let key_x = vm.heap.alloc(HeapObject::String(Arc::from(b"x".as_slice())));
+        let key_x = vm.heap.alloc(HeapObject::String(WrenString::new(Arc::from(b"x".as_slice()))));
         let root_x = vm.add_root(key_x);
-        let key_y = vm.heap.alloc(HeapObject::String(Arc::from(b"y".as_slice())));
+        let key_y = vm.heap.alloc(HeapObject::String(WrenString::new(Arc::from(b"y".as_slice()))));
         let root_y = vm.add_root(key_y);
         // Distinct String objects with equal bytes must still converge on the
         // same hidden-class transition and hit the same PIC entry by content.
-        let key_x_b = vm.heap.alloc(HeapObject::String(Arc::from(b"x".as_slice())));
+        let key_x_b = vm.heap.alloc(HeapObject::String(WrenString::new(Arc::from(b"x".as_slice()))));
         let root_x_b = vm.add_root(key_x_b);
-        let key_y_b = vm.heap.alloc(HeapObject::String(Arc::from(b"y".as_slice())));
+        let key_y_b = vm.heap.alloc(HeapObject::String(WrenString::new(Arc::from(b"y".as_slice()))));
         let root_y_b = vm.add_root(key_y_b);
 
         {
@@ -8165,9 +8418,9 @@ var result = Runner.run()
         let mut vm = Interpreter::new(&program).unwrap();
         let map = vm.heap.alloc(HeapObject::Map(WrenMap::default()));
         let root_map = vm.add_root(map);
-        let key = vm.heap.alloc(HeapObject::String(Arc::from(b"field".as_slice())));
+        let key = vm.heap.alloc(HeapObject::String(WrenString::new(Arc::from(b"field".as_slice()))));
         let root_key = vm.add_root(key);
-        let missing = vm.heap.alloc(HeapObject::String(Arc::from(b"missing".as_slice())));
+        let missing = vm.heap.alloc(HeapObject::String(WrenString::new(Arc::from(b"missing".as_slice()))));
         let root_missing = vm.add_root(missing);
 
         {
@@ -8227,7 +8480,7 @@ var result = Runner.run()
         let mut vm = Interpreter::new(&program).unwrap();
         let map = vm.heap.alloc(HeapObject::Map(WrenMap::default()));
         let root_map = vm.add_root(map);
-        let key = vm.heap.alloc(HeapObject::String(Arc::from(vec![b'k'; MAX_SHAPED_MAP_KEY_BYTES + 1])));
+        let key = vm.heap.alloc(HeapObject::String(WrenString::new(Arc::from(vec![b'k'; MAX_SHAPED_MAP_KEY_BYTES + 1]))));
         let root_key = vm.add_root(key);
 
         {
@@ -8241,6 +8494,41 @@ var result = Runner.run()
         ));
 
         vm.release_root(root_key);
+        vm.release_root(root_map);
+    }
+
+    #[test]
+    fn dictionary_string_keys_match_distinct_equal_strings() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+        let map = vm.heap.alloc(HeapObject::Map(WrenMap::default()));
+        let root_map = vm.add_root(map);
+
+        let bytes = vec![b'k'; MAX_SHAPED_MAP_KEY_BYTES + 1];
+        let key_a = vm.heap.alloc(HeapObject::String(WrenString::new(Arc::from(bytes.clone()))));
+        let root_a = vm.add_root(key_a);
+        let key_b = vm.heap.alloc(HeapObject::String(WrenString::new(Arc::from(bytes))));
+        let root_b = vm.add_root(key_b);
+
+        {
+            let mut context = HostContext { heap: &mut vm.heap };
+            context.map_set(map, key_a, Value::from_num(42.0)).unwrap();
+            assert_eq!(
+                context.map_get(map, key_b).unwrap().as_num(),
+                Some(42.0),
+                "dictionary lookup must use String content equality, not object identity"
+            );
+        }
+        assert!(matches!(
+            vm.heap.get(map),
+            Some(HeapObject::Map(WrenMap { storage: WrenMapStorage::Dictionary(_) }))
+        ));
+
+        vm.release_root(root_b);
+        vm.release_root(root_a);
         vm.release_root(root_map);
     }
 
@@ -8907,8 +9195,8 @@ var result = Runner.run()
                     let context = HostContext { heap: &mut vm.heap };
                     assert_eq!(context.map_len(data), Some(4));
                     let HeapObject::Map(map) = context.heap.get(data).unwrap() else { panic!("expected Map") };
-                    let empty = map.get(&context.heap.map_shapes, &MapKey::String(Arc::from(b"empty".as_slice()))).unwrap();
-                    let rows = map.get(&context.heap.map_shapes, &MapKey::String(Arc::from(b"rows".as_slice()))).unwrap();
+                    let empty = map.get(&context.heap.map_shapes, &MapKey::String(MapStringKey::new(Arc::from(b"empty".as_slice())))).unwrap();
+                    let rows = map.get(&context.heap.map_shapes, &MapKey::String(MapStringKey::new(Arc::from(b"rows".as_slice())))).unwrap();
                     assert_eq!(context.map_len(empty), Some(0));
                     assert_eq!(context.map_len(context.list_get(rows, 0).unwrap()), Some(0));
                 }
@@ -9309,6 +9597,42 @@ var result = ProtectedLoop.run()
         assert_eq!(source_result(&native), expected);
         let stats = native.jit_stats().unwrap();
         assert!(stats.native_entries > 0, "protected loop should enter native code: {stats:?}");
+    }
+
+    #[test]
+    fn generic_invoke_inside_hot_loop_returns_to_same_native_trace() {
+        let source = r#"
+class CallLoop {
+  static inc(x) { return x + 1 }
+  static run() {
+    var i = 0
+    var total = 0
+    while (i < 200) {
+      total = total + CallLoop.inc(i)
+      i = i + 1
+    }
+    return total
+  }
+}
+var result = CallLoop.run()
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+
+        let mut baseline = source_vm(&program, &manifest);
+        baseline.set_jit_options(None);
+        baseline.run_module(entry).unwrap();
+
+        let mut native = source_vm(&program, &manifest);
+        native.set_jit_options(Some(TracingJitOptions {
+            hot_loop_threshold: 2,
+            native_loop_iteration_budget: 0,
+            ..Default::default()
+        }));
+        native.run_module(entry).unwrap();
+        assert_eq!(source_result(&native), 20100.0);
+        assert_eq!(source_result(&native), source_result(&baseline));
+        let stats = native.jit_stats().unwrap();
+        assert!(stats.native_entries > 0, "call-containing loop should enter native code: {stats:?}");
     }
 
     #[test]
@@ -9828,7 +10152,7 @@ var result = ProtectedLoop.run()
             );
         }
         for i in 0..32 {
-            let child = vm.heap.alloc(HeapObject::String(Arc::from(format!("child{i}").as_bytes())));
+            let child = vm.heap.alloc(HeapObject::String(WrenString::new(Arc::from(format!("child{i}").as_bytes()))));
             let mut context = HostContext { heap: &mut vm.heap };
             context.list_push(list, child).unwrap();
             context.map_set(map, list, child).unwrap();

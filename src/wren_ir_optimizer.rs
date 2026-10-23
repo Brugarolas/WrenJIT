@@ -17,7 +17,8 @@
 #![allow(clippy::needless_return)]
 
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
+use hashbrown::HashMap;
+use std::collections::VecDeque;
 use std::mem::{discriminant, replace, Discriminant};
 use std::marker::PhantomData;
 

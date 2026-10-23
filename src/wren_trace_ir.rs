@@ -5,7 +5,7 @@
 //! registers but preserve unaffected SSA values across the call. Runtime-written result
 //! slots are explicitly reloaded afterwards.
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 use crate::wren_bytecode::{ArgReg, BytecodePc, Reg, RegisterKind, ReturnReg, SpecialReg};
 use crate::wren_ir::{BuiltinId, CmpKind, F64BinOp, F64UnaryOp, FuncId, IntBinOp, IntUnaryOp, StringId};
 
@@ -30,6 +30,13 @@ pub enum TraceRep { Tagged, Int32, UInt32, F64, Bool, HeapHandle, RawPtr }
 pub enum TraceType { Any, Null, Bool, Num, Int32, UInt32, F64 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TraceClass { Builtin(BuiltinId) }
+
+/// Heap kind proven by GuardHeapObject. Kept in backend-neutral Trace IR so
+/// recorder and backend can share the proof without depending on the runtime
+/// sidecar's concrete enum definition. Cross-node guard optimization is left to
+/// the dedicated Trace IR optimization pass work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TraceHeapObjectKind { String, List, Map, Cell, Instance, Promise }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TraceConstant {
     Null, Bool(bool), NumBits(u64), Int32(i32), F64Bits(u64), String(StringId), BuiltinClass(BuiltinId),
@@ -73,6 +80,31 @@ pub enum TraceInst {
     CommitFrameSlot { slot: FrameSlot, value: TraceValueId },
     /// Executes precisely one original opcode, with synchronized VM registers.
     Runtime { location: TraceLocation, next: BytecodePc, terminal: bool },
+    /// Executes a call-like bytecode and, on the successful synchronous path,
+    /// runs the callee until control returns to the same caller frame at `next`.
+    /// This is a full GC/memory epoch: no heap address or cached register value
+    /// may survive it, but it avoids bouncing through the tiering manager merely
+    /// because a call pushed a temporary bytecode frame.
+    RuntimeCall { location: TraceLocation, next: BytecodePc },
+    /// Direct access to a VM-owned, lifetime-stable tagged Value slot. Module
+    /// globals and class static fields use fixed-size backing arrays, so their
+    /// addresses are stable for the lifetime of one Interpreter/JIT instance.
+    LoadAbsoluteValue { address: u64 },
+    StoreAbsoluteValue { address: u64, value: TraceValueId },
+    /// Specialized `IsInstance`: the class operand is guarded against the
+    /// observed class object and the tested value is compared against the
+    /// immutable runtime receiver-class keys of that class and its subclasses.
+    IsInstanceObserved {
+        value: TraceValueId,
+        class: TraceValueId,
+        expected_class: u64,
+        instance_classes: Vec<u64>,
+        /// Finalized runtime classes known when recording. A future/dynamically
+        /// linked class outside this set side-exits instead of returning a stale
+        /// false result.
+        known_classes: Vec<u64>,
+        exit: SideExitId,
+    },
     GuardTruthy { value: TraceValueId, exit: SideExitId },
     GuardFalsey { value: TraceValueId, exit: SideExitId },
     GuardNotNull { value: TraceValueId, exit: SideExitId },
@@ -101,6 +133,10 @@ pub enum TraceInst {
     BoxInt32 { value: TraceValueId }, BoxUInt32 { value: TraceValueId }, BoxF64 { value: TraceValueId },
     Int32ToF64 { value: TraceValueId }, UInt32ToF64 { value: TraceValueId }, F64ToInt32 { value: TraceValueId, exit: SideExitId },
     TaggedToHeapHandle { value: TraceValueId, exit: SideExitId },
+    /// Prove heap tag, liveness and semantic heap kind once and return the stable
+    /// TraceHeapEntry pointer. The moving object address is deliberately *not* the
+    /// result; native heap operations reload it from this sidecar after each epoch.
+    GuardHeapObject { value: TraceValueId, kind: TraceHeapObjectKind, exit: SideExitId },
     HeapLoadField { object: TraceValueId, slot: u32, exit: SideExitId },
     HeapStoreField { object: TraceValueId, value: TraceValueId, slot: u32, exit: SideExitId },
     HeapLoadCell { cell: TraceValueId, exit: SideExitId },
@@ -138,13 +174,15 @@ impl TraceInst {
     pub fn visit_operands(&mut self, mut f: impl FnMut(&mut TraceValueId)) {
         use TraceInst::*;
         match self {
-            Nop | LoadFrameSlot { .. } | Runtime { .. } | GuardMethodEpoch { .. } => {},
+            Nop | LoadFrameSlot { .. } | Runtime { .. } | RuntimeCall { .. }
+            | LoadAbsoluteValue { .. } | GuardMethodEpoch { .. } => {},
             Copy { value } | Reinterpret { value } | CommitFrameSlot { value, .. } | GuardTruthy { value, .. }
             | GuardFalsey { value, .. } | GuardNotNull { value, .. } | GuardF64 { value, .. }
             | GuardInt32 { value, .. } | GuardUInt32 { value, .. } | GuardType { value, .. } | GuardClass { value, .. } | IntUnary { value, .. }
             | F64Unary { value, .. } | F64Math { value, .. } | IsNull { value } | BoxInt32 { value } | BoxUInt32 { value } | BoxF64 { value }
-            | Int32ToF64 { value } | UInt32ToF64 { value } | F64ToInt32 { value, .. } | TaggedToHeapHandle { value, .. }
+            | Int32ToF64 { value } | UInt32ToF64 { value } | F64ToInt32 { value, .. } | TaggedToHeapHandle { value, .. } | GuardHeapObject { value, .. }
             | ReadBarrier { value }
+            | StoreAbsoluteValue { value, .. }
             | HeapLoadField { object: value, .. }
             | HeapLoadCell { cell: value, .. }
             | HeapListLen { list: value, .. }
@@ -156,6 +194,7 @@ impl TraceInst {
             GuardEq { lhs, rhs, .. } | IntBinary { lhs, rhs, .. } | IntBinaryChecked { lhs, rhs, .. }
             | F64Binary { lhs, rhs, .. } | IntCompare { lhs, rhs, .. } | F64Compare { lhs, rhs, .. }
             | RefEq { lhs, rhs }
+            | IsInstanceObserved { value: lhs, class: rhs, .. }
             | HeapStoreField { object: lhs, value: rhs, .. }
             | HeapStoreCell { cell: lhs, value: rhs, .. }
             | HeapListGet { list: lhs, index: rhs, .. }
@@ -190,13 +229,13 @@ impl TraceInst {
             GuardMethodEpoch { exit, .. } | GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
             | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. } | GuardType { exit, .. } | GuardClass { exit, .. }
             | GuardBounds { exit, .. } | GuardSwitch { exit, .. } | GuardEq { exit, .. }
-            | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. }
+            | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. } | GuardHeapObject { exit, .. }
             | HeapLoadField { exit, .. } | HeapStoreField { exit, .. }
             | HeapLoadCell { exit, .. } | HeapStoreCell { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. } | HeapListSet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. }
             | HeapMapSetShaped { exit, .. } | HeapStringLen { exit, .. }
-            | HeapAwaitFulfilled { exit, .. } => Some(*exit),
+            | HeapAwaitFulfilled { exit, .. } | IsInstanceObserved { exit, .. } => Some(*exit),
             _ => None,
         }
     }
@@ -207,7 +246,8 @@ impl TraceInst {
         matches!(self, Self::GuardMethodEpoch { .. } | Self::GuardTruthy { .. } | Self::GuardFalsey { .. }
             | Self::GuardNotNull { .. } | Self::GuardType { .. } | Self::GuardClass { .. }
             | Self::GuardBounds { .. } | Self::GuardEq { .. } | Self::GuardSwitch { .. }
-            | Self::GuardF64 { .. } | Self::GuardInt32 { .. } | Self::GuardUInt32 { .. })
+            | Self::GuardF64 { .. } | Self::GuardInt32 { .. } | Self::GuardUInt32 { .. }
+            | Self::GuardHeapObject { .. } | Self::IsInstanceObserved { .. })
     }
 
     pub fn is_heap_read(&self) -> bool {
@@ -224,6 +264,7 @@ impl TraceInst {
             | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. }
             | GuardType { exit, .. } | GuardClass { exit, .. } | GuardBounds { exit, .. }
             | GuardEq { exit, .. } | GuardSwitch { exit, .. }
+            | GuardHeapObject { exit, .. } | IsInstanceObserved { exit, .. }
             | HeapLoadField { exit, .. } | HeapLoadCell { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. }
@@ -477,6 +518,17 @@ impl TraceBuilder {
     pub fn runtime(&mut self, location: TraceLocation, next: BytecodePc, terminal: bool) {
         self.commit();
         self.emit0(TraceInst::Runtime { location, next, terminal });
+        self.slots.clear();
+        self.memory_epoch = true;
+    }
+
+
+    /// Full synchronized call boundary which resumes the native trace only after
+    /// a synchronous call has returned to the same caller frame. Like `runtime`,
+    /// this invalidates all cached architectural and heap state.
+    pub fn runtime_call(&mut self, location: TraceLocation, next: BytecodePc) {
+        self.commit();
+        self.emit0(TraceInst::RuntimeCall { location, next });
         self.slots.clear();
         self.memory_epoch = true;
     }

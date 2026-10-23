@@ -9,10 +9,16 @@ use crate::wren_trace_ir::*;
 use crate::wren_trace_ir_optimizer::{
     Optimize, TraceOptimization, alias_value, append_preheader, canonicalize_references,
 };
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 
 mod advanced;
 pub use advanced::*;
+mod boolean_optimizations;
+pub use boolean_optimizations::*;
+mod memory_optimizations;
+pub use memory_optimizations::*;
+mod snapshot_optimizations;
+pub use snapshot_optimizations::*;
 mod peephole;
 pub use peephole::*;
 
@@ -26,27 +32,56 @@ pub fn conservative_optimization_passes() -> Optimize {
 
 fn passes(promote_loop_representations: bool) -> Optimize {
     Optimize::new()
+        // Establish compact representations and remove recorder-level boxing noise.
         .with_pass(TraceCanonicalization {
             promote_loop_representations,
         })
         .with_pass(SparseConditionalConstantPropagation)
+        .with_pass(ConversionSimplification)
+        .with_pass(TraceCanonicalization {
+            promote_loop_representations: false,
+        })
+        .with_pass(PredicateSimplification)
+        .with_pass(BooleanMaterializationElimination)
+        .with_pass(CommutativeCanonicalization)
+        .with_pass(IntegerCanonicalization)
         .with_pass(AlgebraicSimplification)
+        // Propagate successful-path facts before global value numbering.
         .with_pass(InductionVariableSimplification)
         .with_pass(ClassTypePropagation)
+        .with_pass(HeapFactPropagation)
+        .with_pass(GuardCoalescing)
         .with_pass(RedundantGuardElimination)
+        .with_pass(ArchitecturalLoadForwarding)
         .with_pass(DominatorTreeGVN)
+        // Loop transforms expose additional canonical expressions and memory PRE.
         .with_pass(LoopInvariantCodeMotion)
         .with_pass(PartialRedundancyElimination)
         .with_pass(StrengthReduction)
+        .with_pass(IntegerCanonicalization)
         .with_pass(RangeAnalysis)
         .with_pass(LoadStorePRE)
+        .with_pass(ArchitecturalLoadForwarding)
         .with_pass(LoopInvariantGuardHoisting)
         .with_pass(LoopUnswitching)
         .with_pass(LoopInvariantCodeMotion)
+        // Late fixed-point cleanup after the structural loop transforms.
+        .with_pass(ConversionSimplification)
+        .with_pass(TraceCanonicalization {
+            promote_loop_representations: false,
+        })
+        .with_pass(PredicateSimplification)
+        .with_pass(BooleanMaterializationElimination)
+        .with_pass(CommutativeCanonicalization)
+        .with_pass(IntegerCanonicalization)
         .with_pass(AlgebraicSimplification)
+        .with_pass(HeapFactPropagation)
+        .with_pass(GuardCoalescing)
         .with_pass(RedundantGuardElimination)
         .with_pass(GlobalValueNumbering)
         .with_pass(SparseConditionalConstantPropagation)
+        .with_pass(SnapshotConstantPropagation)
+        .with_pass(DeadCodeElimination)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -113,7 +148,7 @@ fn native_loop(trace: &Trace) -> bool {
         && !trace
             .nodes
             .iter()
-            .any(|n| matches!(n.kind, TraceInst::Runtime { .. }))
+            .any(|n| matches!(n.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }))
 }
 
 /// Value numbering across the complete linear trace, including its preheader.
@@ -153,7 +188,7 @@ impl TraceOptimization for GlobalValueNumbering {
             .collect();
         let mut values = HashMap::<Expression, TraceValueId>::new();
         for id in order {
-            if matches!(trace.nodes[id].kind, TraceInst::Runtime { .. }) {
+            if matches!(trace.nodes[id].kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }) {
                 values.clear();
                 continue;
             }
@@ -341,7 +376,7 @@ impl TraceOptimization for TraceCanonicalization {
         let has_runtime = trace
             .nodes
             .iter()
-            .any(|node| matches!(node.kind, TraceInst::Runtime { .. }));
+            .any(|node| matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }));
         self.cancel_box_guard_pairs(trace);
         if !has_runtime {
             self.hoist_invariant_numeric_guards(trace);

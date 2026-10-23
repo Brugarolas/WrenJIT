@@ -104,51 +104,293 @@ pub fn optimize_program_parallel(program: &mut Program, worker_count: usize) {
 pub struct InterpreterOptimizationBundle;
 
 impl FunctionOptimization for InterpreterOptimizationBundle {
+    /// This deliberately uses the most aggressive behavior:
+    /// - an initial local fixed-point to expose cheap opportunities early;
+    /// - CFG cleanup before escape analysis;
+    /// - SROA/PEA followed by scalar cleanup;
+    /// - up to four global fixed-point rounds including dominator CSE;
+    /// - extra cleanup whenever any optimization changes the function.
     fn optimize_function(&mut self, function: &mut Function) -> bool {
         let mut changed_any = false;
+
+        let mut cse = DominatorCSE::default();
         let mut simplify = FastLocalSimplify::default();
         let mut copies = CopyPropagation::default();
+        let mut dce = DeadCodeElimination::default();
+        let mut cfg = ControlFlowCleanup::default();
+        let mut sroa = ScalarReplacement::default();
 
-        // Two rounds are enough to expose almost all copy/fold/CSE chains while
-        // giving cold start a strict upper bound.
+        // ---------------------------------------------------------------------
+        // Phase 1: cheap local fixed point.
+        //
+        // Keep the original interpreter-oriented warm-up because folding and copy
+        // propagation make later global CSE and SROA substantially more effective.
+        // ---------------------------------------------------------------------
         for _ in 0..2 {
             let simplified = simplify.optimize_function(function);
             let propagated = copies.optimize_function(function);
-            changed_any |= simplified | propagated;
-            if !simplified && !propagated {
+
+            let changed = simplified | propagated;
+            changed_any |= changed;
+
+            if !changed {
                 break;
             }
         }
 
-        let mut dce = DeadCodeElimination::default();
+        // Remove dead values before touching the CFG.
         changed_any |= dce.optimize_function(function);
 
-        let mut cfg = ControlFlowCleanup::default();
+        // Simplify/thread the CFG before escape analysis and dominator-based work.
         let cfg_changed = cfg.optimize_function(function);
         changed_any |= cfg_changed;
 
-        // CFG threading can make block parameters trivially invariant. One final
-        // copy/DCE cleanup captures that win without another full fixed point.
         if cfg_changed {
             let propagated = copies.optimize_function(function);
             changed_any |= propagated;
+
             if propagated {
+                changed_any |= simplify.optimize_function(function);
                 changed_any |= dce.optimize_function(function);
             }
         }
 
-        // Partial escape analysis + scalar replacement runs on the cleaned CFG.
-        // Virtualized fields turn into plain SSA values, which exposes new
-        // folding/copy/DCE opportunities, so re-run the cheap cleanups once.
-        let mut sroa = ScalarReplacement::default();
+        // ---------------------------------------------------------------------
+        // Phase 2: first PEA/SROA pass.
+        //
+        // Running this before the global fixed point exposes virtual-object fields
+        // as ordinary SSA values, which can then participate in CSE/folding/etc.
+        // ---------------------------------------------------------------------
         if sroa.optimize_function(function) {
             changed_any = true;
+
+            // Scalar replacement commonly leaves moves, constants and dead nodes
+            // behind, so clean them immediately.
             simplify.optimize_function(function);
             copies.optimize_function(function);
             dce.optimize_function(function);
         }
 
+        // ---------------------------------------------------------------------
+        // Phase 3: aggressive whole-function fixed point.
+        //
+        // Four rounds preserve the more aggressive policy from
+        // AggressiveOptimizationBundle while bounding compile time.
+        // ---------------------------------------------------------------------
+        for _ in 0..4 {
+            let mut round = false;
+
+            // Global pure-expression elimination first. This can expose constants
+            // and simpler operands to all subsequent local passes.
+            round |= cse.optimize_function(function);
+
+            // Canonicalize SSA identities before algebraic simplification.
+            round |= copies.optimize_function(function);
+
+            // Constant folding, peepholes, local CSE, guard simplification, memory
+            // forwarding and the other bounded transformations contained here.
+            round |= simplify.optimize_function(function);
+
+            // Remove newly dead instructions before CFG transformations.
+            round |= dce.optimize_function(function);
+
+            // Thread/simplify CFG after data-flow simplification.
+            round |= cfg.optimize_function(function);
+
+            // Re-run PEA/SROA because all previous passes may have converted an
+            // escaping allocation into a non-escaping or partially escaping one.
+            round |= sroa.optimize_function(function);
+
+            if round {
+                // SROA and CFG cleanup frequently expose another short scalar chain.
+                // Do a cleanup here rather than waiting for the next global round.
+                let propagated = copies.optimize_function(function);
+                let simplified = simplify.optimize_function(function);
+                let eliminated = dce.optimize_function(function);
+
+                round |= propagated | simplified | eliminated;
+            }
+
+            changed_any |= round;
+
+            if !round {
+                break;
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Phase 4: final canonical cleanup.
+        //
+        // We intentionally do not run another SROA here: if SROA could make another
+        // change, the fixed-point loop above would not have terminated.
+        // ---------------------------------------------------------------------
+        let final_copies = copies.optimize_function(function);
+        let final_simplify = simplify.optimize_function(function);
+
+        let mut final_changed = final_copies | final_simplify;
+
+        if final_changed {
+            final_changed |= dce.optimize_function(function);
+        }
+
+        changed_any |= final_changed;
+
         changed_any
+    }
+}
+
+/// Global value numbering for effect-free WIR expressions using the dominator
+/// tree. The default interpreter optimizer intentionally performs only block-local
+/// CSE; this pass is reserved for the aggressive/hot tier where constructing the
+/// CFG and dominators is amortized by repeated execution.
+#[derive(Default)]
+pub struct DominatorCSE;
+
+impl FunctionOptimization for DominatorCSE {
+    fn optimize_function(&mut self, function: &mut Function) -> bool {
+        let n = function.blocks.len();
+        if n <= 1 {
+            return false;
+        }
+
+        let mut succs = vec![Vec::<usize>::new(); n];
+        for (block_ix, block) in function.blocks.iter().enumerate() {
+            if let Some(term) = block.insts.last().and_then(|id| function.node(*id)) {
+                for edge in term.kind.edges() {
+                    let target = edge.target.0 as usize;
+                    if target < n && !succs[block_ix].contains(&target) {
+                        succs[block_ix].push(target);
+                    }
+                }
+            }
+        }
+        // Exceptional handlers are real CFG successors for dominance purposes.
+        for region in &function.exception_regions {
+            let handler = region.handler.0 as usize;
+            if handler >= n {
+                continue;
+            }
+            for &protected in &region.protected_blocks {
+                let source = protected.0 as usize;
+                if source < n && !succs[source].contains(&handler) {
+                    succs[source].push(handler);
+                }
+            }
+        }
+
+        let entry = function.entry.0 as usize;
+        if entry >= n {
+            return false;
+        }
+        let mut reachable = vec![false; n];
+        let mut post = Vec::with_capacity(n);
+        reachable[entry] = true;
+        let mut stack = vec![(entry, 0usize)];
+        while let Some((block, next)) = stack.last_mut() {
+            if *next < succs[*block].len() {
+                let child = succs[*block][*next];
+                *next += 1;
+                if !reachable[child] {
+                    reachable[child] = true;
+                    stack.push((child, 0));
+                }
+            } else {
+                post.push(*block);
+                stack.pop();
+            }
+        }
+        let rpo: Vec<usize> = post.into_iter().rev().collect();
+        if rpo.is_empty() {
+            return false;
+        }
+        let mut rpo_index = vec![usize::MAX; n];
+        for (index, &block) in rpo.iter().enumerate() {
+            rpo_index[block] = index;
+        }
+        let mut preds = vec![Vec::<usize>::new(); n];
+        for &block in &rpo {
+            for &succ in &succs[block] {
+                if reachable[succ] {
+                    preds[succ].push(block);
+                }
+            }
+        }
+        let mut idom = vec![usize::MAX; n];
+        idom[entry] = entry;
+        let intersect = |idom: &[usize], mut a: usize, mut b: usize| -> usize {
+            while a != b {
+                while rpo_index[a] > rpo_index[b] {
+                    a = idom[a];
+                }
+                while rpo_index[b] > rpo_index[a] {
+                    b = idom[b];
+                }
+            }
+            a
+        };
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for &block in rpo.iter().skip(1) {
+                let mut new_idom = usize::MAX;
+                for &pred in &preds[block] {
+                    if idom[pred] == usize::MAX {
+                        continue;
+                    }
+                    new_idom = if new_idom == usize::MAX {
+                        pred
+                    } else {
+                        intersect(&idom, pred, new_idom)
+                    };
+                }
+                if new_idom != usize::MAX && idom[block] != new_idom {
+                    idom[block] = new_idom;
+                    progress = true;
+                }
+            }
+        }
+
+        let mut children = vec![Vec::<usize>::new(); n];
+        for &block in rpo.iter().skip(1) {
+            if idom[block] != usize::MAX {
+                children[idom[block]].push(block);
+            }
+        }
+
+        fn visit(
+            function: &mut Function,
+            block: usize,
+            children: &[Vec<usize>],
+            inherited: &HashMap<PureKey, ValueId>,
+            changed: &mut bool,
+        ) {
+            let mut values = inherited.clone();
+            let insts = function.blocks[block].insts.clone();
+            for id in insts {
+                let kind = function.nodes[id.0 as usize].kind.clone();
+                let Some(key) = pure_key(&kind) else {
+                    continue;
+                };
+                let Some(result) = single_result(function, id) else {
+                    continue;
+                };
+                if let Some(&previous) = values.get(&key) {
+                    if previous != result {
+                        function.nodes[id.0 as usize].kind = Inst::Move(previous);
+                        *changed = true;
+                    }
+                } else {
+                    values.insert(key, result);
+                }
+            }
+            for &child in &children[block] {
+                visit(function, child, children, &values, changed);
+            }
+        }
+
+        let mut changed = false;
+        visit(function, entry, &children, &HashMap::new(), &mut changed);
+        changed
     }
 }
 

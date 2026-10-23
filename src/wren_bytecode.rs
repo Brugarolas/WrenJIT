@@ -33,7 +33,7 @@
 #![allow(clippy::identity_op)]
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 use std::fmt;
 
 use crate::wren_ir::{

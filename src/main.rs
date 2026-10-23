@@ -60,7 +60,7 @@ use std::process::ExitCode;
 
 use mimalloc::MiMalloc;
 
-use crate::wren_interpreter::{ExecutionResult, Interpreter};
+use crate::wren_interpreter::{ExecutionResult, Interpreter, WrenString};
 use crate::wren_ir::Program;
 
 #[global_allocator]

@@ -2,6 +2,7 @@
 use super::*;
 use crate::wren_bytecode::*;
 use crate::wren_ir::{ClassInfo, ModuleInfo, MethodSignature, MethodKind, ForeignFunctionInfo, SiteId, DeoptId};
+use crate::wren_interpreter::WrenString;
 
 struct TestHost;
 impl Host for TestHost {
@@ -281,9 +282,9 @@ fn heap_reference_stores_use_the_native_barrier_path() {
         let mut baseline = setup(&program, opcode);
         let mut native = setup(&program, opcode);
 
-        let baseline_child = baseline.heap.alloc(HeapObject::String(Arc::from(b"child".as_slice())));
+        let baseline_child = baseline.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(b"child".as_slice()))));
         baseline.add_root(baseline_child);
-        let native_child = native.heap.alloc(HeapObject::String(Arc::from(b"child".as_slice())));
+        let native_child = native.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(b"child".as_slice()))));
         native.add_root(native_child);
         let value_reg = match opcode {
             StoreField | StoreCell => Reg(1),

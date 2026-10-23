@@ -44,7 +44,7 @@
 #![allow(clippy::type_complexity)]
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
@@ -69,7 +69,7 @@ use crate::wren_ir::{
 use crate::wren_trace_ir::{
     verify_trace, ExitReason, ExitTarget, FrameDisposition, FrameSlot,
     SnapshotValue, SideExit, SideExitId, Trace, TraceAnchor, TraceClass,
-    TraceConstant, TraceId, TraceInst, TraceKind, TraceLocation,
+    TraceConstant, TraceHeapObjectKind, TraceId, TraceInst, TraceKind, TraceLocation,
     TraceRep, TraceSwitchGuard, TraceMathOp, TraceTerminator, TraceType, TraceValueId,
     TraceValueOrigin,
 };
@@ -163,6 +163,10 @@ pub const TRACE_RESULT_SIDE_EXIT: u32 = 1;
 pub const TRACE_RESULT_RETURNED: u32 = 2;
 pub const TRACE_RESULT_LINK: u32 = 3;
 pub const TRACE_RESULT_RUNTIME: u32 = 4;
+/// High bit in the runtime-helper `next` operand. It requests call-to-return
+/// execution instead of exactly one bytecode step. Bytecode PCs are u32 word
+/// offsets and the verifier never emits code streams approaching this boundary.
+pub const TRACE_RUNTIME_CALL_FLAG: u32 = 1 << 31;
 
 /// Maximum number of distinct dynamic values one side-exit snapshot may
 /// describe. Native exits now commit these values directly to architectural
@@ -390,9 +394,10 @@ pub struct ShapedMapAccess {
 /// - expose pointers for the *current* frame in `trace_activation_inputs`;
 /// - execute `trace_execute_unfused_step` using the original opcode handler, not
 ///   an installed superinstruction;
-/// - keep those activation pointers stable while native code executes. Native
-///   runtime leaf calls are restricted to bytecodes whose contract forbids GC and
-///   frame/fiber changes, so the register-bank pointers remain stable across them.
+/// - keep activation pointers stable between synchronized runtime boundaries.
+///   Non-GC leaf calls preserve them; full/runtime-call boundaries may move the
+///   register stack or heap and must refresh `TraceActivation` before native code
+///   resumes.
 pub trait TraceRuntime {
     type RuntimeError: Error + Send + Sync + 'static;
 
@@ -414,6 +419,33 @@ pub trait TraceRuntime {
     /// Field slots are relocated when a class is linked to its superclass.
     fn trace_field_slot(&self, _location: TraceLocation, local_slot: u32) -> u32 { local_slot }
 
+    /// Stable address of the module-global slot referenced by this bytecode.
+    /// Module variable arrays are fixed-size for the lifetime of an interpreter.
+    fn trace_module_slot_address(&self, _location: TraceLocation) -> Option<usize> { None }
+
+    /// Observe one class static-field access. Returns the exact receiver-class
+    /// key of the class object plus the lifetime-stable address of the slot.
+    fn trace_static_field_access(
+        &self,
+        _class: RegisterWord,
+        _slot: u32,
+    ) -> Option<(u64, usize)> {
+        None
+    }
+
+    /// Observe the class operand of IsInstance. The first element is the exact
+    /// receiver-class key of the class object; the second contains every finalized
+    /// instance/foreign receiver-class key accepted by that class, and the third
+    /// contains every finalized instance/foreign receiver-class key currently known.
+    /// Unknown future dynamic classes therefore side-exit instead of reusing a stale
+    /// negative hierarchy observation.
+    fn trace_is_instance_observation(
+        &self,
+        _class: RegisterWord,
+    ) -> Option<(u64, Vec<u64>, Vec<u64>)> {
+        None
+    }
+
     fn trace_current_location(&self) -> TraceLocation;
 
     fn trace_read_slot(&self, slot: FrameSlot) -> Result<RegisterWord, Self::RuntimeError>;
@@ -430,6 +462,13 @@ pub trait TraceRuntime {
     ) -> Result<(), Self::RuntimeError>;
 
     fn trace_execute_unfused_step(&mut self) -> Result<TraceStep, Self::RuntimeError>;
+
+    /// Execute the call-like opcode at the current location and, for ordinary
+    /// synchronous bytecode calls, continue the baseline interpreter until the
+    /// callee returns to the same caller frame. Implementations must stop early
+    /// if execution suspends/fails/switches fiber or otherwise cannot resume at
+    /// the requested continuation.
+    fn trace_execute_call_to_return(&mut self) -> Result<TraceStep, Self::RuntimeError>;
 
     fn trace_activation_inputs(
         &mut self,
@@ -613,6 +652,9 @@ pub struct TracingJitStats {
     pub eliminated_trace_guards: u64,
     pub eliminated_trace_boxes: u64,
     pub eliminated_trace_copies: u64,
+    pub trace_gvn_eliminated: u64,
+    pub trace_licm_hoisted: u64,
+    pub trace_pre_eliminated: u64,
     pub last_abort: Option<String>,
 }
 
@@ -948,6 +990,21 @@ impl<'a> TraceRecorder<'a> {
         builder.write_slot(FrameSlot::General(Reg(reg)), value);
     }
 
+    #[inline]
+    fn guard_heap_object(
+        &self,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
+        value: TraceValueId,
+        kind: TraceHeapObjectKind,
+        exit: SideExitId,
+    ) -> TraceValueId {
+        builder.emit1(
+            TraceInst::GuardHeapObject { value, kind, exit },
+            TraceType::Any,
+            TraceRep::RawPtr,
+        )
+    }
+
     fn tagged_bool(
         &self,
         builder: &mut crate::wren_trace_ir::TraceBuilder,
@@ -1067,7 +1124,7 @@ impl<'a> TraceRecorder<'a> {
             .trace()
             .nodes
             .iter()
-            .filter(|node| matches!(node.kind, TraceInst::Runtime { .. }))
+            .filter(|node| matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }))
             .count();
         if used >= MAX_RUNTIME_LEAF_OPS_PER_TRACE {
             return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
@@ -1353,6 +1410,29 @@ impl<'a> TraceRecorder<'a> {
                 builder.runtime(op.location, op.next_pc, terminal);
                 Ok(ExpectedStep::Runtime { terminal })
             }
+        }
+    }
+
+    fn inline_or_runtime_call<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::wren_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        // Inlining is preferable, but it is speculative. If the callee is too
+        // large/complex (or contains an opcode the bounded inliner refuses), roll
+        // back every emitted guard/node and keep the call inside the native trace
+        // as a synchronized RuntimeCall instead of aborting the whole trace.
+        let checkpoint = builder.clone();
+        match self.inline_call(runtime, program, op, builder) {
+            Ok(step) => Ok(step),
+            Err(RecordingAbort::UnsupportedCall | RecordingAbort::UnsupportedOpcode(_)) => {
+                *builder = checkpoint;
+                builder.runtime_call(op.location, op.next_pc);
+                Ok(ExpectedStep::RuntimeCall)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1919,10 +1999,10 @@ impl<'a> TraceRecorder<'a> {
                 if self.record_num_invoke(runtime, program, function, op, builder)? {
                     Ok(ExpectedStep::Exact(next))
                 } else {
-                    self.inline_call(runtime, program, op, builder)
+                    self.inline_or_runtime_call(runtime, program, op, builder)
                 }
             }
-            CallDirect => self.inline_call(runtime, program, op, builder),
+            CallDirect => self.inline_or_runtime_call(runtime, program, op, builder),
 
             // Specialized integer unary.
             INeg | IBitNot => {
@@ -2227,6 +2307,7 @@ impl<'a> TraceRecorder<'a> {
             LoadField => {
                 let object = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let object = self.guard_heap_object(builder, object, TraceHeapObjectKind::Instance, exit);
                 let result = builder.emit1(
                     TraceInst::HeapLoadField { object, slot: runtime.trace_field_slot(op.location, op.x), exit },
                     TraceType::Any,
@@ -2240,6 +2321,7 @@ impl<'a> TraceRecorder<'a> {
                 let object = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let object = self.guard_heap_object(builder, object, TraceHeapObjectKind::Instance, exit);
                 builder.emit0(TraceInst::HeapStoreField {
                     object, value, slot: runtime.trace_field_slot(op.location, op.x), exit });
                 Ok(ExpectedStep::Exact(next))
@@ -2248,6 +2330,7 @@ impl<'a> TraceRecorder<'a> {
             LoadCell => {
                 let cell = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let cell = self.guard_heap_object(builder, cell, TraceHeapObjectKind::Cell, exit);
                 let result = builder.emit1(
                     TraceInst::HeapLoadCell { cell, exit },
                     TraceType::Any,
@@ -2261,6 +2344,7 @@ impl<'a> TraceRecorder<'a> {
                 let cell = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                 let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let cell = self.guard_heap_object(builder, cell, TraceHeapObjectKind::Cell, exit);
                 builder.emit0(TraceInst::HeapStoreCell { cell, value, exit });
                 Ok(ExpectedStep::Exact(next))
             }
@@ -2268,6 +2352,7 @@ impl<'a> TraceRecorder<'a> {
             ListLen => {
                 let list = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let list = self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
                 let result = builder.emit1(
                     TraceInst::HeapListLen { list, exit },
                     TraceType::Int32,
@@ -2281,6 +2366,7 @@ impl<'a> TraceRecorder<'a> {
                 let list = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let index = self.read_gpr(builder, op.c, TraceType::Int32, TraceRep::Int32)?;
                 let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
+                let list = self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
                 let result = builder.emit1(
                     TraceInst::HeapListGet { list, index, exit },
                     TraceType::Any,
@@ -2295,6 +2381,7 @@ impl<'a> TraceRecorder<'a> {
                 let index = self.read_gpr(builder, op.b, TraceType::Int32, TraceRep::Int32)?;
                 let value = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardBounds, op.location.pc);
+                let list = self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
                 builder.emit0(TraceInst::HeapListSet { list, index, value, exit });
                 Ok(ExpectedStep::Exact(next))
             }
@@ -2302,6 +2389,7 @@ impl<'a> TraceRecorder<'a> {
             MapLen => {
                 let map = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
                 let result = builder.emit1(
                     TraceInst::HeapMapLen { map, exit },
                     TraceType::Int32,
@@ -2322,6 +2410,7 @@ impl<'a> TraceRecorder<'a> {
                     .map_err(|_| RecordingAbort::UnsupportedOpcode(op.opcode))?;
                 if let Some(access) = runtime.trace_shaped_map_access(map_word, key_word) {
                     let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                    let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
                     let result = builder.emit1(
                         TraceInst::HeapMapGetShaped {
                             map,
@@ -2361,6 +2450,7 @@ impl<'a> TraceRecorder<'a> {
                     return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
                 };
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let map = self.guard_heap_object(builder, map, TraceHeapObjectKind::Map, exit);
                 builder.emit0(TraceInst::HeapMapSetShaped {
                     map,
                     key,
@@ -2376,6 +2466,7 @@ impl<'a> TraceRecorder<'a> {
             StringLen => {
                 let string = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let string = self.guard_heap_object(builder, string, TraceHeapObjectKind::String, exit);
                 let result = builder.emit1(
                     TraceInst::HeapStringLen { string, exit },
                     TraceType::Int32,
@@ -2396,21 +2487,130 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
+            LoadModuleVar => {
+                let address = runtime
+                    .trace_module_slot_address(op.location)
+                    .ok_or(RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                let value = builder.emit1(
+                    TraceInst::LoadAbsoluteValue { address: address as u64 },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                self.write_gpr(builder, op.a, value);
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            StoreModuleVar => {
+                let address = runtime
+                    .trace_module_slot_address(op.location)
+                    .ok_or(RecordingAbort::UnsupportedOpcode(op.opcode))?;
+                let value = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                builder.emit0(TraceInst::StoreAbsoluteValue {
+                    address: address as u64,
+                    value,
+                });
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            LoadStaticField => {
+                let class_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let Some((class_key, address)) = runtime
+                    .trace_static_field_access(class_word, op.x)
+                else {
+                    return self.runtime_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                    );
+                };
+                let class = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let _guarded = builder.emit1(
+                    TraceInst::GuardClass {
+                        value: class,
+                        classes: vec![class_key],
+                        exit,
+                    },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                let value = builder.emit1(
+                    TraceInst::LoadAbsoluteValue { address: address as u64 },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                self.write_gpr(builder, op.a, value);
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            StoreStaticField => {
+                let class_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.a)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let Some((class_key, address)) = runtime
+                    .trace_static_field_access(class_word, op.x)
+                else {
+                    return self.runtime_leaf(op, builder, &[]);
+                };
+                let class = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
+                let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let _guarded = builder.emit1(
+                    TraceInst::GuardClass {
+                        value: class,
+                        classes: vec![class_key],
+                        exit,
+                    },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                builder.emit0(TraceInst::StoreAbsoluteValue {
+                    address: address as u64,
+                    value,
+                });
+                Ok(ExpectedStep::Exact(next))
+            }
+
+            IsInstance => {
+                let class_word = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.c)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let Some((expected_class, instance_classes, known_classes)) = runtime
+                    .trace_is_instance_observation(class_word)
+                else {
+                    return self.runtime_leaf(
+                        op,
+                        builder,
+                        &[(Reg(op.a), TraceType::Bool, TraceRep::Tagged)],
+                    );
+                };
+                let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let class = self.read_gpr(builder, op.c, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let result = builder.emit1(
+                    TraceInst::IsInstanceObserved {
+                        value,
+                        class,
+                        expected_class,
+                        instance_classes,
+                        known_classes,
+                        exit,
+                    },
+                    TraceType::Bool,
+                    TraceRep::Tagged,
+                );
+                self.write_gpr(builder, op.a, result);
+                Ok(ExpectedStep::Exact(next))
+            }
+
             // Remaining non-GC runtime leaf operations preserve unrelated native
             // SSA values instead of forcing the full runtime memory epoch.
-            LoadStaticField
-            | LoadModuleVar
-            | ListRemoveAt
-            | MapRemove => self.runtime_leaf(
+            ListRemoveAt | MapRemove => self.runtime_leaf(
                 op,
                 builder,
                 &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
-            ),
-
-            IsInstance => self.runtime_leaf(
-                op,
-                builder,
-                &[(Reg(op.a), TraceType::Bool, TraceRep::Tagged)],
             ),
 
             StringCodePointAt => self.runtime_leaf(
@@ -2419,11 +2619,7 @@ impl<'a> TraceRecorder<'a> {
                 &[(Reg(op.a), TraceType::Int32, TraceRep::Int32)],
             ),
 
-            StoreStaticField
-            | StoreModuleVar
-            | WriteBarrier
-            | ProfileBlock
-            | ProfileNumeric => self.runtime_leaf(op, builder, &[]),
+            WriteBarrier | ProfileBlock | ProfileNumeric => self.runtime_leaf(op, builder, &[]),
 
             Await => {
                 let observed = runtime
@@ -2437,6 +2633,7 @@ impl<'a> TraceRecorder<'a> {
                 };
                 let promise = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
                 let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let promise = self.guard_heap_object(builder, promise, TraceHeapObjectKind::Promise, exit);
                 let value = builder.emit1(
                     TraceInst::HeapAwaitFulfilled { promise, exit },
                     TraceType::Any,
@@ -2446,35 +2643,34 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
-            Safepoint | Breakpoint | Catch => {
-                Err(RecordingAbort::UnsupportedOpcode(op.opcode))
+            Breakpoint => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
+
+            // Full call boundaries remain inside the native trace. The runtime
+            // helper executes a synchronous bytecode callee until it returns to
+            // this frame, or reports a terminal/frame-changing condition. This
+            // removes the tier-manager round trip without pretending that host
+            // or foreign calls are pure or non-GC.
+            InvokeSuper | CallDirect | CallClosure | CallPrimitive | CallForeign | ImportModule => {
+                builder.runtime_call(op.location, op.next_pc);
+                Ok(ExpectedStep::RuntimeCall)
+            }
+
+            // GC-capable operations that return to the same frame are explicit
+            // synchronized slow paths rather than unsupported opcodes. They still
+            // form a full heap/register epoch, but the surrounding arithmetic and
+            // control flow remains in the compiled trace even when the default
+            // `no_runtime_calls_in_native_trace` policy is enabled.
+            CreateClass | BindMethod | BindForeignMethod | AllocInstance | AllocForeign
+            | ImportVariable | AllocCell | MakeClosure | AllocList | AllocListCap
+            | ListAppend | ListInsert | AllocMap | StringConcat | StringSlice
+            | MakeRange | MakeFiber | Safepoint | Catch => {
+                builder.runtime(op.location, op.next_pc, false);
+                Ok(ExpectedStep::Runtime { terminal: false })
             }
 
             Return
             | Return2
             | Trap
-            | InvokeSuper
-            | CallClosure
-            | CallPrimitive
-            | CallForeign
-            | CreateClass
-            | BindMethod
-            | BindForeignMethod
-            | AllocInstance
-            | AllocForeign
-            | ImportModule
-            | ImportVariable
-            | AllocCell
-            | MakeClosure
-            | AllocList
-            | AllocListCap
-            | ListAppend
-            | ListInsert
-            | AllocMap
-            | StringConcat
-            | StringSlice
-            | MakeRange
-            | MakeFiber
             | FiberCall
             | FiberTry
             | FiberTransfer
@@ -2656,14 +2852,20 @@ impl<'a> TraceRecorder<'a> {
 
             let expected = if matches!(mode, RecordingMode::Entry) {
                 // A boundary may be discovered after speculative guards have been
-                // emitted. Preserve only the completed prefix and do not execute
-                // the boundary instruction while recording.
+                // emitted. Keep supported synchronous boundaries in the entry trace;
+                // otherwise roll the speculative lowering back and close the prefix.
                 let checkpoint = builder.clone();
                 match self.translate_native(runtime, program, function, &op, &mut builder) {
                     Ok(step @ ExpectedStep::Exact(next)) if next.pc.0 > location.pc.0
                         && !visited.contains(&next) => step,
                     Ok(step @ ExpectedStep::Inlined { next, .. }) if next.pc.0 > location.pc.0
                         && !visited.contains(&next) => step,
+                    // Synchronous call/runtime boundaries can remain inside an
+                    // entry trace as long as the helper returns to the same frame.
+                    // The recording loop below validates the exact continuation
+                    // after executing the boundary and stops cleanly otherwise.
+                    Ok(step @ ExpectedStep::RuntimeCall) => step,
+                    Ok(step @ ExpectedStep::Runtime { terminal: false }) => step,
                     Ok(_) | Err(_) => {
                         builder = checkpoint;
                         break;
@@ -2674,9 +2876,11 @@ impl<'a> TraceRecorder<'a> {
                     .map_err(RecordOutcome::Abort)?
             };
 
-            let mut step = runtime
-                .trace_execute_unfused_step()
-                .map_err(|error| RecordOutcome::Fatal(runtime_error(error)))?;
+            let mut step = match expected {
+                ExpectedStep::RuntimeCall => runtime.trace_execute_call_to_return(),
+                _ => runtime.trace_execute_unfused_step(),
+            }
+            .map_err(|error| RecordOutcome::Fatal(runtime_error(error)))?;
 
             if let ExpectedStep::Inlined { next, callee, steps: callee_steps } = expected {
                 if !step.running || step.after != TraceLocation::new(callee, BytecodePc(0)) {
@@ -2704,6 +2908,15 @@ impl<'a> TraceRecorder<'a> {
 
             if let ExpectedStep::Runtime { terminal } = expected {
                 if terminal || !step.running || step.frame_changed
+                    || step.after != TraceLocation::new(location.function, op.next_pc)
+                {
+                    runtime_end = true;
+                    break;
+                }
+                continue;
+            }
+            if matches!(expected, ExpectedStep::RuntimeCall) {
+                if !step.running || step.frame_changed
                     || step.after != TraceLocation::new(location.function, op.next_pc)
                 {
                     runtime_end = true;
@@ -2760,9 +2973,22 @@ impl<'a> TraceRecorder<'a> {
 
         let side_terminal_exit = match mode {
             RecordingMode::Entry => {
-                let exit = builder.add_side_exit(ExitReason::GuardValue, runtime.trace_current_location().pc);
-                builder.set_terminator(TraceTerminator::Exit(exit));
-                None
+                if runtime_end {
+                    // The recorded boundary did not synchronously return to the
+                    // expected continuation (throw/suspend/frame change/etc.).
+                    // RuntimeCall already returns directly on that cold path; if
+                    // a later execution does return normally, stop at the same
+                    // epoch instead of using a snapshot from a different frame.
+                    builder.set_terminator(TraceTerminator::RuntimeReturn);
+                    None
+                } else {
+                    let exit = builder.add_side_exit(
+                        ExitReason::GuardValue,
+                        runtime.trace_current_location().pc,
+                    );
+                    builder.set_terminator(TraceTerminator::Exit(exit));
+                    None
+                }
             }
             RecordingMode::RootLoop => {
                 if !builder.has_runtime_calls() {
@@ -2858,6 +3084,7 @@ enum ExpectedStep {
     Exact(TraceLocation),
     Inlined { next: TraceLocation, callee: FuncId, steps: usize },
     Runtime { terminal: bool },
+    RuntimeCall,
 }
 
 fn special_reg(index: u8) -> Option<SpecialReg> {
@@ -3239,6 +3466,10 @@ struct CraneliftLoweringState<'a, 'p> {
     runtime_signature: codegen::ir::SigRef,
     heap_barrier_signature: codegen::ir::SigRef,
     values: Vec<Option<Value>>,
+    /// Current moving-object address for a GuardHeapObject result. Valid only
+    /// until the next full runtime/GC epoch. This is a backend-local lowering
+    /// cache, not a Trace IR optimization pass.
+    heap_addresses: Vec<Option<Value>>,
     exit_plans: &'p [CompiledExitPlan],
     /// Current loop budget block parameter. The manager derives completed native
     /// iterations from it only when a side exit is materialized.
@@ -3341,6 +3572,7 @@ impl<'a> CraneliftTraceCompiler<'a> {
                 runtime_signature,
                 heap_barrier_signature,
                 values: vec![None; self.trace.values.len()],
+                heap_addresses: vec![None; self.trace.values.len()],
                 exit_plans: &self.exit_plans,
                 native_budget_remaining: None,
                 native_budget_initial: self.options.native_loop_iteration_budget,
@@ -4269,19 +4501,103 @@ impl CraneliftLoweringState<'_, '_> {
         Ok((entry, address))
     }
 
-    fn guard_live_heap_entry(
+    #[inline]
+    fn runtime_heap_kind(kind: TraceHeapObjectKind) -> TraceHeapKind {
+        match kind {
+            TraceHeapObjectKind::String => TraceHeapKind::String,
+            TraceHeapObjectKind::List => TraceHeapKind::List,
+            TraceHeapObjectKind::Map => TraceHeapKind::Map,
+            TraceHeapObjectKind::Cell => TraceHeapKind::Cell,
+            TraceHeapObjectKind::Instance => TraceHeapKind::Instance,
+            TraceHeapObjectKind::Promise => TraceHeapKind::Promise,
+        }
+    }
+
+    fn proven_heap_entry_kind(&self, value: TraceValueId) -> Option<TraceHeapObjectKind> {
+        let value = self.trace.canonical_value(value);
+        let TraceValueOrigin::InstResult { node } = &self.trace.value(value)?.origin else {
+            return None;
+        };
+        match &self.trace.nodes.get(*node)?.kind {
+            TraceInst::GuardHeapObject { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Resolve a heap operand that may already be a stable sidecar entry produced
+    /// by GuardHeapObject. The backend may reuse the current moving address inside
+    /// one GC epoch; every full runtime/call boundary invalidates that local cache.
+    fn heap_entry_for_value(
+        &mut self,
+        value: TraceValueId,
+        expected: TraceHeapKind,
+        exit: SideExitId,
+    ) -> Result<(Value, Value), TracingJitError> {
+        let canonical = self.trace.canonical_value(value);
+        let proven = self
+            .proven_heap_entry_kind(canonical)
+            .map(Self::runtime_heap_kind)
+            == Some(expected);
+        if proven {
+            let entry = self.lower_value(canonical)?;
+            if let Some(address) = self
+                .heap_addresses
+                .get(canonical.0 as usize)
+                .and_then(|address| *address)
+            {
+                return Ok((entry, address));
+            }
+            // This path is used only when a structural transform separated the
+            // proof from its consumer without an available backend cache. Reload
+            // and validate liveness from the stable handle-table entry.
+            let address = self.builder.ins().load(
+                self.pointer_type,
+                Self::trusted_mem(),
+                entry,
+                offset_of!(TraceHeapEntry, address) as i32,
+            );
+            let dead = self.builder.ins().icmp_imm_u(IntCC::Equal, address, 0);
+            let dead = self.bool32(dead);
+            self.emit_side_exit(exit, dead)?;
+            return Ok((entry, address));
+        }
+        let tagged = self.lower_value(canonical)?;
+        self.guard_heap_entry(tagged, expected, exit)
+    }
+
+    fn heap_entry_with_metadata_for_value(
+        &mut self,
+        value: TraceValueId,
+        expected: TraceHeapKind,
+        exit: SideExitId,
+    ) -> Result<(Value, Value, Value), TracingJitError> {
+        let canonical = self.trace.canonical_value(value);
+        let proven = self
+            .proven_heap_entry_kind(canonical)
+            .map(Self::runtime_heap_kind)
+            == Some(expected);
+        if proven {
+            let (entry, address) = self.heap_entry_for_value(canonical, expected, exit)?;
+            let metadata = self.builder.ins().load(
+                types::I32,
+                Self::trusted_mem(),
+                entry,
+                offset_of!(TraceHeapEntry, kind) as i32,
+            );
+            return Ok((entry, address, metadata));
+        }
+        let tagged = self.lower_value(canonical)?;
+        self.guard_heap_entry_with_metadata(tagged, expected, exit)
+    }
+
+    /// Resolve a value already proven to carry the heap tag. The returned
+    /// sidecar entry is stable, while `address` is valid only until the next full
+    /// runtime/GC epoch.
+    fn live_heap_entry_from_heap_tagged(
         &mut self,
         tagged: Value,
         exit: SideExitId,
     ) -> Result<(Value, Value), TracingJitError> {
-        let heap_mask = self.builder.ins().iconst(types::I64, TAG_HEAP_MASK as i64);
-        let heap_tag = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
-        let masked = self.builder.ins().band(tagged, heap_mask);
-        let is_heap = self.builder.ins().icmp(IntCC::Equal, masked, heap_tag);
-        let is_heap = self.bool32(is_heap);
-        let not_heap = self.bool_not(is_heap);
-        self.emit_side_exit(exit, not_heap)?;
-
         let payload_mask = self.builder.ins().iconst(types::I64, PAYLOAD_MASK as i64);
         let handle = self.builder.ins().band(tagged, payload_mask);
         let chunk_index = self
@@ -4331,6 +4647,22 @@ impl CraneliftLoweringState<'_, '_> {
         self.emit_side_exit(exit, dead)?;
 
         Ok((entry, address))
+    }
+
+    fn guard_live_heap_entry(
+        &mut self,
+        tagged: Value,
+        exit: SideExitId,
+    ) -> Result<(Value, Value), TracingJitError> {
+        let heap_mask = self.builder.ins().iconst(types::I64, TAG_HEAP_MASK as i64);
+        let heap_tag = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
+        let masked = self.builder.ins().band(tagged, heap_mask);
+        let is_heap = self.builder.ins().icmp(IntCC::Equal, masked, heap_tag);
+        let is_heap = self.bool32(is_heap);
+        let not_heap = self.bool_not(is_heap);
+        self.emit_side_exit(exit, not_heap)?;
+
+        self.live_heap_entry_from_heap_tagged(tagged, exit)
     }
 
     #[inline(always)]
@@ -4563,6 +4895,9 @@ impl CraneliftLoweringState<'_, '_> {
                 next,
                 terminal,
             } => {
+                // A full runtime boundary may collect and move objects. Do not let
+                // any backend-local moving address flow past this epoch.
+                self.heap_addresses.fill(None);
                 let callee = self.builder.ins().load(
                     self.pointer_type,
                     Self::trusted_mem(),
@@ -4605,6 +4940,163 @@ impl CraneliftLoweringState<'_, '_> {
                 // unreachable in that case, but lets the trace terminator close the
                 // CLIF function without appending to an already-terminated block.
                 self.builder.switch_to_block(resume);
+            }
+
+            RuntimeCall { location, next } => {
+                // Calls may allocate/collect even when they synchronously return to
+                // the same Wren frame, so moving addresses die at this boundary.
+                self.heap_addresses.fill(None);
+                if next.0 & TRACE_RUNTIME_CALL_FLAG != 0 {
+                    return Err(self.error("RuntimeCall continuation PC uses reserved high bit"));
+                }
+                let callee = self.builder.ins().load(
+                    self.pointer_type,
+                    Self::trusted_mem(),
+                    self.activation,
+                    offset_of!(TraceActivation, execute) as i32,
+                );
+                let function = self.builder.ins().iconst(types::I32, location.function.0 as i64);
+                let pc = self.builder.ins().iconst(types::I32, location.pc.0 as i64);
+                let next = self.builder.ins().iconst(
+                    types::I32,
+                    (next.0 | TRACE_RUNTIME_CALL_FLAG) as i64,
+                );
+                let call = self.builder.ins().call_indirect(
+                    self.runtime_signature,
+                    callee,
+                    &[self.activation, function, pc, next],
+                );
+                let status = self.builder.inst_results(call)[0];
+
+                let stop = self.builder.create_block();
+                let resume = self.builder.create_block();
+                self.builder.set_cold_block(stop);
+                self.builder.ins().brif(status, stop, &[], resume, &[]);
+
+                self.builder.switch_to_block(stop);
+                let result = self.builder.ins().iconst(types::I32, TRACE_RESULT_RUNTIME as i64);
+                self.builder.ins().return_(&[result]);
+
+                self.builder.switch_to_block(resume);
+            }
+
+            LoadAbsoluteValue { address } => {
+                let address = self.builder.ins().iconst(self.pointer_type, *address as i64);
+                let value = self.builder.ins().load(
+                    types::I64,
+                    Self::trusted_mem(),
+                    address,
+                    0,
+                );
+                self.cache_value(one_result(node)?, value);
+            }
+
+            StoreAbsoluteValue { address, value } => {
+                let value = self.lower_value(*value)?;
+                let address = self.builder.ins().iconst(self.pointer_type, *address as i64);
+                self.builder
+                    .ins()
+                    .store(Self::trusted_mem(), value, address, 0);
+            }
+
+            IsInstanceObserved {
+                value,
+                class,
+                expected_class,
+                instance_classes,
+                known_classes,
+                exit,
+            } => {
+                // First guard the dynamic class operand against the class object
+                // observed while recording. If it changes, baseline owns the
+                // full dynamic semantics.
+                let class = self.lower_value(*class)?;
+                let (class_entry, _) = self.guard_live_heap_entry(class, *exit)?;
+                let class_key = self.builder.ins().load(
+                    types::I64,
+                    Self::trusted_mem(),
+                    class_entry,
+                    offset_of!(TraceHeapEntry, receiver_class) as i32,
+                );
+                let expected = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, *expected_class as i64);
+                let same_class = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::Equal, class_key, expected);
+                let same_class = self.bool32(same_class);
+                let wrong_class = self.bool_not(same_class);
+                self.emit_side_exit(*exit, wrong_class)?;
+
+                let tagged = self.lower_value(*value)?;
+                let heap_mask = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, TAG_HEAP_MASK as i64);
+                let heap_tag = self.builder.ins().iconst(types::I64, TAG_HEAP as i64);
+                let masked = self.builder.ins().band(tagged, heap_mask);
+                let is_heap = self.builder.ins().icmp(IntCC::Equal, masked, heap_tag);
+                let is_heap = self.bool32(is_heap);
+
+                let heap_block = self.builder.create_block();
+                let non_heap_block = self.builder.create_block();
+                let done = self.builder.create_block();
+                self.builder.append_block_param(done, types::I64);
+                self.builder
+                    .ins()
+                    .brif(is_heap, heap_block, &[], non_heap_block, &[]);
+
+                self.builder.switch_to_block(non_heap_block);
+                let false_value = self.builder.ins().iconst(types::I64, TAG_FALSE as i64);
+                self.builder.ins().jump(done, &[false_value.into()]);
+
+                self.builder.switch_to_block(heap_block);
+                let (entry, _) = self.live_heap_entry_from_heap_tagged(tagged, *exit)?;
+                let actual = self.builder.ins().load(
+                    types::I64,
+                    Self::trusted_mem(),
+                    entry,
+                    offset_of!(TraceHeapEntry, receiver_class) as i32,
+                );
+                let mut matches = self.builder.ins().iconst(types::I32, 0);
+                for &candidate in instance_classes {
+                    let candidate = self
+                        .builder
+                        .ins()
+                        .iconst(types::I64, candidate as i64);
+                    let equal = self.builder.ins().icmp(IntCC::Equal, actual, candidate);
+                    let equal = self.bool32(equal);
+                    matches = self.bool_or(matches, equal);
+                }
+
+                // Existing finalized classes have immutable superclass links. If
+                // a class is linked after recording, its receiver-class key is not
+                // in `known_classes`; side-exit rather than returning a stale false.
+                let mut known = self.builder.ins().iconst(types::I32, 0);
+                for &candidate in known_classes {
+                    let candidate = self.builder.ins().iconst(types::I64, candidate as i64);
+                    let equal = self.builder.ins().icmp(IntCC::Equal, actual, candidate);
+                    let equal = self.bool32(equal);
+                    known = self.bool_or(known, equal);
+                }
+                let kind = self.builder.ins().ushr_imm_u(actual, 56);
+                let instance_kind = self.builder.ins().icmp_imm_u(IntCC::Equal, kind, 1);
+                let foreign_kind = self.builder.ins().icmp_imm_u(IntCC::Equal, kind, 4);
+                let instance_kind = self.bool32(instance_kind);
+                let foreign_kind = self.bool32(foreign_kind);
+                let dynamic_instance = self.bool_or(instance_kind, foreign_kind);
+                let not_known = self.bool_not(known);
+                let unknown = self.bool_and(dynamic_instance, not_known);
+                self.emit_side_exit(*exit, unknown)?;
+
+                let boxed = self.box_bool(matches);
+                self.builder.ins().jump(done, &[boxed.into()]);
+
+                self.builder.switch_to_block(done);
+                let result = self.builder.block_params(done)[0];
+                self.cache_value(one_result(node)?, result);
             }
 
             Copy { value } => {
@@ -5124,9 +5616,20 @@ impl CraneliftLoweringState<'_, '_> {
                 self.cache_value(one_result(node)?, handle);
             }
 
+            GuardHeapObject { value, kind, exit } => {
+                let tagged = self.lower_value(*value)?;
+                let (entry, address, _) = self.guard_heap_entry_with_metadata(
+                    tagged,
+                    Self::runtime_heap_kind(*kind),
+                    *exit,
+                )?;
+                let result = one_result(node)?;
+                self.cache_value(result, entry);
+                self.heap_addresses[result.0 as usize] = Some(address);
+            }
+
             HeapLoadField { object, slot, exit } => {
-                let tagged = self.lower_value(*object)?;
-                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::Instance, *exit)?;
+                let (entry, _) = self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
                 let len = self.heap_entry_len(entry);
                 self.guard_constant_index(len, *slot, *exit)?;
                 let data = self.heap_entry_data(entry);
@@ -5142,10 +5645,9 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             HeapStoreField { object, value, slot, exit } => {
-                let tagged_object = self.lower_value(*object)?;
                 let tagged_value = self.lower_value(*value)?;
                 let (entry, owner_address) =
-                    self.guard_heap_entry(tagged_object, TraceHeapKind::Instance, *exit)?;
+                    self.heap_entry_for_value(*object, TraceHeapKind::Instance, *exit)?;
                 let len = self.heap_entry_len(entry);
                 self.guard_constant_index(len, *slot, *exit)?;
                 let data = self.heap_entry_data(entry);
@@ -5156,8 +5658,7 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             HeapLoadCell { cell, exit } => {
-                let tagged = self.lower_value(*cell)?;
-                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::Cell, *exit)?;
+                let (entry, _) = self.heap_entry_for_value(*cell, TraceHeapKind::Cell, *exit)?;
                 let data = self.heap_entry_data(entry);
                 let result = self.builder.ins().load(
                     types::I64,
@@ -5169,27 +5670,24 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             HeapStoreCell { cell, value, exit } => {
-                let tagged_cell = self.lower_value(*cell)?;
                 let tagged_value = self.lower_value(*value)?;
                 let (entry, owner_address) =
-                    self.guard_heap_entry(tagged_cell, TraceHeapKind::Cell, *exit)?;
+                    self.heap_entry_for_value(*cell, TraceHeapKind::Cell, *exit)?;
                 let data = self.heap_entry_data(entry);
                 self.emit_heap_write_barrier(owner_address, *value, tagged_value)?;
                 self.builder.ins().store(Self::trusted_mem(), tagged_value, data, 0);
             }
 
             HeapListLen { list, exit } => {
-                let tagged = self.lower_value(*list)?;
-                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::List, *exit)?;
+                let (entry, _) = self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
                 let len = self.heap_entry_len(entry);
                 let len = self.builder.ins().ireduce(types::I32, len);
                 self.cache_value(one_result(node)?, len);
             }
 
             HeapListGet { list, index, exit } => {
-                let tagged = self.lower_value(*list)?;
                 let index = self.lower_value(*index)?;
-                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::List, *exit)?;
+                let (entry, _) = self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
                 let len = self.heap_entry_len(entry);
                 let index = self.normalize_list_index(index, len, *exit)?;
                 let data = self.heap_entry_data(entry);
@@ -5204,11 +5702,10 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             HeapListSet { list, index, value, exit } => {
-                let tagged_list = self.lower_value(*list)?;
                 let index = self.lower_value(*index)?;
                 let tagged_value = self.lower_value(*value)?;
                 let (entry, owner_address) =
-                    self.guard_heap_entry(tagged_list, TraceHeapKind::List, *exit)?;
+                    self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
                 let len = self.heap_entry_len(entry);
                 let index = self.normalize_list_index(index, len, *exit)?;
                 let data = self.heap_entry_data(entry);
@@ -5218,18 +5715,16 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             HeapMapLen { map, exit } => {
-                let tagged = self.lower_value(*map)?;
-                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::Map, *exit)?;
+                let (entry, _) = self.heap_entry_for_value(*map, TraceHeapKind::Map, *exit)?;
                 let len = self.heap_entry_len(entry);
                 let len = self.builder.ins().ireduce(types::I32, len);
                 self.cache_value(one_result(node)?, len);
             }
 
             HeapMapGetShaped { map, key, expected_key, shape, slot, exit } => {
-                let tagged_map = self.lower_value(*map)?;
                 let tagged_key = self.lower_value(*key)?;
                 let (entry, _, metadata) =
-                    self.guard_heap_entry_with_metadata(tagged_map, TraceHeapKind::Map, *exit)?;
+                    self.heap_entry_with_metadata_for_value(*map, TraceHeapKind::Map, *exit)?;
                 self.guard_map_shape_metadata(metadata, *shape, *exit)?;
                 self.guard_string_bytes(tagged_key, expected_key, *exit)?;
                 let len = self.heap_entry_len(entry);
@@ -5247,11 +5742,10 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             HeapMapSetShaped { map, key, value, expected_key, shape, slot, exit } => {
-                let tagged_map = self.lower_value(*map)?;
                 let tagged_key = self.lower_value(*key)?;
                 let tagged_value = self.lower_value(*value)?;
                 let (entry, owner_address, metadata) =
-                    self.guard_heap_entry_with_metadata(tagged_map, TraceHeapKind::Map, *exit)?;
+                    self.heap_entry_with_metadata_for_value(*map, TraceHeapKind::Map, *exit)?;
                 self.guard_map_shape_metadata(metadata, *shape, *exit)?;
                 self.guard_string_bytes(tagged_key, expected_key, *exit)?;
                 let len = self.heap_entry_len(entry);
@@ -5264,17 +5758,15 @@ impl CraneliftLoweringState<'_, '_> {
             }
 
             HeapStringLen { string, exit } => {
-                let tagged = self.lower_value(*string)?;
-                let (entry, _) = self.guard_heap_entry(tagged, TraceHeapKind::String, *exit)?;
+                let (entry, _) = self.heap_entry_for_value(*string, TraceHeapKind::String, *exit)?;
                 let len = self.heap_entry_len(entry);
                 let len = self.builder.ins().ireduce(types::I32, len);
                 self.cache_value(one_result(node)?, len);
             }
 
             HeapAwaitFulfilled { promise, exit } => {
-                let tagged = self.lower_value(*promise)?;
-                let (entry, _, metadata) = self.guard_heap_entry_with_metadata(
-                    tagged,
+                let (entry, _, metadata) = self.heap_entry_with_metadata_for_value(
+                    *promise,
                     TraceHeapKind::Promise,
                     *exit,
                 )?;
@@ -5398,7 +5890,7 @@ impl TracingJit {
                 let exit = builder.add_side_exit(ExitReason::GuardValue, next.pc);
                 builder.set_terminator(TraceTerminator::Exit(exit));
             },
-            ExpectedStep::Runtime { .. } => {
+            ExpectedStep::Runtime { .. } | ExpectedStep::RuntimeCall => {
                 builder.prepare_memory_loop();
                 builder.set_terminator(TraceTerminator::RuntimeReturn);
             },
@@ -5542,6 +6034,9 @@ impl TracingJit {
                 self.stats.eliminated_trace_guards += trace.stats.eliminated_guards as u64;
                 self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
                 self.stats.eliminated_trace_copies += trace.stats.eliminated_copies as u64;
+                self.stats.trace_gvn_eliminated += trace.stats.gvn_eliminated as u64;
+                self.stats.trace_licm_hoisted += trace.stats.licm_hoisted as u64;
+                self.stats.trace_pre_eliminated += trace.stats.pre_eliminated as u64;
                 if trace.stats.recorded_bytecodes < self.options.min_entry_trace_bytecodes as usize {
                     let state = self.entries.get_mut(&location).unwrap();
                     state.blacklisted = true;
@@ -5677,6 +6172,9 @@ impl TracingJit {
         self.stats.eliminated_trace_guards += trace.stats.eliminated_guards as u64;
         self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
         self.stats.eliminated_trace_copies += trace.stats.eliminated_copies as u64;
+        self.stats.trace_gvn_eliminated += trace.stats.gvn_eliminated as u64;
+        self.stats.trace_licm_hoisted += trace.stats.licm_hoisted as u64;
+        self.stats.trace_pre_eliminated += trace.stats.pre_eliminated as u64;
 
         let compiled = match self.compile_trace(&trace) {
             Ok(compiled) => compiled,
@@ -5937,6 +6435,18 @@ impl TracingJit {
             .stats
             .eliminated_trace_copies
             .saturating_add(trace.stats.eliminated_copies as u64);
+        self.stats.trace_gvn_eliminated = self
+            .stats
+            .trace_gvn_eliminated
+            .saturating_add(trace.stats.gvn_eliminated as u64);
+        self.stats.trace_licm_hoisted = self
+            .stats
+            .trace_licm_hoisted
+            .saturating_add(trace.stats.licm_hoisted as u64);
+        self.stats.trace_pre_eliminated = self
+            .stats
+            .trace_pre_eliminated
+            .saturating_add(trace.stats.pre_eliminated as u64);
 
         let mut compiled = match self.compile_trace(&trace) {
             Ok(compiled) => compiled,

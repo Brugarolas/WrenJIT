@@ -304,7 +304,7 @@ impl TraceOptimization for ClassTypePropagation {
         let mut changed = false;
         for id in order(trace) {
             match trace.nodes[id].kind.clone() {
-                TraceInst::Runtime { .. } | TraceInst::ReadBarrier { .. } => { types.clear(); classes.clear(); }
+                TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. } => { types.clear(); classes.clear(); }
                 TraceInst::GuardType { value, expected, .. } => {
                     let known = types.get(&value).copied().or_else(|| constant(trace, value).map(|c| c.layout().0));
                     let redundant = expected == TraceType::Any || known == Some(expected);
@@ -438,6 +438,11 @@ impl TraceOptimization for RangeAnalysis {
                         IntBinOp::Sub => Some(Range { lo: a.lo - b.hi, hi: a.hi - b.lo }),
                         IntBinOp::Mul => { let p = [a.lo*b.lo, a.lo*b.hi, a.hi*b.lo, a.hi*b.hi]; Some(Range { lo: *p.iter().min().unwrap(), hi: *p.iter().max().unwrap() }) }
                         IntBinOp::BitAnd if b.lo == b.hi && b.lo >= 0 => Some(Range { lo: 0, hi: b.hi }),
+                        IntBinOp::BitAnd if a.lo == a.hi && a.lo >= 0 => Some(Range { lo: 0, hi: a.hi }),
+                        IntBinOp::ShrU if b.lo == b.hi && (1..32).contains(&b.lo) => {
+                            let shift = b.lo as u32;
+                            Some(Range { lo: 0, hi: ((u32::MAX >> shift).min(i32::MAX as u32)) as i64 })
+                        }
                         _ => None,
                     };
                     if r.is_some_and(|r| r.lo >= Range::FULL.lo && r.hi <= Range::FULL.hi) {
@@ -454,7 +459,7 @@ impl TraceOptimization for RangeAnalysis {
             };
             if let (Some(r), Some(&v)) = (inferred, trace.nodes[id].results.first()) { ranges.insert(v, r); }
             match kind {
-                TraceInst::Runtime { .. } => { ranges.clear(); less_than.clear(); }
+                TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } => { ranges.clear(); less_than.clear(); }
                 TraceInst::GuardBounds { index, length, .. } => {
                     let (i, l) = (range(trace, &ranges, index), range(trace, &ranges, length));
                     if i.lo >= 0 && (i.hi < l.lo || less_than.contains(&(index, length))) {
@@ -519,9 +524,73 @@ fn store(kind: &TraceInst, trace: &Trace) -> Option<(Memory, TraceValueId)> {
     })
 }
 
+
+#[inline]
+fn same_value(trace: &Trace, lhs: TraceValueId, rhs: TraceValueId) -> bool {
+    trace.canonical_value(lhs) == trace.canonical_value(rhs)
+}
+
+fn indices_proven_distinct(trace: &Trace, lhs: TraceValueId, rhs: TraceValueId) -> bool {
+    if same_value(trace, lhs, rhs) {
+        return false;
+    }
+    match (constant(trace, lhs).and_then(integer), constant(trace, rhs).and_then(integer)) {
+        (Some(lhs), Some(rhs)) => lhs != rhs,
+        _ => false,
+    }
+}
+
+/// Whether a successful store can change the value represented by `cached`.
+/// Different semantic heap families cannot alias on the successful trace path:
+/// the backend validates their heap kind before every access.
+fn memory_store_clobbers(trace: &Trace, store: &Memory, cached: &Memory) -> bool {
+    match (store, cached) {
+        (Memory::Frame(lhs, _), Memory::Frame(rhs, _)) => lhs == rhs,
+        (Memory::Frame(..), _) | (_, Memory::Frame(..)) => false,
+
+        (Memory::Field(_, store_slot), Memory::Field(_, slot)) => {
+            // Distinct SSA object values are not a no-alias proof: two values may
+            // still name the same runtime object. Field slots, however, are
+            // disjoint within an instance.
+            store_slot == slot
+        }
+        (Memory::Cell(_), Memory::Cell(_)) => true,
+        (Memory::List(_, store_index), Memory::List(_, index)) => {
+            // As above, list identities may alias. Constant unequal indices are
+            // nevertheless independent locations on the successful path.
+            !indices_proven_distinct(trace, *store_index, *index)
+        }
+        (
+            Memory::Map(_, _, _, store_shape, store_slot),
+            Memory::Map(_, _, _, shape, slot),
+        ) => {
+            // Shaped maps provide stable slot disambiguation, but not object
+            // no-alias information.
+            store_shape == shape && store_slot == slot
+        }
+
+        // Element replacement does not change container length. Shaped-map
+        // stores update an existing slot and therefore preserve map length.
+        (Memory::List(..), Memory::ListLen(_))
+        | (Memory::Map(..), Memory::MapLen(_)) => false,
+
+        // A store in one validated heap family cannot affect another family.
+        (Memory::Field(..), _)
+        | (Memory::Cell(..), _)
+        | (Memory::List(..), _)
+        | (Memory::Map(..), _) => false,
+
+        // `store()` never produces these read-only memory classes.
+        (Memory::ListLen(_), _)
+        | (Memory::MapLen(_), _)
+        | (Memory::StringLen(_), _) => false,
+    }
+}
+
 /// Memory value numbering and store-to-load forwarding. Different SSA object
-/// references may alias: every store kills heap facts, and every runtime/barrier
-/// kills all facts. A successful access supplies both value and validation.
+/// references may alias, but validated heap families, field slots and proven-distinct
+/// constant indices provide useful disambiguation. Runtime/barrier boundaries kill
+/// all heap facts. A successful access supplies both value and validation.
 #[derive(Default)]
 pub struct LoadStorePRE;
 impl TraceOptimization for LoadStorePRE {
@@ -531,7 +600,7 @@ impl TraceOptimization for LoadStorePRE {
         let mut changed = false;
         for id in order(trace) {
             let kind = trace.nodes[id].kind.clone();
-            if matches!(kind, TraceInst::Runtime { .. } | TraceInst::ReadBarrier { .. }) {
+            if matches!(kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. }) {
                 available.clear(); validated_stores.clear(); continue;
             }
             if let Some((key, value)) = store(&kind, trace) {
@@ -547,12 +616,16 @@ impl TraceOptimization for LoadStorePRE {
                 // stores also alias across representations of the same slot.
                 match &key {
                     Memory::Frame(slot, _) => {
-                        available.retain(|k, _| !matches!(k, Memory::Frame(s, _) if s == slot));
-                        validated_stores.retain(|k| !matches!(k, Memory::Frame(s, _) if s == slot));
+                        available.retain(|cached, _| {
+                            !matches!(cached, Memory::Frame(cached_slot, _) if cached_slot == slot)
+                        });
+                        validated_stores.retain(|cached| {
+                            !matches!(cached, Memory::Frame(cached_slot, _) if cached_slot == slot)
+                        });
                     }
                     _ => {
-                        available.retain(|k, _| matches!(k, Memory::Frame(..)));
-                        validated_stores.retain(|k| matches!(k, Memory::Frame(..)));
+                        available.retain(|cached, _| !memory_store_clobbers(trace, &key, cached));
+                        validated_stores.retain(|cached| !memory_store_clobbers(trace, &key, cached));
                     }
                 }
                 validated_stores.insert(key.clone());
@@ -572,19 +645,27 @@ impl TraceOptimization for LoadStorePRE {
         }
         if native_loop(trace) && !trace.nodes.iter().any(|n| matches!(n.kind, TraceInst::ReadBarrier { .. })) {
             let invariant = preheader_values(trace);
-            let mut written = false;
+            let mut stores_seen = Vec::<Memory>::new();
             let body: Vec<_> = (0..trace.nodes.len()).filter(|id| !trace.preheader.contains(id)).collect();
             for id in body {
                 let kind = trace.nodes[id].kind.clone();
-                if store(&kind, trace).is_some_and(|(m, _)| !matches!(m, Memory::Frame(..))) { written = true; }
-                if written || !kind.is_heap_read() { continue; }
+                if let Some((memory, _)) = store(&kind, trace) {
+                    if !matches!(memory, Memory::Frame(..)) {
+                        stores_seen.push(memory);
+                    }
+                    continue;
+                }
+                if !kind.is_heap_read() { continue; }
+                let result = trace.nodes[id].results[0];
+                let rep = trace.value(result).unwrap().rep;
+                let key = load(&kind, rep).unwrap();
+                if stores_seen.iter().any(|store| memory_store_clobbers(trace, store, &key)) {
+                    continue;
+                }
                 let mut inputs_available = true;
                 kind.clone().visit_operands(|v| inputs_available &= invariant.contains(v));
                 if !inputs_available { continue; }
-                let result = trace.nodes[id].results[0];
                 let ty = trace.value(result).unwrap().ty;
-                let rep = trace.value(result).unwrap().rep;
-                let key = load(&kind, rep).unwrap();
                 let Some(&next) = available.get(&key) else { continue };
                 if trace.value(next).unwrap().rep != rep { continue; }
                 let exit = anchor_exit(trace);
@@ -612,6 +693,922 @@ impl TraceOptimization for LoadStorePRE {
             }
         }
         changed
+    }
+}
+
+
+// =============================================================================
+// Late scalar/guard cleanup
+// =============================================================================
+
+#[inline]
+fn canonical(trace: &Trace, value: TraceValueId) -> TraceValueId {
+    trace.canonical_value(value)
+}
+
+#[inline]
+fn result_layout(trace: &Trace, node: usize) -> Option<(TraceType, TraceRep)> {
+    let result = *trace.nodes.get(node)?.results.first()?;
+    let value = trace.value(result)?;
+    Some((value.ty, value.rep))
+}
+
+#[inline]
+fn raw_boolean_constant(trace: &Trace, value: TraceValueId) -> Option<bool> {
+    match constant(trace, value)? {
+        TraceConstant::Int32(0) => Some(false),
+        TraceConstant::Int32(1) => Some(true),
+        _ => None,
+    }
+}
+
+#[inline]
+fn bool_constant(
+    trace: &mut Trace,
+    value: bool,
+    ty: TraceType,
+    rep: TraceRep,
+) -> TraceValueId {
+    let constant = if rep == TraceRep::Tagged {
+        TraceConstant::Bool(value)
+    } else {
+        TraceConstant::Int32(value as i32)
+    };
+    intern(trace, constant, ty, rep)
+}
+
+#[inline]
+fn is_commutative_int(op: IntBinOp) -> bool {
+    matches!(
+        op,
+        IntBinOp::Add | IntBinOp::Mul | IntBinOp::BitAnd | IntBinOp::BitOr | IntBinOp::BitXor
+    )
+}
+
+#[inline]
+fn prefer_rhs_constant(trace: &Trace, lhs: TraceValueId, rhs: TraceValueId) -> bool {
+    let lhs = canonical(trace, lhs);
+    let rhs = canonical(trace, rhs);
+    let lhs_constant = constant(trace, lhs).is_some();
+    let rhs_constant = constant(trace, rhs).is_some();
+    (lhs_constant && !rhs_constant)
+        || (lhs_constant == rhs_constant && lhs.0 > rhs.0)
+}
+
+/// Canonicalize commutative integer/reference predicates before GVN. This makes
+/// `a + b` and `b + a` share one value number without changing floating-point
+/// arithmetic, where operand order can affect NaN payloads and signed zero.
+#[derive(Default)]
+pub struct CommutativeCanonicalization;
+
+impl TraceOptimization for CommutativeCanonicalization {
+    fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
+        let mut changed = false;
+        for id in order(trace) {
+            let kind = trace.nodes[id].kind.clone();
+            let rewritten = match kind {
+                TraceInst::IntBinary { op, lhs, rhs }
+                    if is_commutative_int(op) && prefer_rhs_constant(trace, lhs, rhs) =>
+                {
+                    Some(TraceInst::IntBinary { op, lhs: rhs, rhs: lhs })
+                }
+                TraceInst::IntCompare { op, lhs, rhs }
+                    if matches!(op, CmpKind::Eq | CmpKind::Ne)
+                        && prefer_rhs_constant(trace, lhs, rhs) =>
+                {
+                    Some(TraceInst::IntCompare { op, lhs: rhs, rhs: lhs })
+                }
+                TraceInst::F64Compare { op, lhs, rhs }
+                    if matches!(op, CmpKind::Eq | CmpKind::Ne)
+                        && prefer_rhs_constant(trace, lhs, rhs) =>
+                {
+                    Some(TraceInst::F64Compare { op, lhs: rhs, rhs: lhs })
+                }
+                TraceInst::RefEq { lhs, rhs } if prefer_rhs_constant(trace, lhs, rhs) => {
+                    Some(TraceInst::RefEq { lhs: rhs, rhs: lhs })
+                }
+                _ => None,
+            };
+            if let Some(rewritten) = rewritten {
+                trace.nodes[id].kind = rewritten;
+                trace.stats.peephole_simplified += 1;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// Wrapping integer canonicalization plus constant reassociation. Checked
+/// arithmetic is deliberately excluded: combining checked operations would move
+/// or remove an observable overflow side exit.
+#[derive(Default)]
+pub struct IntegerCanonicalization;
+
+impl TraceOptimization for IntegerCanonicalization {
+    fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
+        let mut changed = false;
+        for id in order(trace) {
+            let kind = trace.nodes[id].kind.clone();
+            let Some((ty, rep)) = result_layout(trace, id) else { continue };
+            let TraceInst::IntBinary { mut op, mut lhs, mut rhs } = kind else { continue };
+
+            lhs = canonical(trace, lhs);
+            rhs = canonical(trace, rhs);
+
+            // Normalize wrapping subtraction by a constant into addition.
+            if op == IntBinOp::Sub {
+                if let Some(c) = constant(trace, rhs).and_then(integer) {
+                    rhs = intern(trace, TraceConstant::Int32(c.wrapping_neg()), ty, rep);
+                    op = IntBinOp::Add;
+                    trace.nodes[id].kind = TraceInst::IntBinary { op, lhs, rhs };
+                    trace.stats.peephole_simplified += 1;
+                    changed = true;
+                }
+            }
+
+            if is_commutative_int(op) && prefer_rhs_constant(trace, lhs, rhs) {
+                std::mem::swap(&mut lhs, &mut rhs);
+                trace.nodes[id].kind = TraceInst::IntBinary { op, lhs, rhs };
+                changed = true;
+            }
+
+            let rhs_constant = constant(trace, rhs).and_then(integer);
+            let same = lhs == rhs;
+            let replacement = match (op, rhs_constant) {
+                (IntBinOp::Add, Some(0))
+                | (IntBinOp::Mul, Some(1))
+                | (IntBinOp::BitOr, Some(0))
+                | (IntBinOp::BitXor, Some(0))
+                | (IntBinOp::Shl | IntBinOp::ShrU | IntBinOp::Sar, Some(0))
+                | (IntBinOp::DivS, Some(1)) => Some(lhs),
+                (IntBinOp::Mul | IntBinOp::BitAnd, Some(0))
+                | (IntBinOp::RemS, Some(1)) => {
+                    Some(intern(trace, TraceConstant::Int32(0), ty, rep))
+                }
+                (IntBinOp::BitAnd, Some(-1)) => Some(lhs),
+                (IntBinOp::BitOr, Some(-1)) => {
+                    Some(intern(trace, TraceConstant::Int32(-1), ty, rep))
+                }
+                _ if same && matches!(op, IntBinOp::BitAnd | IntBinOp::BitOr) => Some(lhs),
+                _ if same && matches!(op, IntBinOp::Sub | IntBinOp::BitXor) => {
+                    Some(intern(trace, TraceConstant::Int32(0), ty, rep))
+                }
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                replace(trace, id, replacement);
+                trace.stats.peephole_simplified += 1;
+                changed = true;
+                continue;
+            }
+
+            if op == IntBinOp::Mul && rhs_constant == Some(-1) {
+                trace.nodes[id].kind = TraceInst::IntUnary {
+                    op: IntUnaryOp::Neg,
+                    value: lhs,
+                };
+                trace.stats.peephole_simplified += 1;
+                changed = true;
+                continue;
+            }
+
+            // Reassociate only operations whose Trace IR semantics are explicitly
+            // wrapping/bitwise. This shortens chains such as (i + 4) + 8.
+            let Some(outer) = rhs_constant else { continue };
+            let Some((_, producer)) = TraceCanonicalization::producer(trace, lhs) else { continue };
+            let TraceInst::IntBinary {
+                op: inner_op,
+                lhs: base,
+                rhs: inner_rhs,
+            } = producer
+            else {
+                continue;
+            };
+            if inner_op != op
+                || !matches!(
+                    op,
+                    IntBinOp::Add
+                        | IntBinOp::Mul
+                        | IntBinOp::BitAnd
+                        | IntBinOp::BitOr
+                        | IntBinOp::BitXor
+                )
+            {
+                continue;
+            }
+            let Some(inner) = constant(trace, inner_rhs).and_then(integer) else { continue };
+            let combined = match op {
+                IntBinOp::Add => inner.wrapping_add(outer),
+                IntBinOp::Mul => inner.wrapping_mul(outer),
+                IntBinOp::BitAnd => inner & outer,
+                IntBinOp::BitOr => inner | outer,
+                IntBinOp::BitXor => inner ^ outer,
+                _ => unreachable!(),
+            };
+            let rhs = intern(trace, TraceConstant::Int32(combined), ty, rep);
+            trace.nodes[id].kind = TraceInst::IntBinary { op, lhs: base, rhs };
+            trace.stats.peephole_simplified += 1;
+            changed = true;
+        }
+        changed
+    }
+}
+
+#[inline]
+fn rep_word_width(rep: TraceRep) -> u8 {
+    match rep {
+        TraceRep::Int32 | TraceRep::UInt32 | TraceRep::Bool => 32,
+        TraceRep::Tagged | TraceRep::F64 | TraceRep::HeapHandle | TraceRep::RawPtr => 64,
+    }
+}
+
+/// Cancel exact conversion round-trips and collapse reinterpret chains. Every
+/// rewrite preserves the result representation; conversions with rounding or a
+/// possible side exit are retained unless the inverse is mathematically exact.
+#[derive(Default)]
+pub struct ConversionSimplification;
+
+impl TraceOptimization for ConversionSimplification {
+    fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
+        let mut changed = false;
+        for id in order(trace) {
+            let kind = trace.nodes[id].kind.clone();
+            let Some(&result) = trace.nodes[id].results.first() else { continue };
+            let result_rep = trace.value(result).map(|value| value.rep);
+            match kind {
+                TraceInst::F64ToInt32 { value, .. } => {
+                    if let Some((_, TraceInst::Int32ToF64 { value: source })) =
+                        TraceCanonicalization::producer(trace, value)
+                    {
+                        replace(trace, id, source);
+                        trace.stats.peephole_simplified += 1;
+                        changed = true;
+                    }
+                }
+                TraceInst::Int32ToF64 { value } => {
+                    if let Some((_, TraceInst::F64ToInt32 { value: source, .. })) =
+                        TraceCanonicalization::producer(trace, value)
+                    {
+                        // Keep the guarded F64ToInt32 node itself: its side exit
+                        // proves exactness and excludes -0.0. The inverse numeric
+                        // conversion is redundant on the successful path.
+                        replace(trace, id, source);
+                        trace.stats.peephole_simplified += 1;
+                        changed = true;
+                    }
+                }
+                TraceInst::BoxInt32 { value } => {
+                    if let Some((_, TraceInst::F64ToInt32 { value: source, .. })) =
+                        TraceCanonicalization::producer(trace, value)
+                    {
+                        // The preceding exactness guard guarantees that boxing the
+                        // original F64 produces the same Wren number.
+                        trace.nodes[id].kind = TraceInst::BoxF64 { value: source };
+                        trace.stats.peephole_simplified += 1;
+                        changed = true;
+                    }
+                }
+                TraceInst::BoxF64 { value } => {
+                    if let Some((_, producer)) = TraceCanonicalization::producer(trace, value) {
+                        match producer {
+                            TraceInst::Int32ToF64 { value: source } => {
+                                trace.nodes[id].kind = TraceInst::BoxInt32 { value: source };
+                                trace.stats.peephole_simplified += 1;
+                                changed = true;
+                            }
+                            TraceInst::UInt32ToF64 { value: source } => {
+                                trace.nodes[id].kind = TraceInst::BoxUInt32 { value: source };
+                                trace.stats.peephole_simplified += 1;
+                                changed = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                TraceInst::Reinterpret { value } => {
+                    let value = canonical(trace, value);
+                    if trace.value(value).map(|desc| desc.rep) == result_rep {
+                        replace(trace, id, value);
+                        trace.stats.eliminated_copies += 1;
+                        changed = true;
+                        continue;
+                    }
+                    let Some((_, TraceInst::Reinterpret { value: source })) =
+                        TraceCanonicalization::producer(trace, value)
+                    else {
+                        continue;
+                    };
+                    let source = canonical(trace, source);
+                    let Some(source_rep) = trace.value(source).map(|desc| desc.rep) else { continue };
+                    let Some(result_rep) = result_rep else { continue };
+                    if source_rep == result_rep {
+                        replace(trace, id, source);
+                        trace.stats.eliminated_copies += 1;
+                        changed = true;
+                    } else if rep_word_width(source_rep) == rep_word_width(result_rep) {
+                        trace.nodes[id].kind = TraceInst::Reinterpret { value: source };
+                        trace.stats.eliminated_copies += 1;
+                        changed = true;
+                    }
+                }
+                TraceInst::F64Unary {
+                    op: F64UnaryOp::Neg,
+                    value,
+                } => {
+                    if let Some((_, TraceInst::F64Unary {
+                        op: F64UnaryOp::Neg,
+                        value: source,
+                    })) = TraceCanonicalization::producer(trace, value)
+                    {
+                        replace(trace, id, source);
+                        trace.stats.peephole_simplified += 1;
+                        changed = true;
+                    }
+                }
+                TraceInst::F64Math { op, value }
+                    if matches!(
+                        op,
+                        TraceMathOp::Abs
+                            | TraceMathOp::Floor
+                            | TraceMathOp::Ceil
+                            | TraceMathOp::Round
+                    ) =>
+                {
+                    if let Some((_, TraceInst::F64Math { op: inner, .. })) =
+                        TraceCanonicalization::producer(trace, value)
+                    {
+                        if inner == op {
+                            replace(trace, id, value);
+                            trace.stats.peephole_simplified += 1;
+                            changed = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+}
+
+/// Fold SSA predicates whose result is known from identity/constant facts and
+/// remove guards that are guaranteed to succeed. Guards that are known to fail
+/// are intentionally retained: their side-exit snapshot is observable control flow.
+#[derive(Default)]
+pub struct PredicateSimplification;
+
+impl TraceOptimization for PredicateSimplification {
+    fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
+        let mut changed = false;
+        for id in order(trace) {
+            let kind = trace.nodes[id].kind.clone();
+            let layout = result_layout(trace, id);
+            let replacement = match kind.clone() {
+                TraceInst::IntCompare { op, lhs, rhs }
+                    if canonical(trace, lhs) == canonical(trace, rhs) =>
+                {
+                    let value = matches!(op, CmpKind::Eq | CmpKind::Le | CmpKind::Ge);
+                    layout.map(|(ty, rep)| bool_constant(trace, value, ty, rep))
+                }
+                TraceInst::RefEq { lhs, rhs }
+                    if canonical(trace, lhs) == canonical(trace, rhs) =>
+                {
+                    layout.map(|(ty, rep)| bool_constant(trace, true, ty, rep))
+                }
+                TraceInst::IsNull { value } => constant(trace, value).map(|constant| {
+                    let (ty, rep) = layout.expect("IsNull must produce a result");
+                    bool_constant(trace, constant == TraceConstant::Null, ty, rep)
+                }),
+                TraceInst::Select {
+                    condition,
+                    if_true,
+                    if_false,
+                } => {
+                    if canonical(trace, if_true) == canonical(trace, if_false) {
+                        Some(canonical(trace, if_true))
+                    } else {
+                        raw_boolean_constant(trace, condition).map(|truth| {
+                            canonical(trace, if truth { if_true } else { if_false })
+                        })
+                    }
+                }
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                replace(trace, id, replacement);
+                trace.stats.peephole_simplified += 1;
+                changed = true;
+                continue;
+            }
+
+            let remove_guard = match &kind {
+                TraceInst::GuardEq { lhs, rhs, .. } => {
+                    canonical(trace, *lhs) == canonical(trace, *rhs)
+                }
+                TraceInst::GuardNotNull { value, .. } => {
+                    let value = canonical(trace, *value);
+                    trace.value(value).is_some_and(|desc| desc.rep == TraceRep::Tagged)
+                        && constant(trace, value).is_some_and(|constant| constant != TraceConstant::Null)
+                }
+                TraceInst::GuardTruthy { value, .. } => {
+                    let value = canonical(trace, *value);
+                    trace.value(value).is_some_and(|desc| desc.rep == TraceRep::Tagged)
+                        && constant(trace, value).is_some_and(|constant| {
+                            !matches!(constant, TraceConstant::Null | TraceConstant::Bool(false))
+                        })
+                }
+                TraceInst::GuardFalsey { value, .. } => {
+                    let value = canonical(trace, *value);
+                    trace.value(value).is_some_and(|desc| desc.rep == TraceRep::Tagged)
+                        && constant(trace, value).is_some_and(|constant| {
+                            matches!(constant, TraceConstant::Null | TraceConstant::Bool(false))
+                        })
+                }
+                TraceInst::GuardType {
+                    value,
+                    expected,
+                    ..
+                } => {
+                    *expected == TraceType::Any
+                        || constant(trace, *value)
+                            .is_some_and(|constant| constant.layout().0 == *expected)
+                }
+                _ => false,
+            };
+            if !remove_guard {
+                continue;
+            }
+
+            let source = match &kind {
+                TraceInst::GuardNotNull { value, .. }
+                | TraceInst::GuardTruthy { value, .. }
+                | TraceInst::GuardFalsey { value, .. }
+                | TraceInst::GuardType { value, .. } => Some(canonical(trace, *value)),
+                _ => None,
+            };
+            if let (Some(&result), Some(source)) = (trace.nodes[id].results.first(), source) {
+                if trace.value(source).map(|desc| desc.rep)
+                    == trace.value(result).map(|desc| desc.rep)
+                {
+                    replace(trace, id, source);
+                } else {
+                    trace.nodes[id].kind = TraceInst::Nop;
+                }
+            } else {
+                trace.nodes[id].kind = TraceInst::Nop;
+            }
+            trace.stats.eliminated_guards += 1;
+            trace.stats.redundant_guards += 1;
+            changed = true;
+        }
+        changed
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GuardFingerprint {
+    Truthy(TraceValueId),
+    Falsey(TraceValueId),
+    NotNull(TraceValueId),
+    F64(TraceValueId),
+    Int32(TraceValueId),
+    UInt32(TraceValueId),
+    Type(TraceValueId, TraceType),
+    Class(TraceValueId, Vec<u64>),
+    Bounds(TraceValueId, TraceValueId),
+    Eq(TraceValueId, TraceValueId),
+    Switch(TraceValueId, TraceSwitchGuard),
+    Heap(TraceValueId, TraceHeapObjectKind),
+    MethodEpoch(u64),
+}
+
+fn guard_fingerprint(trace: &Trace, kind: &TraceInst) -> Option<GuardFingerprint> {
+    Some(match kind {
+        TraceInst::GuardTruthy { value, .. } => {
+            GuardFingerprint::Truthy(canonical(trace, *value))
+        }
+        TraceInst::GuardFalsey { value, .. } => {
+            GuardFingerprint::Falsey(canonical(trace, *value))
+        }
+        TraceInst::GuardNotNull { value, .. } => {
+            GuardFingerprint::NotNull(canonical(trace, *value))
+        }
+        TraceInst::GuardF64 { value, .. } => GuardFingerprint::F64(canonical(trace, *value)),
+        TraceInst::GuardInt32 { value, .. } => {
+            GuardFingerprint::Int32(canonical(trace, *value))
+        }
+        TraceInst::GuardUInt32 { value, .. } => {
+            GuardFingerprint::UInt32(canonical(trace, *value))
+        }
+        TraceInst::GuardType {
+            value,
+            expected,
+            ..
+        } => GuardFingerprint::Type(canonical(trace, *value), *expected),
+        TraceInst::GuardClass { value, classes, .. } => {
+            let mut classes = classes.clone();
+            classes.sort_unstable();
+            classes.dedup();
+            GuardFingerprint::Class(canonical(trace, *value), classes)
+        }
+        TraceInst::GuardBounds { index, length, .. } => GuardFingerprint::Bounds(
+            canonical(trace, *index),
+            canonical(trace, *length),
+        ),
+        TraceInst::GuardEq { lhs, rhs, .. } => {
+            let mut lhs = canonical(trace, *lhs);
+            let mut rhs = canonical(trace, *rhs);
+            if lhs.0 > rhs.0 {
+                std::mem::swap(&mut lhs, &mut rhs);
+            }
+            GuardFingerprint::Eq(lhs, rhs)
+        }
+        TraceInst::GuardSwitch { tag, observed, .. } => {
+            let observed = match observed {
+                TraceSwitchGuard::Case(value) => TraceSwitchGuard::Case(*value),
+                TraceSwitchGuard::Default { excluded } => {
+                    let mut excluded = excluded.clone();
+                    excluded.sort_unstable();
+                    excluded.dedup();
+                    TraceSwitchGuard::Default { excluded }
+                }
+            };
+            GuardFingerprint::Switch(canonical(trace, *tag), observed)
+        }
+        TraceInst::GuardHeapObject { value, kind, .. } => {
+            GuardFingerprint::Heap(canonical(trace, *value), *kind)
+        }
+        TraceInst::GuardMethodEpoch { expected, .. } => {
+            GuardFingerprint::MethodEpoch(*expected)
+        }
+        _ => return None,
+    })
+}
+
+/// Dominating guard CSE. Because a trace body is linear, a successful earlier
+/// identical guard dominates every later occurrence until a full runtime/GC epoch.
+/// Numeric guard facts also subsume later generic numeric type guards.
+#[derive(Default)]
+pub struct GuardCoalescing;
+
+impl TraceOptimization for GuardCoalescing {
+    fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
+        let mut seen: Vec<(GuardFingerprint, Option<TraceValueId>)> = Vec::new();
+        let mut numeric = HashSet::<TraceValueId>::new();
+        let mut non_null = HashSet::<TraceValueId>::new();
+        let mut truthy = HashSet::<TraceValueId>::new();
+        let mut changed = false;
+
+        for id in order(trace) {
+            let kind = trace.nodes[id].kind.clone();
+            if matches!(
+                kind,
+                TraceInst::Runtime { .. }
+                    | TraceInst::RuntimeCall { .. }
+                    | TraceInst::ReadBarrier { .. }
+            ) {
+                seen.clear();
+                numeric.clear();
+                non_null.clear();
+                truthy.clear();
+                continue;
+            }
+
+            let source = match &kind {
+                TraceInst::GuardF64 { value, .. }
+                | TraceInst::GuardInt32 { value, .. }
+                | TraceInst::GuardUInt32 { value, .. }
+                | TraceInst::GuardTruthy { value, .. }
+                | TraceInst::GuardNotNull { value, .. }
+                | TraceInst::GuardType { value, .. }
+                | TraceInst::GuardClass { value, .. }
+                | TraceInst::GuardHeapObject { value, .. } => Some(canonical(trace, *value)),
+                _ => None,
+            };
+
+
+            if matches!(kind, TraceInst::GuardTruthy { .. }) {
+                let guarded = match &kind {
+                    TraceInst::GuardTruthy { value, .. } => canonical(trace, *value),
+                    _ => unreachable!(),
+                };
+                if truthy.contains(&guarded) {
+                    trace.nodes[id].kind = TraceInst::Nop;
+                    trace.stats.eliminated_guards += 1;
+                    trace.stats.redundant_guards += 1;
+                    changed = true;
+                    continue;
+                }
+            }
+
+            if matches!(kind, TraceInst::GuardNotNull { .. })
+                && source.is_some_and(|value| non_null.contains(&value))
+            {
+                let source = source.expect("not-null guard has a source");
+                if let Some(&result) = trace.nodes[id].results.first() {
+                    if trace.value(source).map(|desc| desc.rep)
+                        == trace.value(result).map(|desc| desc.rep)
+                    {
+                        replace(trace, id, source);
+                    } else {
+                        trace.nodes[id].kind = TraceInst::Nop;
+                    }
+                } else {
+                    trace.nodes[id].kind = TraceInst::Nop;
+                }
+                trace.stats.eliminated_guards += 1;
+                trace.stats.redundant_guards += 1;
+                changed = true;
+                continue;
+            }
+
+            if matches!(
+                kind,
+                TraceInst::GuardType {
+                    expected: TraceType::Num,
+                    ..
+                }
+            ) && source.is_some_and(|value| numeric.contains(&value))
+            {
+                let source = source.expect("type guard has a source");
+                if trace.nodes[id].results.is_empty() {
+                    trace.nodes[id].kind = TraceInst::Nop;
+                } else {
+                    replace(trace, id, source);
+                }
+                trace.stats.eliminated_guards += 1;
+                trace.stats.redundant_guards += 1;
+                changed = true;
+                continue;
+            }
+
+            if let Some(key) = guard_fingerprint(trace, &kind) {
+                if let Some((_, previous)) = seen.iter().find(|(old, _)| old == &key) {
+                    match (trace.nodes[id].results.first().copied(), *previous) {
+                        (Some(result), Some(previous))
+                            if trace.value(result).map(|desc| desc.rep)
+                                == trace.value(previous).map(|desc| desc.rep) =>
+                        {
+                            replace(trace, id, previous);
+                        }
+                        (None, _) => trace.nodes[id].kind = TraceInst::Nop,
+                        _ => continue,
+                    }
+                    trace.stats.eliminated_guards += 1;
+                    trace.stats.redundant_guards += 1;
+                    changed = true;
+                    continue;
+                }
+                seen.push((key, trace.nodes[id].results.first().copied()));
+            }
+
+            let Some(source) = source else { continue };
+            match &kind {
+                TraceInst::GuardInt32 { .. }
+                | TraceInst::GuardUInt32 { .. }
+                | TraceInst::GuardF64 { .. } => {
+                    numeric.insert(source);
+                    non_null.insert(source);
+                    truthy.insert(source);
+                }
+                TraceInst::GuardClass { .. } | TraceInst::GuardHeapObject { .. } => {
+                    non_null.insert(source);
+                    truthy.insert(source);
+                }
+                TraceInst::GuardTruthy { .. } => {
+                    non_null.insert(source);
+                    truthy.insert(source);
+                }
+                TraceInst::GuardNotNull { .. } => {
+                    non_null.insert(source);
+                }
+                TraceInst::GuardType {
+                    expected: TraceType::Num,
+                    ..
+                } => {
+                    non_null.insert(source);
+                    truthy.insert(source);
+                }
+                TraceInst::GuardType {
+                    expected: TraceType::Bool,
+                    ..
+                } => {
+                    non_null.insert(source);
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+}
+
+/// Propagate stable heap-object proofs across scalar work. A GuardHeapObject
+/// produces a GC-stable sidecar entry (RawPtr in Trace IR); it may be reused only
+/// within the current runtime/GC epoch.
+#[derive(Default)]
+pub struct HeapFactPropagation;
+
+impl TraceOptimization for HeapFactPropagation {
+    fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
+        let mut facts = Vec::<(TraceValueId, TraceHeapObjectKind, TraceValueId)>::new();
+        let mut non_null = HashSet::<TraceValueId>::new();
+        let mut changed = false;
+        for id in order(trace) {
+            let kind = trace.nodes[id].kind.clone();
+            if matches!(
+                kind,
+                TraceInst::Runtime { .. }
+                    | TraceInst::RuntimeCall { .. }
+                    | TraceInst::ReadBarrier { .. }
+            ) {
+                facts.clear();
+                non_null.clear();
+                continue;
+            }
+            match &kind {
+                TraceInst::GuardHeapObject { value, kind, .. } => {
+                    let value = canonical(trace, *value);
+                    if let Some((_, _, previous)) =
+                        facts.iter().find(|(known, known_kind, _)| {
+                            *known == value && *known_kind == *kind
+                        })
+                    {
+                        replace(trace, id, *previous);
+                        trace.stats.eliminated_guards += 1;
+                        trace.stats.redundant_guards += 1;
+                        changed = true;
+                    } else if let Some(&result) = trace.nodes[id].results.first() {
+                        facts.push((value, *kind, result));
+                    }
+                    non_null.insert(value);
+                }
+                TraceInst::TaggedToHeapHandle { value, .. }
+                | TraceInst::GuardClass { value, .. } => {
+                    non_null.insert(canonical(trace, *value));
+                }
+                TraceInst::GuardNotNull { value, .. }
+                    if non_null.contains(&canonical(trace, *value)) =>
+                {
+                    let value = canonical(trace, *value);
+                    if let Some(&result) = trace.nodes[id].results.first() {
+                        if trace.value(value).map(|desc| desc.rep)
+                            == trace.value(result).map(|desc| desc.rep)
+                        {
+                            replace(trace, id, value);
+                        } else {
+                            trace.nodes[id].kind = TraceInst::Nop;
+                        }
+                    } else {
+                        trace.nodes[id].kind = TraceInst::Nop;
+                    }
+                    trace.stats.eliminated_guards += 1;
+                    trace.stats.redundant_guards += 1;
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+}
+
+#[inline]
+fn dead_removable(kind: &TraceInst) -> bool {
+    kind.is_speculatable()
+        || matches!(
+            kind,
+            TraceInst::LoadFrameSlot { .. } | TraceInst::LoadAbsoluteValue { .. }
+        )
+}
+
+/// Snapshot-aware mark/sweep DCE for the linear SSA trace. Side-exit snapshot
+/// values, loop backedges and all effectful/trapping nodes are roots. Pure
+/// producers reachable only from other dead producers disappear as one web.
+#[derive(Default)]
+pub struct DeadCodeElimination;
+
+impl TraceOptimization for DeadCodeElimination {
+    fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
+        let aliases: Vec<_> = (0..trace.values.len())
+            .map(|index| trace.canonical_value(TraceValueId(index as u32)))
+            .collect();
+        let resolve = |value: TraceValueId| {
+            aliases
+                .get(value.0 as usize)
+                .copied()
+                .unwrap_or(value)
+        };
+
+        let mut live_values = HashSet::<TraceValueId>::new();
+        let mut work = Vec::<TraceValueId>::new();
+        let mut live_nodes = vec![false; trace.nodes.len()];
+        let push = |value: TraceValueId,
+                    live_values: &mut HashSet<TraceValueId>,
+                    work: &mut Vec<TraceValueId>| {
+            let value = resolve(value);
+            if live_values.insert(value) {
+                work.push(value);
+            }
+        };
+
+        for (id, node) in trace.nodes.iter().enumerate() {
+            if matches!(node.kind, TraceInst::Nop) {
+                continue;
+            }
+            if !dead_removable(&node.kind) {
+                live_nodes[id] = true;
+                let mut kind = node.kind.clone();
+                kind.visit_operands(|value| push(*value, &mut live_values, &mut work));
+            }
+        }
+        let mut referenced_exits = HashSet::<SideExitId>::new();
+        for node in &trace.nodes {
+            if !matches!(node.kind, TraceInst::Nop) {
+                if let Some(exit) = node.kind.exit() {
+                    referenced_exits.insert(exit);
+                }
+            }
+        }
+        for phi in &trace.loop_phis {
+            if let Some(exit) = phi.entry_exit {
+                referenced_exits.insert(exit);
+            }
+        }
+        if let Some(exit) = trace.native_budget_exit {
+            referenced_exits.insert(exit);
+        }
+        if let TraceTerminator::Exit(exit) = &trace.terminator {
+            referenced_exits.insert(*exit);
+        }
+        for exit in &trace.exits {
+            if !referenced_exits.contains(&exit.id) {
+                continue;
+            }
+            for frame in &exit.frames {
+                for write in &frame.writes {
+                    if let SnapshotValue::Value(value) = write.value {
+                        push(value, &mut live_values, &mut work);
+                    }
+                }
+            }
+        }
+
+        while let Some(value) = work.pop() {
+            let Some(desc) = trace.value(value).cloned() else { continue };
+            match desc.origin {
+                TraceValueOrigin::Alias(source)
+                | TraceValueOrigin::GuardedEntry { value: source, .. } => {
+                    push(source, &mut live_values, &mut work);
+                }
+                TraceValueOrigin::InstResult { node } => {
+                    if node >= trace.nodes.len() || live_nodes[node] {
+                        continue;
+                    }
+                    live_nodes[node] = true;
+                    let mut kind = trace.nodes[node].kind.clone();
+                    kind.visit_operands(|operand| {
+                        push(*operand, &mut live_values, &mut work)
+                    });
+                }
+                TraceValueOrigin::LoopPhi { .. } | TraceValueOrigin::LoopTemporary => {
+                    if let Some(phi) = trace
+                        .loop_phis
+                        .iter()
+                        .find(|phi| resolve(phi.value) == value)
+                        .cloned()
+                    {
+                        push(phi.initial, &mut live_values, &mut work);
+                        if let Some(backedge) = phi.backedge {
+                            push(backedge, &mut live_values, &mut work);
+                        }
+                    }
+                }
+                TraceValueOrigin::EntrySlot { .. } | TraceValueOrigin::Constant(_) => {}
+            }
+        }
+
+        let mut eliminated = 0usize;
+        for (id, node) in trace.nodes.iter_mut().enumerate() {
+            if !matches!(node.kind, TraceInst::Nop)
+                && dead_removable(&node.kind)
+                && !live_nodes[id]
+            {
+                node.kind = TraceInst::Nop;
+                eliminated += 1;
+            }
+        }
+        let before_phis = trace.loop_phis.len();
+        trace
+            .loop_phis
+            .retain(|phi| live_values.contains(&resolve(phi.value)));
+        let removed_phis = before_phis - trace.loop_phis.len();
+        if eliminated != 0 || removed_phis != 0 {
+            trace.stats.peephole_simplified += eliminated + removed_phis;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -782,4 +1779,181 @@ mod tests {
         let (_, TraceInst::IntBinary { op: IntBinOp::Add, rhs, .. }) = TraceCanonicalization::producer(&trace, trace.loop_phis[1].backedge.unwrap()).unwrap() else { panic!("missing recurrence") };
         assert_eq!(constant(&trace, rhs), Some(TraceConstant::Int32(21)));
     }
+
+    #[test]
+    fn integer_canonicalization_combines_wrapping_constant_chains() {
+        let mut b = builder(TraceKind::Side);
+        let x = input(&mut b, 0, TraceRep::Int32);
+        let four = int(&mut b, 4);
+        let eight = int(&mut b, 8);
+        let first = binary(&mut b, IntBinOp::Add, x, four);
+        let second = binary(&mut b, IntBinOp::Add, first, eight);
+        b.write_slot(FrameSlot::General(Reg(1)), second);
+        let mut trace = finish(b);
+        Optimize::new()
+            .with_pass(IntegerCanonicalization)
+            .with_pass(DeadCodeElimination)
+            .optimize_trace(&mut trace)
+            .unwrap();
+
+        let (_, TraceInst::IntBinary { op: IntBinOp::Add, lhs, rhs }) =
+            TraceCanonicalization::producer(&trace, second).unwrap()
+        else {
+            panic!("constant chain was not canonicalized");
+        };
+        assert_eq!(lhs, x);
+        assert_eq!(constant(&trace, rhs), Some(TraceConstant::Int32(12)));
+    }
+
+    #[test]
+    fn conversion_simplification_keeps_exactness_guard_but_removes_round_trip() {
+        let mut b = builder(TraceKind::Side);
+        let source = b.read_slot(
+            FrameSlot::General(Reg(0)),
+            TraceType::F64,
+            TraceRep::F64,
+        );
+        let exit = b.add_side_exit(ExitReason::GuardInteger, BytecodePc(0));
+        let narrowed = b.emit1(
+            TraceInst::F64ToInt32 { value: source, exit },
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        let widened = b.emit1(
+            TraceInst::Int32ToF64 { value: narrowed },
+            TraceType::F64,
+            TraceRep::F64,
+        );
+        let boxed = b.emit1(
+            TraceInst::BoxInt32 { value: narrowed },
+            TraceType::Num,
+            TraceRep::Tagged,
+        );
+        b.write_slot(FrameSlot::General(Reg(1)), widened);
+        b.write_slot(FrameSlot::General(Reg(2)), boxed);
+        let mut trace = finish(b);
+
+        Optimize::new()
+            .with_pass(ConversionSimplification)
+            .optimize_trace(&mut trace)
+            .unwrap();
+
+        assert!(matches!(trace.nodes[0].kind, TraceInst::F64ToInt32 { .. }));
+        assert_eq!(trace.canonical_value(widened), source);
+        assert!(matches!(
+            TraceCanonicalization::producer(&trace, boxed),
+            Some((_, TraceInst::BoxF64 { value })) if value == source
+        ));
+    }
+
+    #[test]
+    fn guard_coalescing_reuses_dominating_numeric_guard() {
+        let mut b = builder(TraceKind::Side);
+        let tagged = input(&mut b, 0, TraceRep::Tagged);
+        let exit = b.add_side_exit(ExitReason::GuardInteger, BytecodePc(0));
+        let first = b.emit1(
+            TraceInst::GuardInt32 { value: tagged, exit },
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        let second = b.emit1(
+            TraceInst::GuardInt32 { value: tagged, exit },
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        b.write_slot(FrameSlot::General(Reg(1)), second);
+        let mut trace = finish(b);
+        Optimize::new()
+            .with_pass(GuardCoalescing)
+            .optimize_trace(&mut trace)
+            .unwrap();
+
+        assert_eq!(trace.canonical_value(second), first);
+        assert_eq!(trace.stats.redundant_guards, 1);
+    }
+
+    #[test]
+    fn guard_coalescing_reuses_method_epoch_and_numeric_truthiness() {
+        let mut b = builder(TraceKind::Side);
+        let tagged = input(&mut b, 0, TraceRep::Tagged);
+        let numeric_exit = b.add_side_exit(ExitReason::GuardInteger, BytecodePc(0));
+        let branch_exit = b.add_side_exit(ExitReason::GuardTruthy, BytecodePc(1));
+        let epoch_exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(2));
+        b.emit1(
+            TraceInst::GuardInt32 { value: tagged, exit: numeric_exit },
+            TraceType::Int32,
+            TraceRep::Int32,
+        );
+        b.emit0(TraceInst::GuardTruthy { value: tagged, exit: branch_exit });
+        b.emit0(TraceInst::GuardMethodEpoch { expected: 17, exit: epoch_exit });
+        b.emit0(TraceInst::GuardMethodEpoch { expected: 17, exit: epoch_exit });
+        let mut trace = finish(b);
+
+        Optimize::new()
+            .with_pass(GuardCoalescing)
+            .optimize_trace(&mut trace)
+            .unwrap();
+
+        assert!(matches!(trace.nodes[1].kind, TraceInst::Nop));
+        assert!(matches!(trace.nodes[3].kind, TraceInst::Nop));
+        assert_eq!(trace.stats.redundant_guards, 2);
+    }
+
+    #[test]
+    fn dead_code_elimination_keeps_snapshot_values_only() {
+        let mut b = builder(TraceKind::Side);
+        let x = input(&mut b, 0, TraceRep::Int32);
+        let one = int(&mut b, 1);
+        let dead = binary(&mut b, IntBinOp::Add, x, one);
+        let live = binary(&mut b, IntBinOp::Mul, x, one);
+        b.write_slot(FrameSlot::General(Reg(1)), live);
+        let mut trace = finish(b);
+        let dead_node = match &trace.value(dead).unwrap().origin {
+            TraceValueOrigin::InstResult { node } => *node,
+            _ => unreachable!(),
+        };
+        Optimize::new()
+            .with_pass(DeadCodeElimination)
+            .optimize_trace(&mut trace)
+            .unwrap();
+
+        assert!(matches!(trace.nodes[dead_node].kind, TraceInst::Nop));
+        assert!(!matches!(
+            TraceCanonicalization::producer(&trace, live).map(|(_, kind)| kind),
+            None | Some(TraceInst::Nop)
+        ));
+    }
+
+    #[test]
+    fn memory_pre_preserves_disjoint_instance_field_slots() {
+        let mut b = builder(TraceKind::Side);
+        let object = input(&mut b, 0, TraceRep::Tagged);
+        let value = b.constant(TraceConstant::NumBits(7.0f64.to_bits()));
+        let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let first = b.emit1(
+            TraceInst::HeapLoadField { object, slot: 1, exit },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        b.emit0(TraceInst::HeapStoreField {
+            object,
+            slot: 0,
+            value,
+            exit,
+        });
+        let second = b.emit1(
+            TraceInst::HeapLoadField { object, slot: 1, exit },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        b.write_slot(FrameSlot::General(Reg(1)), second);
+        let mut trace = finish(b);
+        Optimize::new()
+            .with_pass(LoadStorePRE)
+            .optimize_trace(&mut trace)
+            .unwrap();
+
+        assert_eq!(trace.canonical_value(second), first);
+    }
+
 }
