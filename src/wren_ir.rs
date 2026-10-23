@@ -334,11 +334,23 @@ pub struct Signature {
     pub result: Type,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ModuleExport {
+    pub name: StringId,
+    pub slot: ModuleSlot,
+}
+
 #[derive(Clone, Debug)]
 pub struct ModuleInfo {
     pub id: ModuleId,
+    /// Canonical module identity used by ImportModule. This is intentionally
+    /// independent from the source file path used for diagnostics.
     pub name: StringId,
     pub variable_count: u32,
+    /// Public module bindings addressable by `import "..." for Name`.
+    /// Keeping this in immutable program metadata lets the VM build the export
+    /// table once during initialization instead of registering names at runtime.
+    pub exports: Vec<ModuleExport>,
     /// Slots preinitialized by the VM with engine-provided core class objects.
     pub builtin_bindings: Vec<BuiltinBinding>,
 }
@@ -904,25 +916,6 @@ pub enum Inst {
 }
 
 impl Inst {
-    /// Conservative language-exception classification. Guards/deopts, memory
-    /// operations and calls may enter a protected handler; total scalar SSA and
-    /// ordinary control flow cannot. This is deliberately independent of purity
-    /// (integer division, for example, is pure but may fail).
-    pub fn may_throw(&self) -> bool {
-        !matches!(self,
-            Self::Jump { .. } | Self::Branch { .. } | Self::Switch { .. }
-            | Self::Return(_) | Self::Unreachable | Self::Const(_) | Self::Move(_)
-            | Self::IntUnary { .. }
-            | Self::IntBin { op: IntBinOp::Add | IntBinOp::Sub | IntBinOp::Mul
-                | IntBinOp::BitAnd | IntBinOp::BitOr | IntBinOp::BitXor
-                | IntBinOp::Shl | IntBinOp::ShrU | IntBinOp::Sar, .. }
-            | Self::F64Unary { .. } | Self::F64Bin { .. }
-            | Self::CmpInt { .. } | Self::CmpF64 { .. } | Self::RefEq { .. }
-            | Self::Int32ToNum { .. } | Self::F64ToNum { .. }
-            | Self::WriteBarrier { .. } | Self::ReadBarrier { .. }
-            | Self::Safepoint | Self::OSRPoint)
-    }
-
     pub fn effect_behavior(&self) -> EffectBehavior {
         use EffectBehavior as B;
         use EffectKind as E;
@@ -1019,6 +1012,83 @@ impl Inst {
             EffectBehavior::None => None,
             EffectBehavior::Chain(kind) | EffectBehavior::Sink(kind) => Some(kind),
         }
+    }
+
+    /// Returns whether evaluating this instruction may transfer control through
+    /// Wren's structured exception machinery.
+    ///
+    /// This is intentionally about *language/runtime exceptions*, not every
+    /// operation that has side effects, allocates, reaches a safepoint, or may
+    /// deoptimize. Escape analysis uses this predicate to decide whether a
+    /// virtual object must remain materialized when it is live across a protected
+    /// instruction. False positives only inhibit scalar replacement; false
+    /// negatives can make exceptional snapshots observe an object that no longer
+    /// exists, so uncertain dynamic operations belong on the conservative side.
+    #[inline]
+    pub fn may_throw(&self) -> bool {
+        use Inst::*;
+
+        matches!(
+            self,
+            // Arbitrary Wren/host code may raise, and call setup itself can fail.
+            Invoke { .. }
+                | InvokeSuper { .. }
+                | CallDirect { .. }
+                | CallClosure { .. }
+                | CallPrimitive { .. }
+                | CallForeign { .. }
+
+                // Dynamic class operations validate their runtime operands.
+                | CreateClass { .. }
+                | BindMethod { .. }
+                | BindForeignMethod { .. }
+                | AllocForeign { .. }
+                | LoadField { .. }
+                | StoreField { .. }
+                | LoadStaticField { .. }
+                | StoreStaticField { .. }
+
+                // Importing can execute another module body; importing a missing
+                // module/export is also a catchable runtime error.
+                | ImportModule { .. }
+                | ImportVariable { .. }
+
+                // These validate that the dynamic operand has the expected heap
+                // representation.
+                | LoadCell { .. }
+                | StoreCell { .. }
+
+                // Collection operations can reject bad receivers/indices/keys.
+                | AllocList { capacity: Some(_) }
+                | ListLen { .. }
+                | ListGet { .. }
+                | ListSet { .. }
+                | ListAppend { .. }
+                | ListInsert { .. }
+                | ListRemoveAt { .. }
+                | MapLen { .. }
+                | MapGet { .. }
+                | MapSet { .. }
+                | MapRemove { .. }
+
+                // String operations validate dynamic operands and bounds.
+                | StringLen { .. }
+                | StringConcat { .. }
+                | StringSlice { .. }
+                | StringCodePointAt { .. }
+
+                // Promise rejection and fiber errors are explicit exceptional
+                // control-flow sources.
+                | Await { .. }
+                | MakeFiber { .. }
+                | FiberCall { .. }
+                | FiberTry { .. }
+                | FiberTransfer { .. }
+                | FiberTransferError { .. }
+                | FiberYield { .. }
+                | FiberSuspend
+                | FiberAbort { .. }
+        )
     }
 
     pub fn result_count(&self) -> usize {
@@ -1763,6 +1833,7 @@ impl Program {
             id,
             name: self.intern_string(name),
             variable_count,
+            exports: Vec::new(),
             builtin_bindings: Vec::new(),
         };
         let index = self.modules.len();
@@ -1775,6 +1846,23 @@ impl Program {
         self.module_index
             .get(&id)
             .and_then(|index| self.modules.get(*index))
+    }
+
+    pub fn set_module_exports(&mut self, id: ModuleId, exports: Vec<ModuleExport>) {
+        let index = *self
+            .module_index
+            .get(&id)
+            .unwrap_or_else(|| panic!("unknown module {id:?}"));
+        let module = &mut self.modules[index];
+        for export in &exports {
+            assert!(
+                export.slot.0 < module.variable_count,
+                "module export slot {:?} out of range for {:?}",
+                export.slot,
+                id
+            );
+        }
+        module.exports = exports;
     }
 
     pub fn set_module_builtin_bindings(&mut self, id: ModuleId, bindings: Vec<BuiltinBinding>) {

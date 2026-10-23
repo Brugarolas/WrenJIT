@@ -28,7 +28,7 @@ use crate::wren_front::{
 };
 use crate::wren_ir::{
     self as ir, Builder, BuiltinBinding, BuiltinId, CaptureMode, ClassId, ClassSet, FieldSlot,
-    FuncId, FunctionKind, Inst, MethodKind, MethodSymbol, ModuleId, ModuleSlot, SourceSpan,
+    FuncId, FunctionKind, Inst, MethodKind, MethodSymbol, ModuleExport, ModuleId, ModuleSlot, SourceSpan,
     StaticFieldSlot, Type, ValueId,
 };
 
@@ -46,6 +46,10 @@ const MAX_WREN_FIELDS: usize = u16::MAX as usize;
 
 #[derive(Clone, Debug)]
 pub struct LowerOptions {
+    /// Canonical module-name substitutions prepared by the module resolver.
+    /// The parser keeps the spelling written by the user; lowering rewrites only
+    /// the ImportModule operand, so source diagnostics retain the original text.
+    pub import_map: HashMap<String, String>,
     /// Retained for source/API compatibility.
     ///
     /// Field slots are now class-local in WIR and relocated once at runtime
@@ -59,6 +63,7 @@ pub struct LowerOptions {
 impl Default for LowerOptions {
     fn default() -> Self {
         Self {
+            import_map: HashMap::new(),
             require_static_super_layout_for_fields: true,
             warn_shadowing: false,
         }
@@ -810,6 +815,10 @@ struct ModuleLowerer<'p, 's, 'a> {
     class_plans: HashMap<Span, ClassPlan>,
     top_level_classes: HashMap<String, ClassId>,
     string_ids: HashMap<String, ir::StringId>,
+    /// Source import spelling -> canonical resolved module StringId. Kept
+    /// separate from string_ids so an ordinary literal like "./dep" retains
+    /// its exact source value even when the same bytes name an import.
+    import_ids: HashMap<String, ir::StringId>,
     closure_functions: HashMap<(usize, usize), FuncId>,
     method_functions: HashMap<Span, FuncId>,
 }
@@ -841,6 +850,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             class_plans: HashMap::new(),
             top_level_classes: HashMap::new(),
             string_ids: HashMap::new(),
+            import_ids: HashMap::new(),
             closure_functions: HashMap::new(),
             method_functions: HashMap::new(),
         }
@@ -852,6 +862,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             .program
             .add_module(self.module_name, self.module_layout.slots.len() as u32);
         self.module_id = Some(module_id);
+        self.install_module_exports(module_id);
         let builtin_bindings = BuiltinId::ALL
             .into_iter()
             .filter_map(|builtin| {
@@ -956,6 +967,52 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         for (name, span) in declarations {
             self.insert_module_slot(&name, span, &mut next);
         }
+    }
+
+    fn install_module_exports(&mut self, module: ModuleId) {
+        // Wren module-level bindings are public by name. Builtins and hidden
+        // lexical class roots deliberately stay private. Imported bindings are
+        // included, matching Wren's ordinary module-variable semantics.
+        let mut names = Vec::<(String, ModuleSlot)>::new();
+        let mut seen = HashSet::<String>::new();
+
+        for statement in &self.ast.statements {
+            match &statement.kind {
+                StmtKind::Variable { name, .. } => {
+                    if let Some(slot) = self.module_layout.get(&name.value) {
+                        if seen.insert(name.value.clone()) {
+                            names.push((name.value.clone(), slot));
+                        }
+                    }
+                }
+                StmtKind::Class(class) => {
+                    if let Some(slot) = self.module_layout.get(&class.name.value) {
+                        if seen.insert(class.name.value.clone()) {
+                            names.push((class.name.value.clone(), slot));
+                        }
+                    }
+                }
+                StmtKind::Import(import) => {
+                    for binding in &import.bindings {
+                        if let Some(slot) = self.module_layout.get(&binding.local.value) {
+                            if seen.insert(binding.local.value.clone()) {
+                                names.push((binding.local.value.clone(), slot));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let exports = names
+            .into_iter()
+            .map(|(name, slot)| ModuleExport {
+                name: self.program.intern_string(name),
+                slot,
+            })
+            .collect();
+        self.program.set_module_exports(module, exports);
     }
 
     fn insert_module_slot(&mut self, name: &str, span: Span, next: &mut u32) {
@@ -1185,11 +1242,28 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 self.string_ids.insert(text.to_owned(), id);
             }
         }
-        let mut imports = Vec::new();
-        collect_import_strings(&self.ast.statements, &mut imports);
-        for string in imports {
-            let id = self.program.intern_string(&string);
-            self.string_ids.insert(string, id);
+        // Import names are needed by every compilation root, including methods
+        // and nested closures. Discover them through the frontend's exhaustive
+        // AST walker rather than only scanning statement blocks.
+        for import in front::module_imports(self.ast) {
+            if let Ok(module_name) = std::str::from_utf8(&import.module) {
+                let id = self.program.intern_string(module_name);
+                self.string_ids.insert(module_name.to_owned(), id);
+            }
+            for binding in &import.bindings {
+                let id = self.program.intern_string(&binding.imported.value);
+                self.string_ids.insert(binding.imported.value.clone(), id);
+            }
+        }
+
+        // Resolved module identities may not occur literally in source. Keep a
+        // dedicated import lookup instead of overwriting string_ids: the program
+        // may legitimately contain an ordinary string literal whose bytes equal
+        // an import specifier, and that literal must preserve its source value.
+        for (source_spelling, canonical) in &self.options.import_map {
+            let id = self.program.intern_string(canonical);
+            self.string_ids.insert(canonical.clone(), id);
+            self.import_ids.insert(source_spelling.clone(), id);
         }
     }
 
@@ -1483,6 +1557,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             symbols: &self.symbols,
             class_plans: &self.class_plans,
             string_ids: &self.string_ids,
+            import_ids: &self.import_ids,
             analysis,
             node_id,
             closure_ids,
@@ -1612,6 +1687,7 @@ struct FunctionCompilerContext<'a> {
     symbols: &'a SymbolTable,
     class_plans: &'a HashMap<Span, ClassPlan>,
     string_ids: &'a HashMap<String, ir::StringId>,
+    import_ids: &'a HashMap<String, ir::StringId>,
     analysis: &'a RootAnalysis,
     node_id: FunctionNodeId,
     closure_ids: HashMap<FunctionNodeId, FuncId>,
@@ -2177,14 +2253,20 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 return;
             }
         };
-        let module_name = self
-            .builder
-            .emit1(
-                Inst::ImportModule {
-                    module_name: *self.context.string_ids.get(module_name).expect("import module name must be preinterned"),
-                },
-                Type::Module,
-            );
+        let module_name = self.builder.emit1(
+            Inst::ImportModule {
+                // Resolved graphs use import_ids; standalone lower_module()
+                // falls back to the literal source module name for compatibility.
+                module_name: self
+                    .context
+                    .import_ids
+                    .get(module_name)
+                    .copied()
+                    .or_else(|| self.context.string_ids.get(module_name).copied())
+                    .expect("import module name must be preinterned"),
+            },
+            Type::Module,
+        );
 
         for binding in &import.bindings {
             let Some(name_id) = self.context.string_ids.get(&binding.imported.value).copied() else {
@@ -3775,46 +3857,6 @@ fn collect_strings_expr(expr: &Expr, out: &mut Vec<Vec<u8>>) {
         | ExprKind::Field(_)
         | ExprKind::StaticField(_)
         | ExprKind::This => {}
-    }
-}
-
-fn collect_import_strings(statements: &[Stmt], out: &mut Vec<String>) {
-    for statement in statements {
-        match &statement.kind {
-            StmtKind::Import(import) => {
-                if let Ok(module) = std::str::from_utf8(&import.module) {
-                    out.push(module.to_owned());
-                }
-                for binding in &import.bindings {
-                    out.push(binding.imported.value.clone());
-                }
-            }
-            StmtKind::Block(statements) => collect_import_strings(statements, out),
-            StmtKind::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                collect_import_strings(std::slice::from_ref(then_branch.as_ref()), out);
-                if let Some(else_branch) = else_branch {
-                    collect_import_strings(std::slice::from_ref(else_branch.as_ref()), out)
-                }
-            }
-            StmtKind::While { body, .. } | StmtKind::For { body, .. }
-            | StmtKind::Defer { body, .. } => {
-                collect_import_strings(std::slice::from_ref(body.as_ref()), out)
-            }
-            StmtKind::Try { body, catch, finally_branch } => {
-                collect_import_strings(std::slice::from_ref(body.as_ref()), out);
-                if let Some(catch) = catch {
-                    collect_import_strings(std::slice::from_ref(catch.body.as_ref()), out);
-                }
-                if let Some(finally_branch) = finally_branch {
-                    collect_import_strings(std::slice::from_ref(finally_branch.as_ref()), out);
-                }
-            }
-            _ => {}
-        }
     }
 }
 

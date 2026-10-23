@@ -3766,11 +3766,20 @@ impl<'p> Interpreter<'p> {
                 };
                 *target = builtin_values[binding.builtin.index()];
             }
+            // ImportVariable resolves names through this table. The lowerer
+            // already records public bindings in immutable module metadata.
+            let mut exports = FastMap::default();
+            for export in &info.exports {
+                if export.slot.0 as usize >= variables.len() {
+                    return Err(RuntimeError::new("module export slot out of range"));
+                }
+                exports.insert(export.name, export.slot.0);
+            }
             modules.push(RuntimeModule {
                 id: info.id,
                 name: info.name,
                 variables,
-                exports: FastMap::default(),
+                exports,
                 module_value,
                 body: None,
                 initialized: false,
@@ -8195,7 +8204,7 @@ mod tests {
 
     fn simple_program(chunk: crate::wren_bytecode::BytecodeChunk, gprs: u16) -> BytecodeProgram {
         let mut program = BytecodeProgram::new();
-        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, builtin_bindings: Vec::new() });
+        program.metadata.modules.push(ModuleInfo { id: ModuleId(0), name: StringId(0), variable_count: 0, exports: Vec::new(), builtin_bindings: Vec::new() });
         program.metadata.strings.push("main".to_owned());
         program.push_function(BytecodeFunction {
             id: FuncId(0), module: ModuleId(0), kind: FunctionKind::ModuleBody,

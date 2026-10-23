@@ -24,13 +24,14 @@
 //! The pipeline is:
 //!
 //! ```text
-//! source
-//!   -> tokenizer/parser
-//!   -> AST
-//!   -> Wren HIR
+//! entry source
+//!   -> static module graph resolution (@lib / @std / relative)
+//!   -> tokenizer/parser for every module
+//!   -> ASTs
+//!   -> one multi-module Wren HIR program
 //!   -> HIR optimization passes
 //!   -> register bytecode
-//!   -> interpreter
+//!   -> interpreter / tracing JIT
 //! ```
 
 #![allow(warnings)]
@@ -43,6 +44,7 @@ pub mod wren_gc;
 pub mod wren_interpreter;
 pub mod wren_ir;
 pub mod wren_lowerer;
+pub mod wren_modules;
 pub mod wren_trace_ir;
 pub mod wren_trace_ir_optimizer;
 pub mod wren_trace_ir_optimizing;
@@ -54,13 +56,12 @@ pub mod wren_pipeline;
 
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mimalloc::MiMalloc;
 
-use crate::wren_interpreter::{ExecutionResult, Interpreter, WrenString};
+use crate::wren_interpreter::{ExecutionResult, Interpreter};
 use crate::wren_ir::Program;
 
 #[global_allocator]
@@ -86,65 +87,33 @@ fn run() -> u8 {
         eprintln!("Debug build: use `cargo run --release -- <file.wren>` for performance measurements.");
     }
 
-    let source = match fs::read_to_string(&source_path) {
-        Ok(source) => source,
-        Err(error) => {
-            eprintln!(
-                "error: failed to read '{}': {error}",
-                source_path.display()
-            );
-            return EXIT_IO_ERROR;
-        }
-    };
-
-    let source_name = source_path.to_string_lossy();
-    let module_name = module_name_from_path(&source_path);
-
     // -------------------------------------------------------------------------
-    // Frontend: source -> AST
-    // -------------------------------------------------------------------------
-
-    let parsed = wren_front::parse(&source_name, &source);
-
-    if let Err(error) = parsed.emit(&source_name, &source) {
-        eprintln!("error: failed to render parser diagnostics: {error}");
-        return EXIT_IO_ERROR;
-    }
-
-    if parsed.has_errors() {
-        return EXIT_COMPILE_ERROR;
-    }
-
-    // -------------------------------------------------------------------------
-    // Lowering: AST -> SSA HIR
+    // Module graph: resolve -> parse -> lower every statically named module.
     // -------------------------------------------------------------------------
 
     let mut hir = Program::new();
     let builtin_manifest = wren_builtin::install_hir_builtins(&mut hir);
-    let lowered = wren_lowerer::lower_module(
-        &mut hir,
-        &source_name,
-        &source,
-        &module_name,
-        &parsed.module,
-    );
+    let modules = match wren_modules::compile_module_graph(&mut hir, &source_path) {
+        Ok(modules) => modules,
+        Err(error) => {
+            if let Err(render_error) = error.emit() {
+                eprintln!("error: failed to render module diagnostics: {render_error}");
+                return EXIT_IO_ERROR;
+            }
+            return match error.kind() {
+                wren_modules::ModuleErrorKind::Io => EXIT_IO_ERROR,
+                wren_modules::ModuleErrorKind::Compile => EXIT_COMPILE_ERROR,
+            };
+        }
+    };
 
-    if let Err(error) = lowered.emit(&source_name, &source) {
-        eprintln!("error: failed to render lowering diagnostics: {error}");
+    if let Err(error) = modules.emit_diagnostics() {
+        eprintln!("error: failed to render module diagnostics: {error}");
         return EXIT_IO_ERROR;
     }
 
-    if lowered.has_errors() {
-        return EXIT_COMPILE_ERROR;
-    }
-
-    let lowered_module = match lowered.lowered {
-        Some(module) => module,
-        None => {
-            eprintln!("error: lowering completed without producing a module");
-            return EXIT_COMPILE_ERROR;
-        }
-    };
+    let lowered_module = modules.entry;
+    let module_name = modules.entry_name.clone();
 
     // -------------------------------------------------------------------------
     // Compilation pipeline: HIR -> optimizations -> register bytecode
@@ -177,11 +146,6 @@ fn run() -> u8 {
     // execution has no environment lookup in the hot path.
     if env::var_os("WREN_NO_JIT").is_some() {
         interpreter.set_jit_options(None);
-    } else if env::var_os("WREN_NO_ENTRY_JIT").is_some() {
-        interpreter.set_jit_options(Some(wren_tracing_jit::TracingJitOptions {
-            hot_entry_threshold: 0,
-            ..Default::default()
-        }));
     }
 
     let execution = interpreter.run_module(lowered_module.entry);
@@ -246,30 +210,4 @@ fn parse_command_line() -> Result<PathBuf, ()> {
 
 fn print_usage(executable: &str) {
     eprintln!("Usage: {executable} <file.wren>");
-}
-
-fn module_name_from_path(path: &Path) -> String {
-    path.file_stem()
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| OsStr::new("main"))
-        .to_string_lossy()
-        .into_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn derives_module_name_from_file_name() {
-        assert_eq!(
-            module_name_from_path(Path::new("examples/hello.wren")),
-            "hello"
-        );
-    }
-
-    #[test]
-    fn derives_fallback_module_name() {
-        assert_eq!(module_name_from_path(Path::new("")), "main");
-    }
 }

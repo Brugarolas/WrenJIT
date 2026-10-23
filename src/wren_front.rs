@@ -1285,6 +1285,164 @@ pub enum StringPart {
     Expression(Expr),
 }
 
+
+/// Returns every statically named module import reachable from this module,
+/// including imports nested inside methods, closures, control-flow bodies and
+/// deferred/exception handlers. Wren import targets are string literals, so the
+/// complete dependency graph can be discovered before lowering or execution.
+pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
+    fn visit_body<'a>(body: &'a FunctionBody, out: &mut Vec<&'a ImportDecl>) {
+        match &body.kind {
+            FunctionBodyKind::Expression(expr) => visit_expr(expr, out),
+            FunctionBodyKind::Statements(statements) => visit_statements(statements, out),
+        }
+    }
+
+    fn visit_expr<'a>(expr: &'a Expr, out: &mut Vec<&'a ImportDecl>) {
+        match &expr.kind {
+            ExprKind::InterpolatedString(parts) => {
+                for part in parts {
+                    if let StringPart::Expression(expr) = part {
+                        visit_expr(expr, out);
+                    }
+                }
+            }
+            ExprKind::Super(super_expr) => {
+                for arg in &super_expr.args {
+                    visit_expr(arg, out);
+                }
+            }
+            ExprKind::List(items) => {
+                for item in items {
+                    visit_expr(item, out);
+                }
+            }
+            ExprKind::Map(entries) => {
+                for entry in entries {
+                    visit_expr(&entry.key, out);
+                    visit_expr(&entry.value, out);
+                }
+            }
+            ExprKind::Grouped(inner)
+            | ExprKind::Unary { operand: inner, .. }
+            | ExprKind::Await(inner) => visit_expr(inner, out),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Logical { left, right, .. } => {
+                visit_expr(left, out);
+                visit_expr(right, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                visit_expr(condition, out);
+                visit_expr(then_expr, out);
+                visit_expr(else_expr, out);
+            }
+            ExprKind::Assign { target, value } => {
+                visit_expr(target, out);
+                visit_expr(value, out);
+            }
+            ExprKind::Invoke(invoke) => {
+                if let Some(receiver) = &invoke.receiver {
+                    visit_expr(receiver, out);
+                }
+                for arg in &invoke.args {
+                    visit_expr(arg, out);
+                }
+            }
+            ExprKind::Subscript { receiver, args } => {
+                visit_expr(receiver, out);
+                for arg in args {
+                    visit_expr(arg, out);
+                }
+            }
+            ExprKind::Closure(body) | ExprKind::AsyncClosure(body) => visit_body(body, out),
+            ExprKind::Null
+            | ExprKind::Bool(_)
+            | ExprKind::Number(_)
+            | ExprKind::String(_)
+            | ExprKind::Name(_)
+            | ExprKind::Field(_)
+            | ExprKind::StaticField(_)
+            | ExprKind::This => {}
+        }
+    }
+
+    fn visit_stmt<'a>(statement: &'a Stmt, out: &mut Vec<&'a ImportDecl>) {
+        match &statement.kind {
+            StmtKind::Variable { initializer, .. } => {
+                if let Some(initializer) = initializer {
+                    visit_expr(initializer, out);
+                }
+            }
+            StmtKind::Class(class) => {
+                if let Some(superclass) = &class.superclass {
+                    visit_expr(superclass, out);
+                }
+                for method in &class.methods {
+                    if let Some(body) = &method.body {
+                        visit_body(body, out);
+                    }
+                }
+            }
+            StmtKind::Import(import) => out.push(import),
+            StmtKind::Block(statements) => visit_statements(statements, out),
+            StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                visit_expr(condition, out);
+                visit_stmt(then_branch, out);
+                if let Some(else_branch) = else_branch {
+                    visit_stmt(else_branch, out);
+                }
+            }
+            StmtKind::While { condition, body } => {
+                visit_expr(condition, out);
+                visit_stmt(body, out);
+            }
+            StmtKind::For { iterable, body, .. } => {
+                visit_expr(iterable, out);
+                visit_stmt(body, out);
+            }
+            StmtKind::Defer { body, .. } => visit_stmt(body, out),
+            StmtKind::Try {
+                body,
+                catch,
+                finally_branch,
+            } => {
+                visit_stmt(body, out);
+                if let Some(catch) = catch {
+                    visit_stmt(&catch.body, out);
+                }
+                if let Some(finally_branch) = finally_branch {
+                    visit_stmt(finally_branch, out);
+                }
+            }
+            StmtKind::Throw(expr) | StmtKind::Expression(expr) => visit_expr(expr, out),
+            StmtKind::Return(expr) => {
+                if let Some(expr) = expr {
+                    visit_expr(expr, out);
+                }
+            }
+            StmtKind::Break | StmtKind::Continue => {}
+        }
+    }
+
+    fn visit_statements<'a>(statements: &'a [Stmt], out: &mut Vec<&'a ImportDecl>) {
+        for statement in statements {
+            visit_stmt(statement, out);
+        }
+    }
+
+    let mut imports = Vec::new();
+    visit_statements(&module.statements, &mut imports);
+    imports
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     Negate,
@@ -1821,7 +1979,7 @@ impl<'a> Parser<'a> {
             return Ok(MethodSignatureAst::InfixOperator { operator, param });
         }
 
-        let name = self.parse_method_name("WREN-P023", "expected method name")?;
+        let name = self.parse_identifier("WREN-P023", "expected method name")?;
         if self.match_kind(TokenKind::Equal) {
             self.expect(
                 TokenKind::LeftParen,
@@ -2682,7 +2840,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_dot_call(&mut self, receiver: Expr) -> PResult<Expr> {
-        let name = self.parse_method_name("WREN-P054", "expected method name after `.`")?;
+        let name = self.parse_identifier("WREN-P054", "expected method name after `.`")?;
         let (syntax, mut args, end) = if self.match_kind(TokenKind::LeftParen) {
             let args = self.parse_argument_list(TokenKind::RightParen)?;
             (InvokeSyntax::Method, args, self.previous().span.end)
@@ -2843,7 +3001,7 @@ impl<'a> Parser<'a> {
 
     fn parse_super(&mut self, start: usize) -> PResult<Expr> {
         if self.match_kind(TokenKind::Dot) {
-            let method = self.parse_method_name(
+            let method = self.parse_identifier(
                 "WREN-P059",
                 "expected superclass method name after `super.`",
             )?;
@@ -3367,24 +3525,6 @@ impl<'a> Parser<'a> {
         }
         let token = self.advance();
         Ok(Spanned::new(self.slice(token.span).to_owned(), token.span))
-    }
-
-    /// Method names may reuse the error-handling keywords, which are only
-    /// reserved in statement position (e.g. Wren's core `Fiber.try()`).
-    fn parse_method_name(&mut self, code: &'static str, message: impl Into<String>) -> PResult<Ident> {
-        if matches!(
-            self.peek().kind,
-            TokenKind::Try
-                | TokenKind::Catch
-                | TokenKind::Finally
-                | TokenKind::Throw
-                | TokenKind::Defer
-                | TokenKind::ErrDefer
-        ) {
-            let token = self.advance();
-            return Ok(Spanned::new(self.slice(token.span).to_owned(), token.span));
-        }
-        self.parse_identifier(code, message)
     }
 
     fn peek_operator_name(&self) -> Option<OperatorName> {
