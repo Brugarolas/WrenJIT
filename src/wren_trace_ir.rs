@@ -127,6 +127,9 @@ pub enum TraceInst {
         exit: SideExitId,
     },
     HeapStringLen { string: TraceValueId, exit: SideExitId },
+    /// Fast path for `await` when the observed Promise is already fulfilled.
+    /// Pending/rejected/non-Promise values side-exit to the original Await opcode.
+    HeapAwaitFulfilled { promise: TraceValueId, exit: SideExitId },
     ReadBarrier { value: TraceValueId },
 }
 impl TraceInst {
@@ -144,7 +147,8 @@ impl TraceInst {
             | HeapLoadCell { cell: value, .. }
             | HeapListLen { list: value, .. }
             | HeapMapLen { map: value, .. }
-            | HeapStringLen { string: value, .. } => f(value),
+            | HeapStringLen { string: value, .. }
+            | HeapAwaitFulfilled { promise: value, .. } => f(value),
             GuardBounds { index, length, .. } => { f(index); f(length); },
             GuardSwitch { tag, .. } => f(tag),
             GuardEq { lhs, rhs, .. } | IntBinary { lhs, rhs, .. } | IntBinaryChecked { lhs, rhs, .. }
@@ -189,7 +193,8 @@ impl TraceInst {
             | HeapLoadCell { exit, .. } | HeapStoreCell { exit, .. }
             | HeapListLen { exit, .. } | HeapListGet { exit, .. } | HeapListSet { exit, .. }
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. }
-            | HeapMapSetShaped { exit, .. } | HeapStringLen { exit, .. } => Some(*exit),
+            | HeapMapSetShaped { exit, .. } | HeapStringLen { exit, .. }
+            | HeapAwaitFulfilled { exit, .. } => Some(*exit),
             _ => None,
         }
     }

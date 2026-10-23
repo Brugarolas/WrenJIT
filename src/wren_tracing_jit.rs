@@ -178,6 +178,10 @@ pub const TRACE_HEAP_METADATA_SHIFT: u32 = 8;
 pub const TRACE_HEAP_METADATA_MAX: u32 = 0x00ff_ffff;
 pub const TRACE_MAP_DICTIONARY_SHAPE: u32 = TRACE_HEAP_METADATA_MAX;
 
+/// Promise state is packed into the high metadata bits of TraceHeapEntry::kind.
+pub const TRACE_PROMISE_PENDING: u32 = 1;
+pub const TRACE_PROMISE_FULFILLED: u32 = 2;
+pub const TRACE_PROMISE_REJECTED: u32 = 3;
 
 /// Stable object kinds exposed to generated code. This is deliberately separate
 /// from the Rust `HeapObject` enum: Cranelift must never depend on Rust enum layout.
@@ -190,6 +194,7 @@ pub enum TraceHeapKind {
     Map = 3,
     Cell = 4,
     Instance = 5,
+    Promise = 6,
 }
 
 /// Stable JIT-visible sidecar for one Wren heap handle.
@@ -205,12 +210,15 @@ pub struct TraceHeapEntry {
     pub(crate) address: AtomicUsize,
     pub(crate) next_free: AtomicU32,
     /// Packed metadata: low 8 bits are TraceHeapKind. The upper 24 bits are a
-    /// type-specific payload: ShapeId for shaped Maps and UTF-8 byte length for
-    /// Strings. Packing avoids adding another sidecar field for Map/String metadata.
+    /// type-specific payload: ShapeId for shaped Maps, UTF-8 byte length for
+    /// Strings, and settlement state for Promises. Packing avoids extra sidecar
+    /// fields for small type-specific metadata.
     pub(crate) kind: AtomicU32,
     pub(crate) receiver_class: AtomicU64,
     pub(crate) data: AtomicUsize,
     pub(crate) len: AtomicUsize,
+    /// Settled Promise payload. Promise state itself is packed in `kind` metadata.
+    pub(crate) promise_value: AtomicU64,
 }
 
 impl TraceHeapEntry {
@@ -222,6 +230,7 @@ impl TraceHeapEntry {
             receiver_class: AtomicU64::new(0),
             data: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
+            promise_value: AtomicU64::new(0),
         }
     }
 
@@ -231,6 +240,7 @@ impl TraceHeapEntry {
         self.receiver_class.store(0, Ordering::Relaxed);
         self.data.store(0, Ordering::Relaxed);
         self.len.store(0, Ordering::Relaxed);
+        self.promise_value.store(0, Ordering::Relaxed);
     }
 }
 
@@ -426,6 +436,15 @@ pub trait TraceRuntime {
         None
     }
 
+    /// Observe an already-fulfilled Promise while recording `Await`. Pending and
+    /// rejected Promises remain runtime boundaries because they can suspend/fail.
+    fn trace_fulfilled_promise(
+        &self,
+        _value: RegisterWord,
+    ) -> Result<Option<RegisterWord>, Self::RuntimeError> {
+        Ok(None)
+    }
+
     /// Resolve a heap object's semantic class if the recorder asks for one.
     fn trace_observe_heap_class(
         &self,
@@ -492,6 +511,10 @@ pub struct TracingJitOptions {
     pub hot_loop_threshold: u32,
     /// Visits to a function entry/call continuation before recording. Zero disables this tier.
     pub hot_entry_threshold: u32,
+    /// Do not install acyclic entry traces shorter than this. Tiny forwarding
+    /// methods usually lose to the token-threaded baseline until native call
+    /// linking/inlining removes the transition itself.
+    pub min_entry_trace_bytecodes: u32,
     /// Hard recorder limit for one loop iteration.
     pub max_trace_steps: usize,
     /// Repeated recording/lowering failures before a loop is permanently ignored.
@@ -523,6 +546,7 @@ impl Default for TracingJitOptions {
         Self {
             hot_loop_threshold: 64,
             hot_entry_threshold: 64,
+            min_entry_trace_bytecodes: 6,
             max_trace_steps: 4096,
             max_failures_before_blacklist: 8,
             hot_side_exit_threshold: 32,
@@ -549,6 +573,7 @@ pub struct TracingJitStats {
     pub loop_header_hits: u64,
     pub entry_hits: u64,
     pub entry_traces_compiled: u64,
+    pub entry_traces_too_small: u64,
     pub entry_native_entries: u64,
     pub blacklisted_entries: u64,
     pub recordings_started: u64,
@@ -2388,6 +2413,27 @@ impl<'a> TraceRecorder<'a> {
             | ProfileBlock
             | ProfileNumeric => self.runtime_leaf(op, builder, &[]),
 
+            Await => {
+                let observed = runtime
+                    .trace_read_slot(FrameSlot::General(Reg(op.b)))
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?;
+                let Some(_fulfilled) = runtime
+                    .trace_fulfilled_promise(observed)
+                    .map_err(|_| RecordingAbort::GuardFailedWhileRecording)?
+                else {
+                    return Err(RecordingAbort::UnsupportedOpcode(op.opcode));
+                };
+                let promise = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+                let value = builder.emit1(
+                    TraceInst::HeapAwaitFulfilled { promise, exit },
+                    TraceType::Any,
+                    TraceRep::Tagged,
+                );
+                self.write_gpr(builder, op.a, value);
+                Ok(ExpectedStep::Exact(next))
+            }
+
             Safepoint | Breakpoint => {
                 Err(RecordingAbort::UnsupportedOpcode(op.opcode))
             }
@@ -2424,8 +2470,7 @@ impl<'a> TraceRecorder<'a> {
             | FiberTransferError
             | FiberYield
             | FiberSuspend
-            | FiberAbort
-            | Await => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
+            | FiberAbort => Err(RecordingAbort::UnsupportedOpcode(op.opcode)),
         }
     }
 
@@ -4356,6 +4401,15 @@ impl CraneliftLoweringState<'_, '_> {
         )
     }
 
+    fn heap_entry_promise_value(&mut self, entry: Value) -> Value {
+        self.builder.ins().load(
+            types::I64,
+            Self::trusted_mem(),
+            entry,
+            offset_of!(TraceHeapEntry, promise_value) as i32,
+        )
+    }
+
     fn guard_constant_index(
         &mut self,
         len: Value,
@@ -5174,6 +5228,26 @@ impl CraneliftLoweringState<'_, '_> {
                 self.cache_value(one_result(node)?, len);
             }
 
+            HeapAwaitFulfilled { promise, exit } => {
+                let tagged = self.lower_value(*promise)?;
+                let (entry, _, metadata) = self.guard_heap_entry_with_metadata(
+                    tagged,
+                    TraceHeapKind::Promise,
+                    *exit,
+                )?;
+                let state = self.heap_metadata_payload(metadata);
+                let fulfilled = self.builder.ins().icmp_imm_u(
+                    IntCC::Equal,
+                    state,
+                    TRACE_PROMISE_FULFILLED as i64,
+                );
+                let fulfilled = self.bool32(fulfilled);
+                let not_fulfilled = self.bool_not(fulfilled);
+                self.emit_side_exit(*exit, not_fulfilled)?;
+                let value = self.heap_entry_promise_value(entry);
+                self.cache_value(one_result(node)?, value);
+            }
+
             ReadBarrier { value } => {
                 let value = self.lower_value(*value)?;
                 self.cache_value(one_result(node)?, value);
@@ -5387,6 +5461,15 @@ impl TracingJit {
             .and_then(|compiled| compiled.debug_text.clone())
     }
 
+    /// Prime manager-side hotness after the interpreter's dense per-PC counter
+    /// has already paid the cold-tier threshold. This keeps HashMap traffic out
+    /// of cold calls without changing retry/blacklist semantics here.
+    pub(crate) fn preheat_entry(&mut self, location: TraceLocation) {
+        let threshold = self.options.hot_entry_threshold.max(1);
+        let state = self.entries.entry(location).or_default();
+        state.hotness = state.hotness.max(threshold.max(state.retry_after));
+    }
+
     /// Record a bounded acyclic path. Recording executes the prefix once, so
     /// newly compiled entries are first used on a subsequent visit.
     pub fn on_entry<R: TraceRuntime>(&mut self, runtime: &mut R)
@@ -5414,6 +5497,18 @@ impl TracingJit {
                 self.stats.eliminated_trace_guards += trace.stats.eliminated_guards as u64;
                 self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
                 self.stats.eliminated_trace_copies += trace.stats.eliminated_copies as u64;
+                if trace.stats.recorded_bytecodes < self.options.min_entry_trace_bytecodes as usize {
+                    let state = self.entries.get_mut(&location).unwrap();
+                    state.blacklisted = true;
+                    self.stats.blacklisted_entries = self.stats.blacklisted_entries.saturating_add(1);
+                    self.stats.entry_traces_too_small = self.stats.entry_traces_too_small.saturating_add(1);
+                    self.stats.last_abort = Some(format!(
+                        "entry region too small: {} bytecodes < {}",
+                        trace.stats.recorded_bytecodes,
+                        self.options.min_entry_trace_bytecodes,
+                    ));
+                    return Ok(JitAction::Blacklisted);
+                }
                 self.compile_trace(&trace).map_err(|error| error.to_string())
             }
             Err(RecordOutcome::Abort(reason)) => Err(reason.to_string()),
@@ -6425,6 +6520,77 @@ mod tests {
         assert_eq!(general[0].0 as u32 as i32, 40);
         assert_eq!(general[1].0 as u32 as i32, 6);
         assert_eq!(general[2].0 as u32 as i32, 46);
+    }
+
+    #[test]
+    fn fulfilled_await_loads_result_natively_and_pending_promise_side_exits() {
+        unsafe extern "C" fn unexpected_runtime(
+            _: *mut TraceActivation, _: u32, _: u32, _: u32,
+        ) -> u32 { panic!("fulfilled Await fast path must not call the runtime") }
+
+        let location = TraceLocation::new(FuncId(0), BytecodePc(0));
+        let mut builder = crate::wren_trace_ir::TraceBuilder::new(
+            TraceId(79),
+            TraceAnchor { kind: TraceKind::Side, location },
+        );
+        let promise = builder.read_slot(
+            FrameSlot::General(Reg(0)),
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        let slow = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let value = builder.emit1(
+            TraceInst::HeapAwaitFulfilled { promise, exit: slow },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        builder.write_slot(FrameSlot::General(Reg(1)), value);
+        let success = builder.add_side_exit(ExitReason::GuardValue, BytecodePc(1));
+        builder.set_terminator(TraceTerminator::Exit(success));
+        let trace = builder.finish().unwrap();
+
+        let mut jit = TracingJit::new(TracingJitOptions::default());
+        let compiled = jit.compile_trace(&trace).unwrap();
+        let mut chunk = (0..TRACE_HEAP_CHUNK_SIZE)
+            .map(|_| TraceHeapEntry::new(0))
+            .collect::<Vec<_>>();
+        let mut chunks = vec![chunk.as_mut_ptr()];
+        let entry = &chunk[0];
+        entry.address.store(1, Ordering::Relaxed);
+        entry.promise_value.store(42.0f64.to_bits(), Ordering::Relaxed);
+        entry.kind.store(
+            (TraceHeapKind::Promise as u32)
+                | (TRACE_PROMISE_FULFILLED << TRACE_HEAP_METADATA_SHIFT),
+            Ordering::Relaxed,
+        );
+
+        let answer = RegisterWord(42.0f64.to_bits());
+        let mut general = [RegisterWord(TAG_HEAP), RegisterWord(0)];
+        let mut activation = TraceActivation::new(TraceActivationInputs {
+            general: general.as_mut_ptr(),
+            arguments: std::ptr::null_mut(),
+            returns: std::ptr::null_mut(),
+            special: std::ptr::null_mut(),
+            runtime: std::ptr::null_mut(),
+            execute: unexpected_runtime,
+            heap_chunks: chunks.as_mut_ptr(),
+            heap_write_barrier: noop_heap_write_barrier,
+        });
+        activation.current_links = compiled.native_links.as_ptr();
+
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(activation.exit_id, success.0);
+        assert_eq!(general[1], answer);
+
+        entry.kind.store(
+            (TraceHeapKind::Promise as u32)
+                | (TRACE_PROMISE_PENDING << TRACE_HEAP_METADATA_SHIFT),
+            Ordering::Relaxed,
+        );
+        activation.reset_result();
+        general[1] = RegisterWord(0);
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        assert_eq!(activation.exit_id, slow.0);
     }
 
     #[test]
