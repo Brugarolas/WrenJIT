@@ -2265,6 +2265,15 @@ impl PreparedSwitch {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PreparedExceptionHandler {
+    start_pc: u32,
+    end_pc: u32,
+    handler_op: u32,
+    error_reg: Reg,
+    depth: u16,
+}
+
 struct PreparedFunction {
     handlers: Vec<Handler>,
     /// Entry hooks wrap only function entries and discovered runtime continuations.
@@ -2286,6 +2295,7 @@ struct PreparedFunction {
     entry_gc_map: u32,
     word_to_op: Vec<u32>,
     deopt_resume: FastMap<u32, u32>,
+    exception_handlers: Vec<PreparedExceptionHandler>,
     frame: FrameLayout,
     id: FuncId,
     /// Class whose LoadField/StoreField operands are still class-local.
@@ -2549,6 +2559,17 @@ impl PreparedProgram {
             deopt_resume.insert(point.id.0, map_word_target(point.resume_pc.0)?);
         }
 
+        let mut exception_handlers = Vec::with_capacity(function.chunk.exception_handlers.len());
+        for handler in &function.chunk.exception_handlers {
+            exception_handlers.push(PreparedExceptionHandler {
+                start_pc: handler.start_pc.0,
+                end_pc: handler.end_pc.0,
+                handler_op: map_word_target(handler.handler_pc.0)?,
+                error_reg: handler.error_reg,
+                depth: handler.depth,
+            });
+        }
+
         let mut handlers = Vec::with_capacity(temps.len());
         let mut ops = Vec::with_capacity(temps.len());
         let mut map_inline_cache_count = 0usize;
@@ -2624,6 +2645,15 @@ impl PreparedProgram {
             }
         }
         target_ops.extend(deopt_resume.values().copied());
+        target_ops.extend(exception_handlers.iter().map(|handler| handler.handler_op));
+        // Never fuse across a structured-exception range boundary. Current
+        // superinstructions only throw from their first constituent, but keeping
+        // boundaries explicit makes raw-PC exception lookup correct for future
+        // fused opcodes as well.
+        for handler in &function.chunk.exception_handlers {
+            target_ops.insert(map_word_target(handler.start_pc.0)?);
+            target_ops.insert(map_word_target(handler.end_pc.0)?);
+        }
         for resume in &function.chunk.resume_points {
             if let Ok(target) = map_word_target(resume.pc.0) { target_ops.insert(target); }
         }
@@ -2760,6 +2790,7 @@ impl PreparedProgram {
             entry_gc_map,
             word_to_op,
             deopt_resume,
+            exception_handlers,
             frame: function.frame.clone(),
             id: function.id,
             field_owner: function.field_owner,
@@ -3348,13 +3379,23 @@ struct Frame {
     reg_base: usize,
     reg_count: u16,
     return_dst: Option<Reg>,
+    /// Raw bytecode PC of the call opcode in the parent frame, if any.
+    caller_pc: Option<u32>,
     root_map: u32,
 }
 
 impl Frame {
     #[inline(always)]
     fn new(function: u32, reg_base: usize, reg_count: u16, return_dst: Option<Reg>) -> Self {
-        Self { function, pc: 0, reg_base, reg_count, return_dst, root_map: NO_INDEX }
+        Self {
+            function,
+            pc: 0,
+            reg_base,
+            reg_count,
+            return_dst,
+            caller_pc: None,
+            root_map: NO_INDEX,
+        }
     }
 }
 
@@ -3463,6 +3504,7 @@ enum RunState {
 
 pub struct Interpreter<'p> {
     jit: Option<Box<TracingJit>>,
+    method_epoch: u64,
     program: &'p BytecodeProgram,
     prepared: Box<PreparedProgram>,
     host: Box<dyn Host>,
@@ -3484,6 +3526,8 @@ pub struct Interpreter<'p> {
     run_state: RunState,
     result: Value,
     error: Option<RuntimeError>,
+    /// Runtime errors are materialized as managed Strings only at Catch safepoints.
+    pending_native_exception: Option<RuntimeError>,
     inline_caches: Vec<Vec<InlineCacheState>>,
     builtin_methods: Vec<Vec<Option<CallTarget>>>,
     megamorphic_cache: FastMap<(ReceiverClass, MethodSymbol, Option<u32>), CallTarget>,
@@ -3748,6 +3792,7 @@ impl<'p> Interpreter<'p> {
 
         Ok(Self {
             jit: Some(Box::new(TracingJit::default())),
+            method_epoch: 0,
             program,
             prepared,
             host,
@@ -3766,6 +3811,7 @@ impl<'p> Interpreter<'p> {
             run_state: RunState::Running,
             result: Value::NULL,
             error: None,
+            pending_native_exception: None,
             inline_caches,
             builtin_methods: vec![vec![None; program.metadata.methods.len()]; BUILTIN_CLASS_COUNT],
             megamorphic_cache: FastMap::default(),
@@ -3878,6 +3924,7 @@ impl<'p> Interpreter<'p> {
     }
 
     fn invalidate_method_traces(&mut self) {
+        self.method_epoch = self.method_epoch.wrapping_add(1);
         if let Some(options) = self.jit.as_ref().map(|jit| jit.options().clone()) {
             self.jit = Some(Box::new(TracingJit::new(options)));
         }
@@ -4429,6 +4476,119 @@ impl<'p> Interpreter<'p> {
         self.run_state = RunState::Failed;
     }
 
+    fn find_structured_handler(
+        &self,
+        op: &PreparedOp,
+    ) -> Option<(usize, PreparedExceptionHandler)> {
+        let fiber = self.fiber(self.current_fiber);
+        if fiber.frames.is_empty() {
+            return None;
+        }
+
+        let mut probe_pc = op.raw_pc;
+        for depth in (0..fiber.frames.len()).rev() {
+            let frame = &fiber.frames[depth];
+            let function = &self.prepared.functions[frame.function as usize];
+            if let Some(handler) = function
+                .exception_handlers
+                .iter()
+                .filter(|handler| handler.start_pc <= probe_pc && probe_pc < handler.end_pc)
+                .max_by_key(|handler| handler.depth)
+                .copied()
+            {
+                return Some((depth, handler));
+            }
+
+            if depth == 0 {
+                break;
+            }
+            let Some(caller_pc) = frame.caller_pc else {
+                break;
+            };
+            probe_pc = caller_pc;
+        }
+        None
+    }
+
+    fn unwind_to_structured_handler(
+        &mut self,
+        op: &PreparedOp,
+        thrown: Option<Value>,
+        runtime_error: Option<RuntimeError>,
+    ) -> bool {
+        let Some((target_depth, handler)) = self.find_structured_handler(op) else {
+            return false;
+        };
+
+        self.flush_hot_pc();
+        let current = self.current_fiber;
+
+        // Mark module bodies abandoned by unwinding as no longer initializing.
+        let unwound_functions = self.fiber(current).frames[target_depth + 1..]
+            .iter()
+            .map(|frame| frame.function)
+            .collect::<Vec<_>>();
+        for function_index in unwound_functions {
+            let prepared = &self.prepared.functions[function_index as usize];
+            if prepared.kind == FunctionKind::ModuleBody {
+                self.modules[prepared.module_slot as usize].initializing = false;
+            }
+        }
+
+        let (reg_top, target_function) = {
+            let fiber = self.fiber(current);
+            let frame = &fiber.frames[target_depth];
+            (frame.reg_base + frame.reg_count as usize, frame.function)
+        };
+
+        {
+            let fiber = self.fiber_mut(current);
+            fiber.frames.truncate(target_depth + 1);
+            fiber.register_top = reg_top;
+            let frame_reg_base = {
+                let frame = fiber
+                    .frames
+                    .last_mut()
+                    .expect("handler target frame disappeared");
+                debug_assert_eq!(frame.function, target_function);
+                frame.pc = handler.handler_op;
+                frame.root_map = NO_INDEX;
+                frame.reg_base
+            };
+
+            // Catch is a GC safepoint because a VM RuntimeError is materialized
+            // as a managed String there. The handler's block parameter is live
+            // in that safepoint map, so initialize its physical register before
+            // any collection can inspect the frame. This also roots an explicit
+            // thrown heap value while the handler is entered.
+            let error_word = thrown.unwrap_or(Value::NULL).word();
+            let error_index = frame_reg_base + handler.error_reg.index();
+            *fiber
+                .registers
+                .get_mut(error_index)
+                .expect("handler error register is outside target frame") = error_word;
+
+            let banks = fiber
+                .banks
+                .get_mut(target_depth)
+                .expect("handler target banks disappeared");
+            banks.special[SpecialReg::Error.index()] = error_word;
+        }
+
+        self.pending_native_exception = runtime_error;
+        self.refresh_hot_frame();
+        true
+    }
+
+    fn raise_value_exception(&mut self, op: &PreparedOp, error: Value) -> bool {
+        self.pending_native_exception = None;
+        self.unwind_to_structured_handler(op, Some(error), None)
+    }
+
+    fn raise_runtime_exception(&mut self, op: &PreparedOp, error: RuntimeError) -> bool {
+        self.unwind_to_structured_handler(op, None, Some(error))
+    }
+
     /// Route an ordinary VM runtime error through Wren's Fiber caller chain.
     ///
     /// We only materialize the Wren String after reaching a `try()` caller. The
@@ -4526,7 +4686,11 @@ impl<'p> Interpreter<'p> {
 
     fn fail_at(&mut self, op: &PreparedOp, message: impl Into<String>) {
         let (function, pc) = self.current_location(op);
-        self.fail(RuntimeError::new(message).at(function, pc));
+        let error = RuntimeError::new(message).at(function, pc);
+        if self.raise_runtime_exception(op, error.clone()) {
+            return;
+        }
+        self.fail(error);
     }
 
     #[inline(always)]
@@ -4953,14 +5117,19 @@ impl<'p> Interpreter<'p> {
                 Ok(promise) => unsafe { self.set_reg(op.a, promise.word()) },
                 Err(error) => self.fail_at(op, error.message),
             }
-        } else if let Err(error) = self.push_frame(
-            function,
-            receiver,
-            args,
-            closure,
-            Some(Reg(op.a)),
-        ) {
-            self.fail_at(op, error.message);
+        } else {
+            match self.push_frame(
+                function,
+                receiver,
+                args,
+                closure,
+                Some(Reg(op.a)),
+            ) {
+                Ok(()) => {
+                    self.current_frame_mut().caller_pc = Some(op.raw_pc);
+                }
+                Err(error) => self.fail_at(op, error.message),
+            }
         }
     }
 
@@ -6461,7 +6630,7 @@ fn is_unfused_monomorphic_invoke_handler(handler: Handler) -> bool {
 // Static token-threading handler table.
 // =============================================================================
 
-const OPCODE_COUNT: usize = 123;
+const OPCODE_COUNT: usize = 124;
 
 static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_nop, // Nop
@@ -6587,13 +6756,14 @@ static HANDLER_TABLE: [Handler; OPCODE_COUNT] = [
     h_profile_numeric, // ProfileNumeric
     h_breakpoint, // Breakpoint
     h_await, // Await
+    h_catch, // Catch
 ];
 
 #[inline(always)]
 fn handler_for(opcode: Opcode) -> Handler {
-    // Opcode values are deliberately dense 0..122. Preparation has already
+    // Opcode values are deliberately dense 0..123. Preparation has already
     // validated the byte stream, so dispatch selection is a single indexed
-    // load instead of a generated 123-way match.
+    // load instead of a generated 124-way match.
     unsafe { *HANDLER_TABLE.get_unchecked(opcode as usize) }
 }
 
@@ -7154,8 +7324,8 @@ unsafe fn h_create_class(vm:&mut Interpreter, ptr:*const PreparedOp){
     vm.set_reg(op.a,value.word());
     vm.advance(op)
 }
-unsafe fn h_bind_method(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let class_value=Value::from_word(vm.reg(op.a));let slot=match vm.heap.get(class_value){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.fail_at(op,"BindMethod target is not a class");return;}};let function=match vm.prepared.function_by_id.get(&FuncId(op.y)).copied(){Some(v)=>v,None=>{vm.fail_at(op,"BindMethod function does not exist");return;}};let table=if op.b!=0{&mut vm.classes[slot as usize].static_methods}else{&mut vm.classes[slot as usize].instance_methods};match table.get_mut(op.x as usize){Some(entry)=>{*entry=Some(CallTarget::Bytecode(function));vm.advance(op)},None=>vm.fail_at(op,"BindMethod symbol out of range")}}
-unsafe fn h_bind_foreign_method(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let class_value=Value::from_word(vm.reg(op.a));let slot=match vm.heap.get(class_value){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.fail_at(op,"BindForeignMethod target is not a class");return;}};let table=if op.b!=0{&mut vm.classes[slot as usize].static_methods}else{&mut vm.classes[slot as usize].instance_methods};match table.get_mut(op.x as usize){Some(entry)=>{*entry=Some(CallTarget::Foreign(ForeignFnId(op.y)));vm.advance(op)},None=>vm.fail_at(op,"BindForeignMethod symbol out of range")}}
+unsafe fn h_bind_method(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let class_value=Value::from_word(vm.reg(op.a));let slot=match vm.heap.get(class_value){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.fail_at(op,"BindMethod target is not a class");return;}};let function=match vm.prepared.function_by_id.get(&FuncId(op.y)).copied(){Some(v)=>v,None=>{vm.fail_at(op,"BindMethod function does not exist");return;}};let table=if op.b!=0{&mut vm.classes[slot as usize].static_methods}else{&mut vm.classes[slot as usize].instance_methods};match table.get_mut(op.x as usize){Some(entry)=>{*entry=Some(CallTarget::Bytecode(function));vm.invalidate_method_traces();vm.advance(op)},None=>vm.fail_at(op,"BindMethod symbol out of range")}}
+unsafe fn h_bind_foreign_method(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let class_value=Value::from_word(vm.reg(op.a));let slot=match vm.heap.get(class_value){Some(HeapObject::ClassObject{class_slot})=>*class_slot,_=>{vm.fail_at(op,"BindForeignMethod target is not a class");return;}};let table=if op.b!=0{&mut vm.classes[slot as usize].static_methods}else{&mut vm.classes[slot as usize].instance_methods};match table.get_mut(op.x as usize){Some(entry)=>{*entry=Some(CallTarget::Foreign(ForeignFnId(op.y)));vm.invalidate_method_traces();vm.advance(op)},None=>vm.fail_at(op,"BindForeignMethod symbol out of range")}}
 unsafe fn h_alloc_instance(vm:&mut Interpreter, ptr:*const PreparedOp){
     let op=&*ptr;
     vm.mark_gc_point(op);
@@ -7234,6 +7404,10 @@ unsafe fn h_import_module(vm:&mut Interpreter, ptr:*const PreparedOp){
     if let Err(error)=vm.push_frame_direct(body.unwrap_unchecked(),&[],None,None){
         vm.modules.get_unchecked_mut(slot as usize).initializing=false;
         vm.fail_at(op,error.message);
+    } else {
+        // Module initialization is a real call boundary for structured
+        // exception unwinding even though it has no return destination.
+        vm.current_frame_mut().caller_pc = Some(op.raw_pc);
     }
 }
 unsafe fn h_import_variable(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let module=Value::from_word(vm.reg(op.b));let slot=match vm.heap.get(module){Some(HeapObject::ModuleObject{module_slot})=>*module_slot,_=>{vm.fail_at(op,"ImportVariable operand is not module");return;}};let name=StringId(op.x);let index=vm.modules[slot as usize].exports.get(&name).copied();match index.and_then(|i|vm.modules[slot as usize].variables.get(i as usize).copied()){Some(v)=>{vm.set_reg(op.a,v.word());vm.advance(op)},None=>vm.fail_at(op,"imported variable name is not bound")}}
@@ -7425,7 +7599,7 @@ unsafe fn h_fiber_transfer(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*p
 unsafe fn h_fiber_transfer_error(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let fiber=Value::from_word(vm.reg(op.b));let error=Value::from_word(vm.reg(op.c));vm.transfer_error_to_fiber(op,fiber,error)}
 unsafe fn h_fiber_yield(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let value=Value::from_word(vm.reg(op.b));vm.yield_current_fiber(op,value,Some(Reg(op.a)))}
 unsafe fn h_fiber_suspend(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;vm.suspend_vm(op,Reg(op.a))}
-unsafe fn h_fiber_abort(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let error=Value::from_word(vm.reg(op.a));vm.abort_current_fiber(op,error)}
+unsafe fn h_fiber_abort(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let error=Value::from_word(vm.reg(op.a));if !vm.raise_value_exception(op,error){vm.abort_current_fiber(op,error)}}
 
 unsafe fn h_write_barrier(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let owner=Value::from_word(vm.reg(op.a));let value=Value::from_word(vm.reg(op.b));vm.heap.remember_if_reference(owner,value);vm.advance(op)}
 unsafe fn h_read_barrier(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let value=vm.reg(op.b);vm.set_reg(op.a,value);vm.advance(op)}
@@ -7433,6 +7607,24 @@ unsafe fn h_profile_block(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*pt
 unsafe fn h_profile_numeric(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let f=vm.current_frame().function as usize;if let Some(counter)=vm.profile_counters[f].get_mut(op.x as usize){*counter=counter.saturating_add(1);}vm.advance(op)}
 unsafe fn h_breakpoint(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let(f,pc)=vm.current_location(op);match vm.host.breakpoint(f,pc){Ok(())=>vm.advance(op),Err(e)=>vm.fail_at(op,e.message)}}
 unsafe fn h_await(vm:&mut Interpreter,ptr:*const PreparedOp){let op=&*ptr;let promise=Value::from_word(vm.reg(op.b));vm.await_promise(op,promise,Reg(op.a))}
+
+unsafe fn h_catch(vm: &mut Interpreter, ptr: *const PreparedOp) {
+    let op = &*ptr;
+    vm.mark_gc_point(op);
+
+    let value = if let Some(error) = vm.pending_native_exception.take() {
+        vm.maybe_collect();
+        let bytes: Arc<[u8]> = Arc::from(error.message.as_bytes());
+        vm.heap.alloc(HeapObject::String(bytes))
+    } else {
+        Value::from_word(vm.current_banks().special[SpecialReg::Error.index()])
+    };
+
+    vm.current_banks_mut().special[SpecialReg::Error.index()] = value.word();
+    vm.set_reg(op.a, value.word());
+    vm.advance(op);
+}
+
 
 #[inline(always)]
 unsafe fn fused_branch(vm:&mut Interpreter,op:&PreparedOp,condition:bool){let take=if op.flags!=0{condition}else{!condition};let target=if take{op.y}else{op.next};vm.branch_to(op,target)}
@@ -7505,6 +7697,15 @@ impl TraceRuntime for Interpreter<'_> {
 
     fn trace_program(&self) -> &BytecodeProgram { self.program }
 
+    fn trace_method_epoch(&self) -> u64 { self.method_epoch }
+
+    fn trace_inline_target(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<(FuncId, u64)> {
+        let class = self.heap.receiver_class(Value::from_word(receiver))?;
+        let cache = self.program.function(function)?.chunk.inline_caches.get(cache as usize)?;
+        let CallTarget::Bytecode(index) = self.lookup_method(class, cache.method, None)? else { return None };
+        Some((self.prepared.functions.get(index as usize)?.id, class.0))
+    }
+
     fn trace_standard_numeric_method(&self, function: FuncId, cache: u32) -> bool {
         let Some(function) = self.program.function(function) else { return false; };
         let Some(cache) = function.chunk.inline_caches.get(cache as usize) else { return false; };
@@ -7563,8 +7764,8 @@ impl TraceRuntime for Interpreter<'_> {
     }
 
     fn trace_field_slot(&self, location: TraceLocation, local_slot: u32) -> u32 {
-        let prepared = self.current_prepared();
-        if prepared.id != location.function { return local_slot; }
+        let Some(index) = self.prepared.function_by_id.get(&location.function) else { return local_slot; };
+        let prepared = &self.prepared.functions[*index as usize];
         prepared.word_to_op.get(location.pc.0 as usize)
             .and_then(|index| prepared.ops.get(*index as usize))
             .map_or(local_slot, |op| op.x)
@@ -7710,6 +7911,7 @@ unsafe extern "C" fn execute_trace_runtime(activation: *mut TraceActivation, fun
                 activation.arguments = inputs.arguments;
                 activation.returns = inputs.returns;
                 activation.special = inputs.special;
+                activation.method_epoch = vm.method_epoch;
                 0
             },
         Ok(Ok(_)) => 1,
@@ -7789,6 +7991,74 @@ mod tests {
         let mut vm = Interpreter::with_host(program, host).expect("VM should initialize");
         wren_builtin::install_vm_builtins(&mut vm, manifest);
         vm
+    }
+
+    #[test]
+    fn trace_inlines_small_methods_with_class_and_epoch_guards() {
+        let source = r#"
+class Box {
+  construct new(x) { _x = x }
+  value { _x }
+  plus(x) { _x + x }
+}
+var box = Box.new(7)
+var result = 0
+var i = 0
+while (i < 200) {
+  result = result + box.plus(box.value)
+  i = i + 1
+}
+return result
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions { hot_loop_threshold: 2, hot_entry_threshold: 0, ..Default::default() }));
+            let ExecutionResult::Returned(result) = vm.run_module(entry).unwrap() else { panic!("expected return") };
+            assert_eq!(result.as_num(), Some(2800.0));
+            if native {
+                let stats = vm.jit_stats().unwrap();
+                assert!(stats.inlined_calls >= 2 && stats.devirtualized_calls >= 2 && stats.native_entries > 0, "{stats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn inlined_guard_failure_replays_call_into_caller_catch() {
+        let source = r#"
+class Box {
+  construct new(x) { _x = x }
+  plus(x) { _x + x }
+}
+class Runner {
+static run() {
+var box = Box.new(7)
+var result = 0
+var i = 0
+try {
+  while (i < 200) {
+    var x = i < 190 ? 2 : "bad"
+    result = result + box.plus(x)
+    i = i + 1
+  }
+} catch (error) {
+  result = result + 1
+} finally {
+  result = result + 0
+}
+return result
+}
+}
+var result = Runner.run()
+"#;
+        let (program, entry, manifest) = compile_wren_module(source);
+        for native in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(native.then(|| TracingJitOptions { hot_loop_threshold: 2, hot_entry_threshold: 0, ..Default::default() }));
+            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else { panic!("expected return") };
+            assert_eq!(source_result(&vm), 1711.0);
+            if native { assert!(vm.jit_stats().unwrap().inlined_calls > 0, "{:?}", vm.jit_stats()); }
+        }
     }
 
     fn compile_local_wren(source: &str) -> (BytecodeProgram, FuncId, BuiltinManifest) {
@@ -8900,6 +9170,145 @@ var result = Sroa.run()
             vm.run_module(entry).unwrap();
             assert_eq!(source_result(&vm), expected, "jit_enabled={jit_enabled}");
         }
+    }
+
+    #[test]
+    fn structured_defer_errdefer_catch_finally_preserve_semantics_with_and_without_jit() {
+        let source = r#"
+class StructuredErrors {
+  static fail() {
+    throw 7
+  }
+
+  static normal() {
+    var total = 0
+    {
+      defer { total = total * 10 + 1 }
+      errdefer { total = 99999 }
+      defer { total = total * 10 + 2 }
+      total = 3
+    }
+    return total
+  }
+
+  static exceptional() {
+    var total = 0
+    try {
+      defer { total = total + 1 }
+      errdefer (error) { total = total + error }
+      StructuredErrors.fail()
+      total = 99999
+    } catch (error) {
+      total = total + error * 10
+    } finally {
+      total = total + 1000
+    }
+    return total
+  }
+}
+
+var result = StructuredErrors.normal() * 10000 + StructuredErrors.exceptional()
+"#;
+        let expected = 321.0 * 10000.0 + 1078.0;
+        let (program, entry, manifest) = compile_wren_module(source);
+
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(|| TracingJitOptions {
+                hot_loop_threshold: 2,
+                hot_entry_threshold: 2,
+                ..Default::default()
+            }));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), expected, "jit_enabled={jit_enabled}");
+        }
+    }
+
+    #[test]
+    fn runtime_errors_enter_catch_and_finally_exceptions_continue_outward() {
+        let source = r#"
+class StructuredRuntimeErrors {
+  static run() {
+    var runtimeCaught = 0
+    try {
+      1.thisMethodDoesNotExist
+      runtimeCaught = -1
+    } catch (error) {
+      runtimeCaught = 42
+    }
+
+    var unwind = 1
+    try {
+      try {
+        unwind = 2
+      } catch (error) {
+        unwind = 100
+      } finally {
+        throw 5
+      }
+    } catch (error) {
+      unwind = unwind + error * 10
+    }
+    return runtimeCaught * 1000 + unwind
+  }
+}
+var result = StructuredRuntimeErrors.run()
+"#;
+        let expected = 42052.0;
+        let (program, entry, manifest) = compile_wren_module(source);
+
+        for jit_enabled in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            vm.set_jit_options(jit_enabled.then(|| TracingJitOptions {
+                hot_entry_threshold: 2,
+                ..Default::default()
+            }));
+            vm.run_module(entry).unwrap();
+            assert_eq!(source_result(&vm), expected, "jit_enabled={jit_enabled}");
+        }
+    }
+
+    #[test]
+    fn hot_loop_inside_try_stays_jittable() {
+        let source = r#"
+class ProtectedLoop {
+  static run() {
+    var total = 0
+    var i = 0
+    try {
+      defer { total = total + 10000 }
+      errdefer { total = -1000000 }
+      while (i < 200) {
+        total = total + i
+        i = i + 1
+      }
+    } catch (error) {
+      total = -2000000
+    } finally {
+      total = total + 1000
+    }
+    return total
+  }
+}
+var result = ProtectedLoop.run()
+"#;
+        let expected = (0..200).sum::<i32>() as f64 + 11000.0;
+        let (program, entry, manifest) = compile_wren_module(source);
+
+        let mut baseline = source_vm(&program, &manifest);
+        baseline.set_jit_options(None);
+        baseline.run_module(entry).unwrap();
+        assert_eq!(source_result(&baseline), expected);
+
+        let mut native = source_vm(&program, &manifest);
+        native.set_jit_options(Some(TracingJitOptions {
+            hot_loop_threshold: 2,
+            ..Default::default()
+        }));
+        native.run_module(entry).unwrap();
+        assert_eq!(source_result(&native), expected);
+        let stats = native.jit_stats().unwrap();
+        assert!(stats.native_entries > 0, "protected loop should enter native code: {stats:?}");
     }
 
     #[test]

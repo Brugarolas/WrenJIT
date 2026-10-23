@@ -284,18 +284,26 @@ enum RawTokenKind {
     Await,
     #[token("break")]
     Break,
+    #[token("catch")]
+    Catch,
     #[token("class")]
     Class,
     #[token("construct")]
     Construct,
     #[token("continue")]
     Continue,
+    #[token("defer")]
+    Defer,
     #[token("else")]
     Else,
+    #[token("errdefer")]
+    ErrDefer,
     #[token("false")]
     False,
     #[token("for")]
     For,
+    #[token("finally")]
+    Finally,
     #[token("foreign")]
     Foreign,
     #[token("if")]
@@ -316,8 +324,12 @@ enum RawTokenKind {
     Super,
     #[token("this")]
     This,
+    #[token("throw")]
+    Throw,
     #[token("true")]
     True,
+    #[token("try")]
+    Try,
     #[token("var")]
     Var,
     #[token("while")]
@@ -424,12 +436,16 @@ pub enum TokenKind {
     Async,
     Await,
     Break,
+    Catch,
     Class,
     Construct,
     Continue,
+    Defer,
     Else,
+    ErrDefer,
     False,
     For,
+    Finally,
     Foreign,
     If,
     Import,
@@ -440,7 +456,9 @@ pub enum TokenKind {
     Static,
     Super,
     This,
+    Throw,
     True,
+    Try,
     Var,
     While,
     RawString,
@@ -495,12 +513,16 @@ impl TokenKind {
             Async => "`async`",
             Await => "`await`",
             Break => "`break`",
+            Catch => "`catch`",
             Class => "`class`",
             Construct => "`construct`",
             Continue => "`continue`",
+            Defer => "`defer`",
             Else => "`else`",
+            ErrDefer => "`errdefer`",
             False => "`false`",
             For => "`for`",
+            Finally => "`finally`",
             Foreign => "`foreign`",
             If => "`if`",
             Import => "`import`",
@@ -511,7 +533,9 @@ impl TokenKind {
             Static => "`static`",
             Super => "`super`",
             This => "`this`",
+            Throw => "`throw`",
             True => "`true`",
+            Try => "`try`",
             Var => "`var`",
             While => "`while`",
             RawString => "raw string",
@@ -670,12 +694,16 @@ fn map_raw_token(raw: RawTokenKind) -> Option<TokenKind> {
         R::Async => T::Async,
         R::Await => T::Await,
         R::Break => T::Break,
+        R::Catch => T::Catch,
         R::Class => T::Class,
         R::Construct => T::Construct,
         R::Continue => T::Continue,
+        R::Defer => T::Defer,
         R::Else => T::Else,
+        R::ErrDefer => T::ErrDefer,
         R::False => T::False,
         R::For => T::For,
+        R::Finally => T::Finally,
         R::Foreign => T::Foreign,
         R::If => T::If,
         R::Import => T::Import,
@@ -686,7 +714,9 @@ fn map_raw_token(raw: RawTokenKind) -> Option<TokenKind> {
         R::Static => T::Static,
         R::Super => T::Super,
         R::This => T::This,
+        R::Throw => T::Throw,
         R::True => T::True,
+        R::Try => T::Try,
         R::Var => T::Var,
         R::While => T::While,
         R::RawString => T::RawString,
@@ -966,10 +996,28 @@ pub enum StmtKind {
         iterable: Expr,
         body: Box<Stmt>,
     },
+    Defer {
+        body: Box<Stmt>,
+        error_only: bool,
+        error_binding: Option<Ident>,
+    },
+    Try {
+        body: Box<Stmt>,
+        catch: Option<CatchClause>,
+        finally_branch: Option<Box<Stmt>>,
+    },
+    Throw(Expr),
     Break,
     Continue,
     Return(Option<Expr>),
     Expression(Expr),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatchClause {
+    pub binding: Option<Ident>,
+    pub body: Box<Stmt>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1773,7 +1821,7 @@ impl<'a> Parser<'a> {
             return Ok(MethodSignatureAst::InfixOperator { operator, param });
         }
 
-        let name = self.parse_identifier("WREN-P023", "expected method name")?;
+        let name = self.parse_method_name("WREN-P023", "expected method name")?;
         if self.match_kind(TokenKind::Equal) {
             self.expect(
                 TokenKind::LeftParen,
@@ -1833,6 +1881,18 @@ impl<'a> Parser<'a> {
         }
         if self.match_kind(TokenKind::For) {
             return self.parse_for(self.previous().span.start);
+        }
+        if self.match_kind(TokenKind::Defer) {
+            return self.parse_defer(self.previous().span.start, false);
+        }
+        if self.match_kind(TokenKind::ErrDefer) {
+            return self.parse_defer(self.previous().span.start, true);
+        }
+        if self.match_kind(TokenKind::Try) {
+            return self.parse_try(self.previous().span.start);
+        }
+        if self.match_kind(TokenKind::Throw) {
+            return self.parse_throw(self.previous().span.start);
         }
         if self.match_kind(TokenKind::Break) {
             let span = self.previous().span;
@@ -1938,6 +1998,117 @@ impl<'a> Parser<'a> {
                 iterable,
                 body,
             },
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_defer(&mut self, start: usize, error_only: bool) -> PResult<Stmt> {
+        let error_binding = if error_only && self.match_kind(TokenKind::LeftParen) {
+            let binding = self.parse_identifier(
+                "WREN-P080",
+                "expected errdefer binding name after `(`",
+            )?;
+            self.expect(
+                TokenKind::RightParen,
+                "WREN-P081",
+                "expected `)` after errdefer binding",
+            )?;
+            Some(binding)
+        } else {
+            None
+        };
+        let body = Box::new(self.parse_statement()?);
+        let end = body.span.end;
+        Ok(Stmt {
+            kind: StmtKind::Defer {
+                body,
+                error_only,
+                error_binding,
+            },
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_try(&mut self, start: usize) -> PResult<Stmt> {
+        let body = Box::new(self.parse_statement()?);
+        self.skip_newlines();
+
+        let catch = if self.match_kind(TokenKind::Catch) {
+            let catch_start = self.previous().span.start;
+            let binding = if self.match_kind(TokenKind::LeftParen) {
+                let binding = self.parse_identifier(
+                    "WREN-P076",
+                    "expected catch binding name after `(`",
+                )?;
+                self.expect(
+                    TokenKind::RightParen,
+                    "WREN-P077",
+                    "expected `)` after catch binding",
+                )?;
+                Some(binding)
+            } else {
+                None
+            };
+            let catch_body = Box::new(self.parse_statement()?);
+            let span = Span::new(catch_start, catch_body.span.end);
+            let clause = Some(CatchClause {
+                binding,
+                body: catch_body,
+                span,
+            });
+            self.skip_newlines();
+            clause
+        } else {
+            None
+        };
+
+        let finally_branch = if self.match_kind(TokenKind::Finally) {
+            Some(Box::new(self.parse_statement()?))
+        } else {
+            None
+        };
+
+        if catch.is_none() && finally_branch.is_none() {
+            let span = Span::new(start, body.span.end);
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "WREN-P078",
+                    "`try` requires a `catch`, a `finally`, or both",
+                    span,
+                )
+                .with_note("Use `catch (error) { ... }`, `catch { ... }`, or `finally { ... }`."),
+            );
+            return Err(());
+        }
+
+        let end = finally_branch
+            .as_ref()
+            .map(|stmt| stmt.span.end)
+            .or_else(|| catch.as_ref().map(|clause| clause.span.end))
+            .unwrap_or(body.span.end);
+        Ok(Stmt {
+            kind: StmtKind::Try {
+                body,
+                catch,
+                finally_branch,
+            },
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_throw(&mut self, start: usize) -> PResult<Stmt> {
+        if self.at(TokenKind::Newline) || self.at(TokenKind::RightBrace) || self.at(TokenKind::Eof) {
+            let span = Span::new(start, self.peek().span.start);
+            self.diagnostics.push(
+                Diagnostic::error("WREN-P079", "`throw` requires a value", span)
+                    .with_primary_label(span, "provide the value to throw"),
+            );
+            return Err(());
+        }
+        let value = self.parse_expression()?;
+        let end = value.span.end;
+        Ok(Stmt {
+            kind: StmtKind::Throw(value),
             span: Span::new(start, end),
         })
     }
@@ -2511,7 +2682,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_dot_call(&mut self, receiver: Expr) -> PResult<Expr> {
-        let name = self.parse_identifier("WREN-P054", "expected method name after `.`")?;
+        let name = self.parse_method_name("WREN-P054", "expected method name after `.`")?;
         let (syntax, mut args, end) = if self.match_kind(TokenKind::LeftParen) {
             let args = self.parse_argument_list(TokenKind::RightParen)?;
             (InvokeSyntax::Method, args, self.previous().span.end)
@@ -2672,7 +2843,7 @@ impl<'a> Parser<'a> {
 
     fn parse_super(&mut self, start: usize) -> PResult<Expr> {
         if self.match_kind(TokenKind::Dot) {
-            let method = self.parse_identifier(
+            let method = self.parse_method_name(
                 "WREN-P059",
                 "expected superclass method name after `super.`",
             )?;
@@ -3196,6 +3367,24 @@ impl<'a> Parser<'a> {
         }
         let token = self.advance();
         Ok(Spanned::new(self.slice(token.span).to_owned(), token.span))
+    }
+
+    /// Method names may reuse the error-handling keywords, which are only
+    /// reserved in statement position (e.g. Wren's core `Fiber.try()`).
+    fn parse_method_name(&mut self, code: &'static str, message: impl Into<String>) -> PResult<Ident> {
+        if matches!(
+            self.peek().kind,
+            TokenKind::Try
+                | TokenKind::Catch
+                | TokenKind::Finally
+                | TokenKind::Throw
+                | TokenKind::Defer
+                | TokenKind::ErrDefer
+        ) {
+            let token = self.advance();
+            return Ok(Spanned::new(self.slice(token.span).to_owned(), token.span));
+        }
+        self.parse_identifier(code, message)
     }
 
     fn peek_operator_name(&self) -> Option<OperatorName> {
@@ -3883,6 +4072,48 @@ var work = async {|value| await value }
         assert!(class.methods[1].is_async);
         let StmtKind::Variable { initializer: Some(expr), .. } = &module.statements[1].kind else { panic!("expected async closure"); };
         assert!(matches!(expr.kind, ExprKind::AsyncClosure(_)));
+    }
+
+
+    #[test]
+    fn parses_defer_errdefer_try_catch_finally_and_throw() {
+        let source = r#"
+class Example {
+  run() {
+    defer { System.print("always") }
+    errdefer (deferredError) { System.print(deferredError) }
+    try {
+      throw "boom"
+    } catch (error) {
+      System.print(error)
+    } finally {
+      System.print("finally")
+    }
+  }
+}
+"#;
+        let module = parse_ok(source);
+        let StmtKind::Class(class) = &module.statements[0].kind else {
+            panic!("expected class");
+        };
+        let FunctionBodyKind::Statements(statements) = &class.methods[0]
+            .body
+            .as_ref()
+            .expect("method body")
+            .kind
+        else {
+            panic!("expected statement body");
+        };
+        assert!(matches!(statements[0].kind, StmtKind::Defer { error_only: false, .. }));
+        let StmtKind::Defer { error_only: true, error_binding, .. } = &statements[1].kind else {
+            panic!("expected errdefer statement");
+        };
+        assert_eq!(error_binding.as_ref().map(|id| id.value.as_str()), Some("deferredError"));
+        let StmtKind::Try { catch, finally_branch, .. } = &statements[2].kind else {
+            panic!("expected try statement");
+        };
+        assert_eq!(catch.as_ref().and_then(|clause| clause.binding.as_ref()).map(|id| id.value.as_str()), Some("error"));
+        assert!(finally_branch.is_some());
     }
 
 }

@@ -11,6 +11,11 @@ use crate::wren_trace_ir_optimizer::{
 };
 use std::collections::{HashMap, HashSet};
 
+mod advanced;
+pub use advanced::*;
+mod peephole;
+pub use peephole::*;
+
 pub fn optimization_passes() -> Optimize {
     passes(true)
 }
@@ -24,10 +29,24 @@ fn passes(promote_loop_representations: bool) -> Optimize {
         .with_pass(TraceCanonicalization {
             promote_loop_representations,
         })
-        .with_pass(GlobalValueNumbering)
+        .with_pass(SparseConditionalConstantPropagation)
+        .with_pass(AlgebraicSimplification)
+        .with_pass(InductionVariableSimplification)
+        .with_pass(ClassTypePropagation)
+        .with_pass(RedundantGuardElimination)
+        .with_pass(DominatorTreeGVN)
         .with_pass(LoopInvariantCodeMotion)
         .with_pass(PartialRedundancyElimination)
+        .with_pass(StrengthReduction)
+        .with_pass(RangeAnalysis)
+        .with_pass(LoadStorePRE)
+        .with_pass(LoopInvariantGuardHoisting)
+        .with_pass(LoopUnswitching)
+        .with_pass(LoopInvariantCodeMotion)
+        .with_pass(AlgebraicSimplification)
+        .with_pass(RedundantGuardElimination)
         .with_pass(GlobalValueNumbering)
+        .with_pass(SparseConditionalConstantPropagation)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -102,6 +121,10 @@ fn native_loop(trace: &Trace) -> bool {
 /// Runtime calls clear expression availability; loads and guards are excluded.
 #[derive(Default)]
 pub struct GlobalValueNumbering;
+
+/// The trace dominator tree is a chain (preheader then each successful guard),
+/// with side exits as leaves. Walking execution order is its preorder traversal.
+pub use GlobalValueNumbering as DominatorTreeGVN;
 
 impl TraceOptimization for GlobalValueNumbering {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {

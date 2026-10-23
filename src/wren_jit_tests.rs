@@ -163,9 +163,11 @@ fn state(vm: &mut Interpreter<'_>) -> String {
         match vm.heap.get(v) {
             Some(HeapObject::List(items)) => format!("List({:?})", values(items)),
             Some(HeapObject::Map(map)) => {
-                let mut entries: Vec<_> = map.entries.iter().map(|(key, &v)| {
+                let mut entries: Vec<_> = (0..map.len()).map(|index| {
+                    let key = map.nth_key(&vm.heap.map_shapes, index).unwrap();
+                    let v = map.nth_value(index).unwrap();
                     let key = match key {
-                        MapKey::Object(handle) => format!("{:?}", value(Value::from_heap(*handle))),
+                        MapKey::Object(handle) => format!("{:?}", value(Value::from_heap(handle))),
                         key => format!("{key:?}"),
                     };
                     (key, format!("{:?}", value(v)))

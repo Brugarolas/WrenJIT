@@ -37,7 +37,7 @@ use crate::wren_bytecode::{
     opcode_for_int_cmp, opcode_for_int_unary, ArgReg, Assembler, BytecodeDeoptPoint,
     BytecodeFunction, BytecodeInlinedFrameState, BytecodePc, BytecodeProgram,
     BytecodeSnapshotSlot, BytecodeVerifier, CaptureBinding, ClassGuardId, ConstIndex,
-    DeoptLocation, FrameLayout, IcSlot, IncomingSource, InlineCacheDescriptor, Label,
+    DeoptLocation, ExceptionHandlerEntry, FrameLayout, IcSlot, IncomingSource, InlineCacheDescriptor, Label,
     LiveRegisterEntry, LiveRegisterMap, Opcode, ParameterBinding, ProfileCounterKind, ReferenceMap, Reg, RegisterKind,
     ResumeEntry, RuntimeMetadata, SafepointKind, SourceMapEntry, SpecialReg,
     TypeGuardId, GENERAL_REGISTER_COUNT, MAX_WREN_ARITY,
@@ -480,6 +480,24 @@ fn build_cfg(function: &Function) -> Result<CfgInfo, CompileError> {
         successors[block.id.0 as usize].dedup();
     }
 
+    // Exception regions introduce control-flow edges without ordinary SSA arguments.
+    // These edges keep handler state live and make block layout aware of cold handlers.
+    for region in &function.exception_regions {
+        for &protected in &region.protected_blocks {
+            let list = successors
+                .get_mut(protected.0 as usize)
+                .ok_or(CompileError::UnknownBlock {
+                    function: function.id,
+                    block: protected,
+                })?;
+            list.push(region.handler);
+        }
+    }
+    for list in &mut successors {
+        list.sort_unstable();
+        list.dedup();
+    }
+
     Ok(CfgInfo {
         successors,
         incoming_args,
@@ -561,6 +579,12 @@ fn analyze_dead_code(
         }
     }
 
+    // Handler entry values are defined by the VM rather than a normal CFG edge.
+    // Keep them allocated even when the source catch binding is unused.
+    for region in &function.exception_regions {
+        mark_value(region.error, &mut needed_values, &mut value_queue);
+    }
+
     while !node_queue.is_empty() || !value_queue.is_empty() {
         while let Some(id) = node_queue.pop_front() {
             let node = function.node(id).ok_or_else(|| CompileError::Internal {
@@ -627,7 +651,7 @@ fn block_hotness(function: &Function, block: BlockId) -> u64 {
 
 fn component_rpo(
     seed: BlockId,
-    cfg: &CfgInfo,
+    _cfg: &CfgInfo,
     function: &Function,
     profile_guided: bool,
     visited: &mut [bool],
@@ -647,7 +671,18 @@ fn component_rpo(
         visited[index] = true;
         stack.push((block, true));
 
-        let mut successors = cfg.successors[index].clone();
+        // Layout follows only ordinary CFG edges. Exceptional successors are
+        // required by liveness/register allocation, but treating cold handlers
+        // as layout successors would pull catch/defer cleanup into the hot code
+        // stream and hurt I-cache locality despite zero-cost exception tables.
+        let mut successors = function
+            .block(block)
+            .and_then(|block| block.insts.last())
+            .and_then(|id| function.node(*id))
+            .map(|node| node.kind.edges().into_iter().map(|edge| edge.target).collect::<Vec<_>>())
+            .unwrap_or_default();
+        successors.sort_unstable();
+        successors.dedup();
         if profile_guided {
             successors.sort_by_key(|successor| Reverse(block_hotness(function, *successor)));
         } else {
@@ -1494,6 +1529,7 @@ struct DeferredTrampoline {
 #[derive(Clone, Debug)]
 struct PcMap {
     block_start: Vec<Option<BytecodePc>>,
+    block_end: Vec<Option<BytecodePc>>,
     before_inst: Vec<Option<BytecodePc>>,
     after_inst: Vec<Option<BytecodePc>>,
 }
@@ -1558,6 +1594,7 @@ impl<'a> FunctionEmitter<'a> {
             block_labels,
             pc_map: PcMap {
                 block_start: vec![None; function.blocks.len()],
+                block_end: vec![None; function.blocks.len()],
                 before_inst: vec![None; function.nodes.len()],
                 after_inst: vec![None; function.nodes.len()],
             },
@@ -2713,6 +2750,26 @@ impl FunctionEmitter<'_> {
         }
     }
 
+    fn exception_handler_error(&self, block: BlockId) -> Option<ValueId> {
+        self.function
+            .exception_regions
+            .iter()
+            .find(|region| region.handler == block)
+            .map(|region| region.error)
+    }
+
+    fn emit_catch_entry(&mut self, block: BlockId) -> Result<(), CompileError> {
+        let Some(error) = self.exception_handler_error(block) else {
+            return Ok(());
+        };
+        let reg = self.reg(error)?;
+        let pc = self.assembler.emit_abc(Opcode::Catch, reg.0, 0, 0);
+        let references = self.live_reference_map(self.positions.block_start[block.0 as usize]);
+        self.assembler
+            .add_safepoint(pc, SafepointKind::Allocation, references);
+        Ok(())
+    }
+
     fn emit_block_profile_counter(&mut self, block: BlockId) {
         if !self.options.instrument_blocks {
             return;
@@ -2741,6 +2798,7 @@ impl FunctionEmitter<'_> {
             let label = self.block_labels[block_id.0 as usize];
             self.assembler.bind(label);
             self.pc_map.block_start[block_id.0 as usize] = Some(self.assembler.pc());
+            self.emit_catch_entry(block_id)?;
             self.emit_block_profile_counter(block_id);
             let next_block = layout.get(layout_index + 1).copied();
 
@@ -2800,7 +2858,45 @@ impl FunctionEmitter<'_> {
                     }
                 }
             }
+            self.pc_map.block_end[block_id.0 as usize] = Some(self.assembler.pc());
         }
+
+        // Materialize the zero-cost exception table after every block PC range is known.
+        for region in &self.function.exception_regions {
+            let handler_pc = self.pc_map.block_start[region.handler.0 as usize].ok_or_else(|| {
+                CompileError::Internal {
+                    function: Some(self.function.id),
+                    message: format!("missing bytecode PC for exception handler {:?}", region.handler),
+                }
+            })?;
+            let error_reg = self.reg(region.error)?;
+            for &protected in &region.protected_blocks {
+                let start_pc = self.pc_map.block_start[protected.0 as usize].ok_or_else(|| {
+                    CompileError::Internal {
+                        function: Some(self.function.id),
+                        message: format!("missing bytecode start PC for protected block {:?}", protected),
+                    }
+                })?;
+                let end_pc = self.pc_map.block_end[protected.0 as usize].ok_or_else(|| {
+                    CompileError::Internal {
+                        function: Some(self.function.id),
+                        message: format!("missing bytecode end PC for protected block {:?}", protected),
+                    }
+                })?;
+                if start_pc != end_pc {
+                    self.assembler.chunk.exception_handlers.push(ExceptionHandlerEntry {
+                        start_pc,
+                        end_pc,
+                        handler_pc,
+                        error_reg,
+                        depth: region.depth,
+                    });
+                }
+            }
+        }
+        self.assembler.chunk.exception_handlers.sort_unstable_by_key(|entry| {
+            (entry.start_pc.0, entry.end_pc.0, std::cmp::Reverse(entry.depth))
+        });
 
         for trampoline in self.trampolines.clone() {
             self.assembler.bind(trampoline.label);

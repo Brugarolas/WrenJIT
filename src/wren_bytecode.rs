@@ -1062,6 +1062,9 @@ define_opcodes! {
 
     // WrenJIT async extension. A=destination, B=Promise value.
     Await = 122,
+
+    // Structured exception handler entry. A=destination for the thrown value.
+    Catch = 123,
 }
 
 impl Opcode {
@@ -1161,6 +1164,7 @@ impl Opcode {
                 | FiberYield
                 | FiberSuspend
                 | Await
+                | Catch
         )
     }
 }
@@ -1444,6 +1448,20 @@ pub struct ProfileCounterDescriptor {
     pub site: Option<SiteId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExceptionHandlerEntry {
+    /// Inclusive start of the protected bytecode range.
+    pub start_pc: BytecodePc,
+    /// Exclusive end of the protected bytecode range.
+    pub end_pc: BytecodePc,
+    /// First instruction of the handler. This must be `Opcode::Catch`.
+    pub handler_pc: BytecodePc,
+    /// Physical GPR receiving the thrown Wren value.
+    pub error_reg: Reg,
+    /// Lexical nesting depth. Larger values win when ranges overlap.
+    pub depth: u16,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BytecodeChunk {
     pub code: Vec<Word>,
@@ -1459,6 +1477,8 @@ pub struct BytecodeChunk {
     pub resume_points: Vec<ResumeEntry>,
     pub source_map: Vec<SourceMapEntry>,
     pub profile_counters: Vec<ProfileCounterDescriptor>,
+    /// Zero-cost structured exception table. No bytecode executes on try entry/exit.
+    pub exception_handlers: Vec<ExceptionHandlerEntry>,
 }
 
 impl BytecodeChunk {
@@ -3024,6 +3044,47 @@ impl BytecodeVerifier {
             }
         }
 
+        for handler in &chunk.exception_handlers {
+            if handler.start_pc.0 >= handler.end_pc.0
+                || handler.end_pc.0 > chunk.code.len() as u32
+            {
+                return Err(VerificationError::function(
+                    "invalid structured-exception protected PC range",
+                ));
+            }
+            if !boundaries.contains(&handler.start_pc) {
+                return Err(VerificationError::function(format!(
+                    "exception range starts at non-boundary PC {}",
+                    handler.start_pc.0
+                )));
+            }
+            if handler.end_pc.0 != chunk.code.len() as u32
+                && !boundaries.contains(&handler.end_pc)
+            {
+                return Err(VerificationError::function(format!(
+                    "exception range ends at non-boundary PC {}",
+                    handler.end_pc.0
+                )));
+            }
+            if !boundaries.contains(&handler.handler_pc) {
+                return Err(VerificationError::function(format!(
+                    "exception handler PC {} is not an instruction boundary",
+                    handler.handler_pc.0
+                )));
+            }
+            Self::verify_reg(function, handler.handler_pc, handler.error_reg)?;
+
+            let word = chunk.code.get(handler.handler_pc.0 as usize).copied().ok_or_else(|| {
+                VerificationError::function("exception handler PC is outside bytecode")
+            })?;
+            if word.opcode() != Some(Opcode::Catch) || word.a() != handler.error_reg.0 {
+                return Err(VerificationError::function(format!(
+                    "exception handler at PC {} must begin with Catch {:?}",
+                    handler.handler_pc.0, handler.error_reg
+                )));
+            }
+        }
+
         for source in &chunk.source_map {
             if source.start_pc.0 > source.end_pc.0 || source.end_pc.0 > chunk.code.len() as u32 {
                 return Err(VerificationError::function("invalid source-map PC range"));
@@ -3410,6 +3471,7 @@ impl BytecodeVerifier {
                 Self::verify_reg(function, inst.pc, c)?;
             }
 
+            Catch => Self::verify_reg(function, inst.pc, a)?,
             Await => {
                 Self::verify_reg(function, inst.pc, a)?;
                 Self::verify_reg(function, inst.pc, b)?;
@@ -3542,6 +3604,7 @@ pub const fn operand_roles(opcode: Opcode) -> [OperandRole; 3] {
         | ICmpLt | ICmpLe | ICmpGt | ICmpGe | FCmpEq | FCmpNe | FCmpLt
         | FCmpLe | FCmpGt | FCmpGe | RefEq => [General, General, General],
         Await => [General, General, None],
+        Catch => [General, None, None],
         MakeFiber => [General, General, None],
         FiberCall | FiberTry | FiberTransfer | FiberTransferError => [General, General, General],
         FiberYield => [General, General, None],

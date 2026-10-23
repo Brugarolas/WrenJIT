@@ -904,6 +904,25 @@ pub enum Inst {
 }
 
 impl Inst {
+    /// Conservative language-exception classification. Guards/deopts, memory
+    /// operations and calls may enter a protected handler; total scalar SSA and
+    /// ordinary control flow cannot. This is deliberately independent of purity
+    /// (integer division, for example, is pure but may fail).
+    pub fn may_throw(&self) -> bool {
+        !matches!(self,
+            Self::Jump { .. } | Self::Branch { .. } | Self::Switch { .. }
+            | Self::Return(_) | Self::Unreachable | Self::Const(_) | Self::Move(_)
+            | Self::IntUnary { .. }
+            | Self::IntBin { op: IntBinOp::Add | IntBinOp::Sub | IntBinOp::Mul
+                | IntBinOp::BitAnd | IntBinOp::BitOr | IntBinOp::BitXor
+                | IntBinOp::Shl | IntBinOp::ShrU | IntBinOp::Sar, .. }
+            | Self::F64Unary { .. } | Self::F64Bin { .. }
+            | Self::CmpInt { .. } | Self::CmpF64 { .. } | Self::RefEq { .. }
+            | Self::Int32ToNum { .. } | Self::F64ToNum { .. }
+            | Self::WriteBarrier { .. } | Self::ReadBarrier { .. }
+            | Self::Safepoint | Self::OSRPoint)
+    }
+
     pub fn effect_behavior(&self) -> EffectBehavior {
         use EffectBehavior as B;
         use EffectKind as E;
@@ -1583,6 +1602,21 @@ pub struct ProfileData {
     pub numeric_sites: HashMap<InstId, NumericProfile>,
 }
 
+/// Zero-cost exception region used by structured `try`/`catch` and deferred cleanup.
+///
+/// `protected_blocks` are ordinary SSA blocks whose throwing runtime operations
+/// transfer control to `handler`. `error` is a block parameter of `handler`; the
+/// bytecode backend assigns it a physical register and the interpreter writes the
+/// thrown Wren value there on handler entry. `depth` resolves nested overlapping
+/// regions without putting enter/leave opcodes on the hot path.
+#[derive(Clone, Debug)]
+pub struct ExceptionRegion {
+    pub protected_blocks: Vec<BlockId>,
+    pub handler: BlockId,
+    pub error: ValueId,
+    pub depth: u16,
+}
+
 #[derive(Clone, Debug)]
 pub struct Function {
     pub id: FuncId,
@@ -1606,6 +1640,9 @@ pub struct Function {
     pub effects: Vec<EffectValue>,
     pub captures: Vec<CaptureParam>,
     pub deopts: Vec<DeoptPoint>,
+    /// Structured exception metadata. It is side-table-only: normal execution
+    /// pays no bytecode dispatch cost merely for being inside a try/defer region.
+    pub exception_regions: Vec<ExceptionRegion>,
     pub profiles: ProfileData,
 }
 
@@ -1875,6 +1912,7 @@ impl<'p> Builder<'p> {
             }],
             captures: Vec::new(),
             deopts: Vec::new(),
+            exception_regions: Vec::new(),
             profiles: ProfileData::default(),
         };
 
@@ -1924,6 +1962,51 @@ impl<'p> Builder<'p> {
 
     pub fn current_effect(&self) -> EffectId {
         self.current_effect
+    }
+
+    #[inline]
+    pub fn block_count(&self) -> usize {
+        self.function.blocks.len()
+    }
+
+    #[inline]
+    pub fn block_param(&self, block: BlockId, index: usize) -> ValueId {
+        self.function
+            .block(block)
+            .and_then(|block| block.params.get(index))
+            .copied()
+            .expect("unknown block parameter")
+    }
+
+    /// Register a zero-cost structured exception region.
+    ///
+    /// The handler itself must not be protected by this same region. Nested
+    /// outer regions may protect the handler normally.
+    pub fn add_exception_region(
+        &mut self,
+        mut protected_blocks: Vec<BlockId>,
+        handler: BlockId,
+        error: ValueId,
+        depth: u16,
+    ) {
+        protected_blocks.sort_unstable();
+        protected_blocks.dedup();
+        assert!(self.function.block(handler).is_some(), "unknown exception handler block");
+        assert!(
+            !protected_blocks.contains(&handler),
+            "exception handler cannot protect itself"
+        );
+        let error_value = self.function.value(error).expect("unknown exception value");
+        assert!(
+            matches!(error_value.def, ValueDef::BlockParam(block, _) if block == handler),
+            "exception value must be a handler block parameter"
+        );
+        self.function.exception_regions.push(ExceptionRegion {
+            protected_blocks,
+            handler,
+            error,
+            depth,
+        });
     }
 
     pub fn set_source(&mut self, source: Option<SourceSpan>) {
@@ -2390,6 +2473,10 @@ pub enum VerifyError {
     BrokenValueDefinition(ValueId),
     BrokenEffectDefinition(EffectId),
     InvalidDeoptId { inst: InstId, deopt: DeoptId },
+    InvalidExceptionHandler { handler: BlockId },
+    InvalidExceptionBlock { block: BlockId },
+    InvalidExceptionValue { handler: BlockId, value: ValueId },
+    ExceptionHandlerSelfProtected { handler: BlockId },
     ResultCount { inst: InstId, expected: usize, actual: usize },
 }
 
@@ -2434,6 +2521,34 @@ pub fn verify_function(function: &Function) -> Result<(), Vec<VerifyError>> {
             errors.push(VerifyError::InvalidEffectId {
                 index,
                 id: effect.id,
+            });
+        }
+    }
+
+    for region in &function.exception_regions {
+        if function.block(region.handler).is_none() {
+            errors.push(VerifyError::InvalidExceptionHandler {
+                handler: region.handler,
+            });
+            continue;
+        }
+        if region.protected_blocks.contains(&region.handler) {
+            errors.push(VerifyError::ExceptionHandlerSelfProtected {
+                handler: region.handler,
+            });
+        }
+        for &block in &region.protected_blocks {
+            if function.block(block).is_none() {
+                errors.push(VerifyError::InvalidExceptionBlock { block });
+            }
+        }
+        let valid_error = function.value(region.error).is_some_and(|value| {
+            matches!(value.def, ValueDef::BlockParam(block, _) if block == region.handler)
+        });
+        if !valid_error {
+            errors.push(VerifyError::InvalidExceptionValue {
+                handler: region.handler,
+                value: region.error,
             });
         }
     }

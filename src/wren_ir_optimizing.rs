@@ -4,7 +4,7 @@ use hashbrown::{HashMap, HashSet};
 
 use crate::wren_ir::{
     BlockId, ClassSet, CmpKind, Constant, Edge, EffectBehavior, EffectKind, F64BinOp, F64UnaryOp,
-    FieldSlot, Function, Inst, InstId, IntBinOp, IntUnaryOp, ModuleId, ModuleSlot, Node, SiteId,
+    FieldSlot, Function, Inst, InstId, IntBinOp, IntUnaryOp, ModuleId, ModuleSlot, Node, Program, SiteId,
     StaticFieldSlot, StringId, Type, ValueDef, ValueId,
 };
 use crate::wren_ir_escape::ScalarReplacement;
@@ -21,6 +21,79 @@ pub fn optimization_passes() -> Optimize {
     // framework verifies after every stage, so bundling the cheap transforms also
     // avoids repeatedly paying verifier cost during development.
     Optimize::new().with_function_pass(InterpreterOptimizationBundle::default())
+}
+
+/// Optimize independent WIR functions concurrently using one optimizer instance
+/// per worker. `worker_count == 0` selects the host's available parallelism.
+///
+/// The default WIR pipeline is deliberately function-local, so workers never
+/// share mutable optimizer state or mutate global `Program` metadata. This keeps
+/// the hot optimizer data structures thread-local and preserves deterministic
+/// function ordering in `Program::functions`.
+pub fn optimize_program_parallel(program: &mut Program, worker_count: usize) {
+    let function_count = program.functions.len();
+    let total_nodes = program
+        .functions
+        .iter()
+        .map(|function| function.nodes.len())
+        .sum::<usize>();
+    if function_count <= 1 {
+        optimization_passes().optimize_program(program);
+        return;
+    }
+
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    // Auto mode avoids creating a thread per tiny function. Roughly one worker
+    // per 1K HIR nodes gives EA/SROA enough work to amortize thread startup while
+    // still exploiting a few very large functions. Explicit counts are honored.
+    let workers = if worker_count == 0 {
+        let work_limited = total_nodes.saturating_add(1023) / 1024;
+        available.min(work_limited.max(1))
+    } else {
+        worker_count
+    }
+    .max(1)
+    .min(function_count);
+
+    if workers == 1 {
+        optimization_passes().optimize_program(program);
+        return;
+    }
+
+    // WIR function costs are uneven (EA/SROA can make one function much more
+    // expensive than its neighbours), so use a tiny synchronized work queue
+    // instead of fixed contiguous chunks. Each `&mut Function` is produced once
+    // by `iter_mut`, preserving exclusive ownership without unsafe code.
+    let (work_tx, work_rx) = std::sync::mpsc::channel::<&mut Function>();
+    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let work_rx = std::sync::Arc::clone(&work_rx);
+            scope.spawn(move || {
+                let mut optimizer = optimization_passes();
+                loop {
+                    let function = {
+                        let receiver = work_rx.lock().expect("WIR optimizer queue poisoned");
+                        receiver.recv()
+                    };
+                    let Ok(function) = function else {
+                        break;
+                    };
+                    optimizer.optimize_function(function);
+                }
+            });
+        }
+
+        for function in &mut program.functions {
+            work_tx
+                .send(function)
+                .expect("all WIR optimizer workers stopped unexpectedly");
+        }
+        drop(work_tx);
+    });
 }
 
 /// Cold-start-conscious optimizer bundle for interpreter-visible WIR.
@@ -1429,6 +1502,17 @@ fn thread_edge_once(function: &Function, incoming: &Edge, effect: crate::wren_ir
 
 fn compute_reachable(function: &Function) -> Vec<bool> {
     let mut reachable = vec![false; function.blocks.len()];
+    let mut exceptional_successors = vec![Vec::<BlockId>::new(); function.blocks.len()];
+    for region in &function.exception_regions {
+        for &protected in &region.protected_blocks {
+            if let Some(successors) = exceptional_successors.get_mut(protected.0 as usize) {
+                if !successors.contains(&region.handler) {
+                    successors.push(region.handler);
+                }
+            }
+        }
+    }
+
     let mut stack = Vec::new();
     if (function.entry.0 as usize) < reachable.len() {
         stack.push(function.entry);
@@ -1451,6 +1535,12 @@ fn compute_reachable(function: &Function) -> Vec<bool> {
             let target_ix = edge.target.0 as usize;
             if target_ix < reachable.len() && !reachable[target_ix] {
                 stack.push(edge.target);
+            }
+        }
+        for &handler in &exceptional_successors[block_ix] {
+            let target_ix = handler.0 as usize;
+            if target_ix < reachable.len() && !reachable[target_ix] {
+                stack.push(handler);
             }
         }
     }

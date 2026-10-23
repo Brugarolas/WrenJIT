@@ -51,6 +51,8 @@ use std::fmt;
 use std::mem::offset_of;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+mod inlining;
+
 use cranelift::codegen::ir::{Type as ClifType, UserFuncName};
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{default_libcall_names, FuncId as ClifFuncId, Module};
@@ -248,6 +250,7 @@ pub type HeapWriteBarrierFn = unsafe extern "C" fn(*mut c_void, usize);
 
 #[repr(C, align(16))]
 pub struct TraceActivation {
+    pub method_epoch: u64,
     /// Base of the current Wren frame's contiguous GPR bank.
     pub general: *mut RegisterWord,
     pub arguments: *mut RegisterWord,
@@ -286,6 +289,7 @@ pub struct TraceActivation {
 impl TraceActivation {
     pub fn new(inputs: TraceActivationInputs) -> Self {
         Self {
+            method_epoch: 0,
             general: inputs.general,
             arguments: inputs.arguments,
             returns: inputs.returns,
@@ -397,6 +401,11 @@ pub trait TraceRuntime {
     /// Only specialize a numeric Invoke when its actual method target has the
     /// standard semantics. A method name alone is insufficient for host bindings.
     fn trace_standard_numeric_method(&self, _function: FuncId, _cache: u32) -> bool { false }
+
+    fn trace_method_epoch(&self) -> u64 { 0 }
+    /// Actual bytecode method selected for this receiver, plus its stable class
+    /// key. The native trace must guard both class and method-table version.
+    fn trace_inline_target(&self, _function: FuncId, _cache: u32, _receiver: RegisterWord) -> Option<(FuncId, u64)> { None }
 
     /// Resolve a GuardClass descriptor to stable runtime receiver-class keys.
     fn trace_class_guard(&self, _function: FuncId, _guard: u32) -> Option<Vec<u64>> { None }
@@ -570,6 +579,8 @@ impl Default for TracingJitOptions {
 
 #[derive(Clone, Debug, Default)]
 pub struct TracingJitStats {
+    pub inlined_calls: u64,
+    pub devirtualized_calls: u64,
     pub loop_header_hits: u64,
     pub entry_hits: u64,
     pub entry_traces_compiled: u64,
@@ -1908,9 +1919,10 @@ impl<'a> TraceRecorder<'a> {
                 if self.record_num_invoke(runtime, program, function, op, builder)? {
                     Ok(ExpectedStep::Exact(next))
                 } else {
-                    Err(RecordingAbort::UnsupportedCall)
+                    self.inline_call(runtime, program, op, builder)
                 }
             }
+            CallDirect => self.inline_call(runtime, program, op, builder),
 
             // Specialized integer unary.
             INeg | IBitNot => {
@@ -2434,7 +2446,7 @@ impl<'a> TraceRecorder<'a> {
                 Ok(ExpectedStep::Exact(next))
             }
 
-            Safepoint | Breakpoint => {
+            Safepoint | Breakpoint | Catch => {
                 Err(RecordingAbort::UnsupportedOpcode(op.opcode))
             }
 
@@ -2442,7 +2454,6 @@ impl<'a> TraceRecorder<'a> {
             | Return2
             | Trap
             | InvokeSuper
-            | CallDirect
             | CallClosure
             | CallPrimitive
             | CallForeign
@@ -2651,6 +2662,8 @@ impl<'a> TraceRecorder<'a> {
                 match self.translate_native(runtime, program, function, &op, &mut builder) {
                     Ok(step @ ExpectedStep::Exact(next)) if next.pc.0 > location.pc.0
                         && !visited.contains(&next) => step,
+                    Ok(step @ ExpectedStep::Inlined { next, .. }) if next.pc.0 > location.pc.0
+                        && !visited.contains(&next) => step,
                     Ok(_) | Err(_) => {
                         builder = checkpoint;
                         break;
@@ -2661,9 +2674,30 @@ impl<'a> TraceRecorder<'a> {
                     .map_err(RecordOutcome::Abort)?
             };
 
-            let step = runtime
+            let mut step = runtime
                 .trace_execute_unfused_step()
                 .map_err(|error| RecordOutcome::Fatal(runtime_error(error)))?;
+
+            if let ExpectedStep::Inlined { next, callee, steps: callee_steps } = expected {
+                if !step.running || step.after != TraceLocation::new(callee, BytecodePc(0)) {
+                    return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
+                }
+                for _ in 0..callee_steps {
+                    if !step.running || runtime.trace_current_location().function != callee {
+                        return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
+                    }
+                    step = runtime.trace_execute_unfused_step()
+                        .map_err(|error| RecordOutcome::Fatal(runtime_error(error)))?;
+                }
+                if !step.running || step.after != next {
+                    return Err(RecordOutcome::Abort(RecordingAbort::FrameChanged));
+                }
+                // The bounded leaf returned to the original caller. Its frame
+                // transitions are absent from native code and all deopts replay
+                // the original call with the caller snapshot.
+                step = TraceStep::simple(location, next);
+                builder.trace_mut().stats.recorded_bytecodes += callee_steps;
+            }
 
             steps += 1;
             builder.trace_mut().stats.recorded_bytecodes += 1;
@@ -2700,7 +2734,7 @@ impl<'a> TraceRecorder<'a> {
                 }));
             }
 
-            if let ExpectedStep::Exact(expected_location) = expected {
+            if let ExpectedStep::Exact(expected_location) | ExpectedStep::Inlined { next: expected_location, .. } = expected {
                 if step.after != expected_location {
                     return Err(RecordOutcome::Fatal(TracingJitError::Record {
                         location,
@@ -2822,6 +2856,7 @@ enum RecordOutcome {
 #[derive(Clone, Copy, Debug)]
 enum ExpectedStep {
     Exact(TraceLocation),
+    Inlined { next: TraceLocation, callee: FuncId, steps: usize },
     Runtime { terminal: bool },
 }
 
@@ -4781,6 +4816,14 @@ impl CraneliftLoweringState<'_, '_> {
                 self.cache_value(one_result(node)?, value);
             }
 
+            GuardMethodEpoch { expected, exit } => {
+                let epoch = self.builder.ins().load(types::I64, Self::trusted_mem(), self.activation,
+                    offset_of!(TraceActivation, method_epoch) as i32);
+                let expected = self.builder.ins().iconst(types::I64, *expected as i64);
+                let failure = self.builder.ins().icmp(IntCC::NotEqual, epoch, expected);
+                self.emit_side_exit(*exit, failure)?;
+            }
+
             IntUnary { op, value } => {
                 let value = self.lower_value(*value)?;
                 let result = match op {
@@ -5351,7 +5394,7 @@ impl TracingJit {
         let expected = recorder.translate_op(runtime, program, function, &op, &mut builder)
             .map_err(|reason| TracingJitError::Record { location, message: reason.to_string() })?;
         match expected {
-            ExpectedStep::Exact(next) => {
+            ExpectedStep::Exact(next) | ExpectedStep::Inlined { next, .. } => {
                 let exit = builder.add_side_exit(ExitReason::GuardValue, next.pc);
                 builder.set_terminator(TraceTerminator::Exit(exit));
             },
@@ -5493,6 +5536,8 @@ impl TracingJit {
             Ok(trace) => {
                 self.stats.recordings_succeeded += 1;
                 self.stats.recorded_bytecodes += trace.stats.recorded_bytecodes as u64;
+                self.stats.inlined_calls += trace.stats.inlined_calls as u64;
+                self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
                 self.stats.pruned_snapshot_writes += trace.stats.pruned_snapshot_writes as u64;
                 self.stats.eliminated_trace_guards += trace.stats.eliminated_guards as u64;
                 self.stats.eliminated_trace_boxes += trace.stats.eliminated_boxes as u64;
@@ -5623,6 +5668,8 @@ impl TracingJit {
 
         self.stats.recordings_succeeded += 1;
         self.stats.recorded_bytecodes += trace.stats.recorded_bytecodes as u64;
+        self.stats.inlined_calls += trace.stats.inlined_calls as u64;
+        self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
         self.stats.promoted_f64_loop_phis += trace.stats.promoted_f64_loop_phis as u64;
         self.stats.promoted_i32_loop_phis += trace.stats.promoted_i32_loop_phis as u64;
         self.stats.promoted_u32_loop_phis += trace.stats.promoted_u32_loop_phis as u64;
@@ -5747,6 +5794,7 @@ impl TracingJit {
             }
 
             let mut activation = TraceActivation::new(inputs);
+            activation.method_epoch = runtime.trace_method_epoch();
             activation.trace_entries = self.entry_table.as_ptr();
             activation.trace_link_tables = self.link_table_ptrs.as_ptr();
             activation.trace_entries_len = self.entry_table.len() as u32;
@@ -5855,6 +5903,8 @@ impl TracingJit {
         };
 
         self.stats.recordings_succeeded = self.stats.recordings_succeeded.saturating_add(1);
+        self.stats.inlined_calls += trace.stats.inlined_calls as u64;
+        self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
         self.stats.recorded_bytecodes = self
             .stats
             .recorded_bytecodes
@@ -6254,6 +6304,143 @@ impl TracingJit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_scalar_trace(trace: &Trace, registers: &mut [RegisterWord], epoch: u64, budget: u32) -> u32 {
+        unsafe extern "C" fn unexpected_runtime(_: *mut TraceActivation, _: u32, _: u32, _: u32) -> u32 { panic!("unexpected runtime") }
+        let mut jit = TracingJit::new(TracingJitOptions { native_loop_iteration_budget: budget, ..Default::default() });
+        let compiled = jit.compile_trace(trace).unwrap();
+        let mut activation = TraceActivation::new(TraceActivationInputs {
+            general: registers.as_mut_ptr(), arguments: std::ptr::null_mut(), returns: std::ptr::null_mut(),
+            special: std::ptr::null_mut(), runtime: std::ptr::null_mut(), execute: unexpected_runtime,
+            heap_chunks: std::ptr::null(), heap_write_barrier: noop_heap_write_barrier,
+        });
+        activation.current_links = compiled.native_links.as_ptr();
+        activation.method_epoch = epoch;
+        assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+        activation.exit_id
+    }
+
+    #[test]
+    fn optimized_affine_loop_matches_native_wraparound_and_budget_snapshots() {
+        let mut b = crate::wren_trace_ir::TraceBuilder::new(TraceId(0), TraceAnchor { kind: TraceKind::Loop, location: TraceLocation::new(FuncId(0), BytecodePc(0)) });
+        let slot = FrameSlot::General(Reg(0));
+        let start = b.read_slot(slot, TraceType::Int32, TraceRep::Int32);
+        let phi = b.add_loop_phi(slot, start, TraceType::Int32, TraceRep::Int32);
+        let three = b.constant(TraceConstant::Int32(3));
+        let seven = b.constant(TraceConstant::Int32(7));
+        let product = b.emit1(TraceInst::IntBinary { op: IntBinOp::Mul, lhs: phi, rhs: seven }, TraceType::Int32, TraceRep::Int32);
+        let next = b.emit1(TraceInst::IntBinary { op: IntBinOp::Add, lhs: phi, rhs: three }, TraceType::Int32, TraceRep::Int32);
+        b.write_slot(slot, next);
+        b.write_slot(FrameSlot::General(Reg(1)), product);
+        b.set_loop_backedge(phi, next).unwrap();
+        b.add_native_budget_exit(BytecodePc(0));
+        b.set_terminator(TraceTerminator::LoopBack);
+        let original = b.finish().unwrap();
+        let mut optimized = original.clone();
+        crate::wren_trace_ir_optimizing::optimization_passes().optimize_trace(&mut optimized).unwrap();
+        assert_eq!(optimized.stats.strength_reduced, 1);
+        for input in [0, -1, i32::MIN, i32::MAX - 2] {
+            for budget in [1, 3, 17] {
+                let mut baseline = [RegisterWord(input as u32 as u64), RegisterWord(0)];
+                let mut actual = baseline;
+                for _ in 0..3 {
+                    run_scalar_trace(&original, &mut baseline, 0, budget);
+                    run_scalar_trace(&optimized, &mut actual, 0, budget);
+                    assert_eq!(actual, baseline, "input={input} budget={budget}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn method_epoch_guard_deopts_before_inlined_effects() {
+        let mut b = crate::wren_trace_ir::TraceBuilder::new(TraceId(0), TraceAnchor { kind: TraceKind::Side, location: TraceLocation::new(FuncId(0), BytecodePc(0)) });
+        let failure = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        b.emit0(TraceInst::GuardMethodEpoch { expected: 42, exit: failure });
+        let result = b.constant(TraceConstant::Int32(7));
+        b.write_slot(FrameSlot::General(Reg(0)), result);
+        let success = b.add_side_exit(ExitReason::GuardValue, BytecodePc(1));
+        b.set_terminator(TraceTerminator::Exit(success));
+        let trace = b.finish().unwrap();
+        for epoch in [41, 42, 43] {
+            let mut registers = [RegisterWord(99)];
+            let exit = run_scalar_trace(&trace, &mut registers, epoch, 0);
+            assert_eq!(exit, if epoch == 42 { success.0 } else { failure.0 });
+            assert_eq!(registers[0].0, if epoch == 42 { 7 } else { 99 });
+        }
+    }
+
+    #[test]
+    fn loop_memory_pre_matches_native_first_iteration_and_reentry() {
+        let mut b = crate::wren_trace_ir::TraceBuilder::new(TraceId(0), TraceAnchor { kind: TraceKind::Loop, location: TraceLocation::new(FuncId(0), BytecodePc(0)) });
+        let object = b.read_slot(FrameSlot::General(Reg(0)), TraceType::Any, TraceRep::Tagged);
+        let exit = b.add_side_exit(ExitReason::GuardValue, BytecodePc(0));
+        let value = b.emit1(TraceInst::HeapLoadCell { cell: object, exit }, TraceType::Any, TraceRep::Tagged);
+        let seven = b.constant(TraceConstant::NumBits(7.0f64.to_bits()));
+        b.emit0(TraceInst::HeapStoreCell { cell: object, value: seven, exit });
+        b.write_slot(FrameSlot::General(Reg(1)), value);
+        b.add_native_budget_exit(BytecodePc(0));
+        b.set_terminator(TraceTerminator::LoopBack);
+        let original = b.finish().unwrap();
+        let mut optimized = original.clone();
+        crate::wren_trace_ir_optimizing::optimization_passes().optimize_trace(&mut optimized).unwrap();
+        assert_eq!(optimized.stats.loop_loads_reused, 1);
+        unsafe extern "C" fn unexpected_runtime(_: *mut TraceActivation, _: u32, _: u32, _: u32) -> u32 { TRACE_RESULT_RUNTIME }
+        for budget in [1, 2, 5] {
+            for trace in [&original, &optimized] {
+                let mut jit = TracingJit::new(TracingJitOptions { native_loop_iteration_budget: budget, ..Default::default() });
+                let compiled = jit.compile_trace(trace).unwrap();
+                let mut cell = RegisterWord(0);
+                let mut chunk: Vec<_> = (0..TRACE_HEAP_CHUNK_SIZE).map(|_| TraceHeapEntry::new(0)).collect();
+                chunk[0].address.store(1, Ordering::Relaxed);
+                chunk[0].kind.store(TraceHeapKind::Cell as u32, Ordering::Relaxed);
+                chunk[0].data.store(&mut cell as *mut RegisterWord as usize, Ordering::Relaxed);
+                let chunks = [chunk.as_mut_ptr()];
+                let mut registers = [RegisterWord(TAG_HEAP), RegisterWord(0)];
+                let mut activation = TraceActivation::new(TraceActivationInputs {
+                    general: registers.as_mut_ptr(), arguments: std::ptr::null_mut(), returns: std::ptr::null_mut(),
+                    special: std::ptr::null_mut(), runtime: std::ptr::null_mut(), execute: unexpected_runtime,
+                    heap_chunks: chunks.as_ptr(), heap_write_barrier: noop_heap_write_barrier,
+                });
+                activation.current_links = compiled.native_links.as_ptr();
+                for initial in [42.0f64, -10.0] {
+                    cell.0 = initial.to_bits();
+                    activation.reset_result();
+                    assert_eq!(unsafe { (compiled.entry)(&mut activation) }, TRACE_RESULT_SIDE_EXIT);
+                    assert_eq!(f64::from_bits(cell.0), 7.0);
+                    assert_eq!(f64::from_bits(registers[1].0), if budget == 1 { initial } else { 7.0 });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn range_optimization_preserves_native_failure_snapshots() {
+        let mut b = crate::wren_trace_ir::TraceBuilder::new(TraceId(0), TraceAnchor { kind: TraceKind::Side, location: TraceLocation::new(FuncId(0), BytecodePc(0)) });
+        let input = b.read_slot(FrameSlot::General(Reg(0)), TraceType::Int32, TraceRep::Int32);
+        let mask = b.constant(TraceConstant::Int32(15));
+        let length = b.constant(TraceConstant::Int32(16));
+        let masked = b.emit1(TraceInst::IntBinary { op: IntBinOp::BitAnd, lhs: input, rhs: mask }, TraceType::Int32, TraceRep::Int32);
+        b.write_slot(FrameSlot::General(Reg(1)), masked);
+        let failure = b.add_side_exit(ExitReason::GuardBounds, BytecodePc(1));
+        b.emit0(TraceInst::GuardBounds { index: masked, length, exit: failure });
+        b.emit0(TraceInst::GuardBounds { index: input, length, exit: failure });
+        let sum = b.emit1(TraceInst::IntBinaryChecked { op: IntBinOp::Add, lhs: input, rhs: length, exit: failure }, TraceType::Int32, TraceRep::Int32);
+        b.write_slot(FrameSlot::General(Reg(2)), sum);
+        let success = b.add_side_exit(ExitReason::GuardValue, BytecodePc(2));
+        b.set_terminator(TraceTerminator::Exit(success));
+        let original = b.finish().unwrap();
+        let mut optimized = original.clone();
+        crate::wren_trace_ir_optimizing::optimization_passes().optimize_trace(&mut optimized).unwrap();
+        assert_eq!(optimized.stats.eliminated_bounds_checks, 1);
+        assert_eq!(optimized.stats.eliminated_overflow_checks, 1);
+        for input in [i32::MIN, -1, 0, 15, 16, i32::MAX] {
+            let mut baseline = [RegisterWord(input as u32 as u64), RegisterWord(0), RegisterWord(99)];
+            let mut actual = baseline;
+            assert_eq!(run_scalar_trace(&original, &mut baseline, 0, 0), run_scalar_trace(&optimized, &mut actual, 0, 0));
+            assert_eq!(actual, baseline);
+        }
+    }
 
     #[test]
     fn native_math_matches_rust_including_ieee_edge_cases() {

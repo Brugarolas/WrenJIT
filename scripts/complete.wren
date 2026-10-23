@@ -354,3 +354,31 @@ var fiber = Fiber.new {|first|
 System.print(fiber.call(10)) // 11
 System.print(fiber.call(20)) // 22
 System.print(fiber.isDone)   // true
+
+System.print("***** Errors! *****")
+
+Fn.new {
+  defer {
+    System.print("always")
+  }
+
+  errdefer {
+    System.print("only on error")
+  }
+
+  errdefer (error) {
+    System.print(error)
+  }
+
+  throw "error from funcWithError"
+}
+
+Fn.new {
+  try {
+    throw "boom"
+  } catch (error) {
+    System.print(error)
+  } finally {
+    System.print("always")
+  }
+}

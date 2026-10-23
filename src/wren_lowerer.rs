@@ -261,6 +261,7 @@ struct FunctionNode {
     this_binding: Option<BindingId>,
     closure_span: Option<Span>,
     is_async: bool,
+    has_structured_exceptions: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -300,6 +301,7 @@ impl Analyzer {
             this_binding: None,
             closure_span: None,
             is_async: false,
+            has_structured_exceptions: false,
         };
         let mut analyzer = Self {
             analysis: RootAnalysis {
@@ -342,6 +344,7 @@ impl Analyzer {
             this_binding: None,
             closure_span: None,
             is_async: method.is_async,
+            has_structured_exceptions: false,
         };
         let mut analyzer = Self {
             analysis: RootAnalysis {
@@ -543,6 +546,41 @@ impl Analyzer {
                 self.visit_stmt(body, false);
                 self.pop_scope();
             }
+            StmtKind::Defer { body, error_binding, .. } => {
+                self.analysis.nodes[self.current_function.0].has_structured_exceptions = true;
+                self.push_scope();
+                if let Some(binding) = error_binding {
+                    self.declare(binding);
+                }
+                self.visit_stmt(body, false);
+                self.pop_scope();
+            }
+            StmtKind::Try {
+                body,
+                catch,
+                finally_branch,
+            } => {
+                self.analysis.nodes[self.current_function.0].has_structured_exceptions = true;
+                self.push_scope();
+                self.visit_stmt(body, false);
+                self.pop_scope();
+                if let Some(catch) = catch {
+                    self.push_scope();
+                    if let Some(binding) = &catch.binding {
+                        self.declare(binding);
+                    }
+                    self.visit_stmt(&catch.body, false);
+                    self.pop_scope();
+                }
+                if let Some(finally_branch) = finally_branch {
+                    self.push_scope();
+                    self.visit_stmt(finally_branch, false);
+                    self.pop_scope();
+                }
+            }
+            StmtKind::Throw(value) => {
+                self.visit_expr(value);
+            }
             StmtKind::Break | StmtKind::Continue => {}
             StmtKind::Return(value) => {
                 if let Some(value) = value {
@@ -657,6 +695,7 @@ impl Analyzer {
             this_binding: self.analysis.nodes[parent.0].this_binding,
             closure_span: Some(body.span),
             is_async,
+            has_structured_exceptions: false,
         });
         self.analysis.closure_map.insert(body.span, id);
 
@@ -1526,12 +1565,42 @@ impl Storage {
     }
 }
 
+type ExceptionRegionId = usize;
+
+#[derive(Clone, Debug)]
+struct ExceptionRegionBuild {
+    handler: ir::BlockId,
+    error: ValueId,
+    depth: u16,
+    protected_blocks: Vec<ir::BlockId>,
+}
+
+#[derive(Clone, Debug)]
+enum ExitAction {
+    Defer {
+        body: Box<Stmt>,
+        region: ExceptionRegionId,
+        error_only: bool,
+    },
+    Finally {
+        body: Box<Stmt>,
+        region: ExceptionRegionId,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CleanupScope {
+    action_start: usize,
+    region_start: usize,
+}
+
 #[derive(Clone, Debug)]
 struct LoopContext {
     continue_target: ir::BlockId,
     break_target: ir::BlockId,
     carried: Vec<BindingId>,
     continue_prefix: Vec<ValueId>,
+    exit_action_depth: usize,
 }
 
 struct FunctionCompilerContext<'a> {
@@ -1558,6 +1627,12 @@ struct FunctionCompiler<'p, 'a, 'd> {
     env: HashMap<BindingId, Storage>,
     loops: Vec<LoopContext>,
     constructor_this: Option<ValueId>,
+    cleanup_scopes: Vec<CleanupScope>,
+    exit_actions: Vec<ExitAction>,
+    exception_regions: Vec<ExceptionRegionBuild>,
+    active_regions: Vec<ExceptionRegionId>,
+    suppressed_regions: HashSet<ExceptionRegionId>,
+    in_cleanup: usize,
 }
 
 impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
@@ -1574,6 +1649,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             env,
             loops: Vec::new(),
             constructor_this: None,
+            cleanup_scopes: Vec::new(),
+            exit_actions: Vec::new(),
+            exception_regions: Vec::new(),
+            active_regions: Vec::new(),
+            suppressed_regions: HashSet::new(),
+            in_cleanup: 0,
         }
     }
 
@@ -1605,7 +1686,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn bind_initial(&mut self, binding: BindingId, value: ValueId) {
         let info = self.context.analysis.binding(binding);
-        if info.captured && info.mutated {
+        if info.mutated
+            && (info.captured
+                || self.context.analysis.nodes[self.context.node_id.0].has_structured_exceptions)
+        {
             let cell = self.builder.alloc_cell(value, Type::Top);
             self.env.insert(binding, Storage::Cell(cell));
         } else {
@@ -1651,7 +1735,15 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
     }
 
-    fn finish(self) -> FuncId {
+    fn finish(mut self) -> FuncId {
+        for region in self.exception_regions {
+            self.builder.add_exception_region(
+                region.protected_blocks,
+                region.handler,
+                region.error,
+                region.depth,
+            );
+        }
         self.builder.finish()
     }
 
@@ -1668,13 +1760,289 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.diagnostics.push(Diagnostic::error(code, message, span));
     }
 
+    fn new_block(&mut self, param_types: &[Type]) -> ir::BlockId {
+        let block = self.builder.new_block(param_types);
+        let active = self.active_regions.clone();
+        for region in active {
+            if !self.suppressed_regions.contains(&region) {
+                self.exception_regions[region].protected_blocks.push(block);
+            }
+        }
+        block
+    }
+
+    fn begin_cleanup_scope(&mut self) {
+        self.cleanup_scopes.push(CleanupScope {
+            action_start: self.exit_actions.len(),
+            region_start: self.active_regions.len(),
+        });
+    }
+
+    fn end_cleanup_scope(&mut self) {
+        let scope = self
+            .cleanup_scopes
+            .pop()
+            .expect("cleanup scope stack cannot be empty");
+        if !self.current_terminated() {
+            self.emit_exit_actions_from(scope.action_start);
+        }
+        self.exit_actions.truncate(scope.action_start);
+        self.active_regions.truncate(scope.region_start);
+    }
+
+    fn split_cleanup_path(&mut self) {
+        if self.current_terminated() {
+            return;
+        }
+        let next = self.new_block(&[]);
+        self.builder.jump(next, Vec::new());
+        self.builder.seal_block(next);
+        self.builder.position_at(next);
+    }
+
+    fn lower_cleanup_body(&mut self, body: &Stmt) {
+        self.in_cleanup += 1;
+        self.lower_scoped_stmt(body);
+        self.in_cleanup -= 1;
+    }
+
+    fn emit_exit_actions_from(&mut self, depth: usize) {
+        if depth >= self.exit_actions.len() || self.current_terminated() {
+            return;
+        }
+        let actions = self.exit_actions[depth..].to_vec();
+        let saved_suppressed = self.suppressed_regions.clone();
+
+        for action in actions.into_iter().rev() {
+            match action {
+                ExitAction::Defer {
+                    body,
+                    region,
+                    error_only,
+                } => {
+                    // Once this lexical scope is being left, its own exception
+                    // region must not catch failures from cleanup code.
+                    self.suppressed_regions.insert(region);
+                    if error_only {
+                        continue;
+                    }
+                    if self.current_terminated() {
+                        break;
+                    }
+                    self.split_cleanup_path();
+                    self.lower_cleanup_body(&body);
+                }
+                ExitAction::Finally { body, region } => {
+                    // A finally block is outside the protected region it closes.
+                    // Exceptions raised by finally must continue unwinding instead
+                    // of being caught by the associated catch/rethrow handler.
+                    self.suppressed_regions.insert(region);
+                    if self.current_terminated() {
+                        break;
+                    }
+                    self.split_cleanup_path();
+                    self.lower_cleanup_body(&body);
+                }
+            }
+        }
+
+        self.suppressed_regions = saved_suppressed;
+    }
+
+    fn lower_scoped_stmt(&mut self, stmt: &Stmt) {
+        if matches!(&stmt.kind, StmtKind::Block(_)) {
+            self.lower_stmt(stmt, false);
+            return;
+        }
+        self.begin_cleanup_scope();
+        self.lower_stmt(stmt, false);
+        self.end_cleanup_scope();
+    }
+
+    fn create_exception_region(&mut self, handler: ir::BlockId, error: ValueId) -> ExceptionRegionId {
+        let id = self.exception_regions.len();
+        let depth = u16::try_from(self.active_regions.len() + 1).unwrap_or(u16::MAX);
+        self.exception_regions.push(ExceptionRegionBuild {
+            handler,
+            error,
+            depth,
+            protected_blocks: Vec::new(),
+        });
+        id
+    }
+
+    fn lower_defer(&mut self, body: &Stmt, error_only: bool, error_binding: Option<&Ident>) {
+        let saved_env = self.env.clone();
+        let handler = self.new_block(&[Type::Top]);
+        let error = self.builder.block_param(handler, 0);
+        let region = self.create_exception_region(handler, error);
+        self.active_regions.push(region);
+
+        // Split at the declaration so instructions before `defer` are not covered.
+        let continuation = self.new_block(&[]);
+        self.builder.jump(continuation, Vec::new());
+
+        // Emit the exceptional cleanup out of line immediately. The handler is
+        // protected by outer regions, but never by its own region.
+        self.builder.position_at(handler);
+        self.env = saved_env.clone();
+        if let Some(binding) = error_binding {
+            if let Some(id) = self.context.analysis.declaration_map.get(&binding.span).copied() {
+                self.bind_initial(id, error);
+            }
+        }
+        self.suppressed_regions.insert(region);
+        self.lower_cleanup_body(body);
+        self.suppressed_regions.remove(&region);
+        if !self.current_terminated() {
+            self.builder.emit0(Inst::FiberAbort { error });
+        }
+
+        self.builder.position_at(continuation);
+        self.env = saved_env;
+        self.exit_actions.push(ExitAction::Defer {
+            body: Box::new(body.clone()),
+            region,
+            error_only,
+        });
+    }
+
+    fn lower_try(
+        &mut self,
+        body: &Stmt,
+        catch: Option<&front::CatchClause>,
+        finally_branch: Option<&Stmt>,
+    ) {
+        let incoming_env = self.env.clone();
+        let handler = self.new_block(&[Type::Top]);
+        let handler_error = self.builder.block_param(handler, 0);
+        let try_region = self.create_exception_region(handler, handler_error);
+        self.active_regions.push(try_region);
+
+        let try_entry = self.new_block(&[]);
+        self.builder.jump(try_entry, Vec::new());
+        self.builder.position_at(try_entry);
+        self.env = incoming_env.clone();
+
+        let finally_action_depth = self.exit_actions.len();
+        if let Some(finally_branch) = finally_branch {
+            self.exit_actions.push(ExitAction::Finally {
+                body: Box::new(finally_branch.clone()),
+                region: try_region,
+            });
+        }
+        self.lower_scoped_stmt(body);
+        self.exit_actions.truncate(finally_action_depth);
+        self.active_regions.pop();
+
+        let mut predecessors = Vec::new();
+        if !self.current_terminated() {
+            if let Some(finally_branch) = finally_branch {
+                // The normal finally path must begin outside the try region.
+                // Otherwise an exception raised by finally would be caught by
+                // the catch belonging to the try it is currently closing.
+                self.split_cleanup_path();
+                self.lower_cleanup_body(finally_branch);
+            }
+            if !self.current_terminated() {
+                predecessors.push(self.builder.current_block());
+            }
+        }
+
+        // Exceptional path starts at the out-of-line handler.
+        self.builder.position_at(handler);
+        self.env = incoming_env.clone();
+
+        if let Some(catch) = catch {
+            if let Some(finally_branch) = finally_branch {
+                // Exceptions raised by catch must execute finally and then continue
+                // unwinding. A second region covers catch, not finally itself.
+                let rethrow_handler = self.new_block(&[Type::Top]);
+                let rethrow_error = self.builder.block_param(rethrow_handler, 0);
+                let catch_region = self.create_exception_region(rethrow_handler, rethrow_error);
+                self.active_regions.push(catch_region);
+
+                let catch_entry = self.new_block(&[Type::Top]);
+                let catch_error = self.builder.block_param(catch_entry, 0);
+                self.builder.jump(catch_entry, vec![handler_error]);
+                self.builder.position_at(catch_entry);
+                self.env = incoming_env.clone();
+                if let Some(binding) = &catch.binding {
+                    if let Some(id) = self.context.analysis.declaration_map.get(&binding.span).copied() {
+                        self.bind_initial(id, catch_error);
+                    }
+                }
+
+                let action_depth = self.exit_actions.len();
+                self.exit_actions.push(ExitAction::Finally {
+                    body: Box::new(finally_branch.clone()),
+                    region: catch_region,
+                });
+                self.lower_scoped_stmt(&catch.body);
+                self.exit_actions.truncate(action_depth);
+                self.active_regions.pop();
+
+                if !self.current_terminated() {
+                    // Leave the catch region before executing finally on the
+                    // handled path, for the same non-recapture guarantee.
+                    self.split_cleanup_path();
+                    self.lower_cleanup_body(finally_branch);
+                    if !self.current_terminated() {
+                        predecessors.push(self.builder.current_block());
+                    }
+                }
+
+                self.builder.position_at(rethrow_handler);
+                self.env = incoming_env.clone();
+                self.lower_cleanup_body(finally_branch);
+                if !self.current_terminated() {
+                    self.builder.emit0(Inst::FiberAbort { error: rethrow_error });
+                }
+            } else {
+                if let Some(binding) = &catch.binding {
+                    if let Some(id) = self.context.analysis.declaration_map.get(&binding.span).copied() {
+                        self.bind_initial(id, handler_error);
+                    }
+                }
+                self.lower_scoped_stmt(&catch.body);
+                if !self.current_terminated() {
+                    predecessors.push(self.builder.current_block());
+                }
+            }
+        } else {
+            // `try/finally`: run finally and resume unwinding with the original value.
+            if let Some(finally_branch) = finally_branch {
+                self.lower_cleanup_body(finally_branch);
+            }
+            if !self.current_terminated() {
+                self.builder.emit0(Inst::FiberAbort { error: handler_error });
+            }
+        }
+
+        if predecessors.is_empty() {
+            self.env = incoming_env;
+            return;
+        }
+
+        let join = self.new_block(&[]);
+        for predecessor in predecessors {
+            self.builder.position_at(predecessor);
+            self.builder.jump(join, Vec::new());
+        }
+        self.builder.seal_block(join);
+        self.builder.position_at(join);
+        self.env = incoming_env;
+    }
+
     fn lower_statements(&mut self, statements: &[Stmt], module_level: bool) {
+        self.begin_cleanup_scope();
         for statement in statements {
             if self.current_terminated() {
                 break;
             }
             self.lower_stmt(statement, module_level);
         }
+        self.end_cleanup_scope();
     }
 
     fn lower_stmt(&mut self, stmt: &Stmt, module_level: bool) {
@@ -1719,6 +2087,18 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 iterable,
                 body,
             } => self.lower_for(name, iterable, body),
+            StmtKind::Defer { body, error_only, error_binding } => {
+                self.lower_defer(body, *error_only, error_binding.as_ref())
+            },
+            StmtKind::Try {
+                body,
+                catch,
+                finally_branch,
+            } => self.lower_try(body, catch.as_ref(), finally_branch.as_deref()),
+            StmtKind::Throw(value) => {
+                let error = self.lower_expr(value);
+                self.builder.emit0(Inst::FiberAbort { error });
+            }
             StmtKind::Break => self.lower_break(stmt.span),
             StmtKind::Continue => self.lower_continue(stmt.span),
             StmtKind::Return(value) => self.lower_return(value.as_ref(), stmt.span),
@@ -1840,8 +2220,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_if(&mut self, condition: &Expr, then_stmt: &Stmt, else_stmt: Option<&Stmt>) {
         let condition = self.lower_expr(condition);
-        let then_block = self.builder.new_block(&[]);
-        let else_block = self.builder.new_block(&[]);
+        let then_block = self.new_block(&[]);
+        let else_block = self.new_block(&[]);
         self.builder
             .branch(condition, then_block, Vec::new(), else_block, Vec::new());
 
@@ -1850,7 +2230,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
         self.builder.position_at(then_block);
         self.env = incoming.clone();
-        self.lower_stmt(then_stmt, false);
+        self.lower_scoped_stmt(then_stmt);
         if !self.current_terminated() {
             predecessors.push((self.builder.current_block(), self.env.clone()));
         }
@@ -1858,7 +2238,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.builder.position_at(else_block);
         self.env = incoming.clone();
         if let Some(else_stmt) = else_stmt {
-            self.lower_stmt(else_stmt, false);
+            self.lower_scoped_stmt(else_stmt);
         }
         if !self.current_terminated() {
             predecessors.push((self.builder.current_block(), self.env.clone()));
@@ -1878,7 +2258,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
             1 => {
                 let (block, env) = predecessors.into_iter().next().unwrap();
-                let join = self.builder.new_block(&[]);
+                let join = self.new_block(&[]);
                 self.builder.position_at(block);
                 self.builder.jump(join, Vec::new());
                 self.builder.seal_block(join);
@@ -1886,7 +2266,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 self.env = env;
             }
             _ => {
-                let join = self.builder.new_block(&[]);
+                let join = self.new_block(&[]);
                 let mut merged = fallback.clone();
                 let mut params = Vec::new();
 
@@ -1932,14 +2312,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let carried = self.loop_carried_bindings(condition, body);
         let preheader_env = self.env.clone();
 
-        let header = self.builder.new_block(&[]);
+        let header = self.new_block(&[]);
         let mut header_params = HashMap::new();
         for binding in &carried {
             let param = self.builder.add_block_param(header, Type::Top);
             header_params.insert(*binding, param);
         }
-        let body_block = self.builder.new_block(&[]);
-        let exit = self.builder.new_block(&[]);
+        let body_block = self.new_block(&[]);
+        let exit = self.new_block(&[]);
         let mut exit_params = HashMap::new();
         for binding in &carried {
             let param = self.builder.add_block_param(exit, Type::Top);
@@ -1968,8 +2348,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             break_target: exit,
             carried: carried.clone(),
             continue_prefix: Vec::new(),
+            exit_action_depth: self.exit_actions.len(),
         });
-        self.lower_stmt(body, false);
+        self.lower_scoped_stmt(body);
         self.loops.pop();
         if !self.current_terminated() {
             let back_args = self.values_for_bindings(&carried, &self.env);
@@ -1990,14 +2371,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let base_env = self.env.clone();
         let iterator_initial = self.builder.const_null();
 
-        let header = self.builder.new_block(&[]);
+        let header = self.new_block(&[]);
         let iterator_param = self.builder.add_block_param(header, Type::Top);
         let mut header_params = HashMap::new();
         for binding in &carried {
             header_params.insert(*binding, self.builder.add_block_param(header, Type::Top));
         }
-        let body_block = self.builder.new_block(&[]);
-        let exit = self.builder.new_block(&[]);
+        let body_block = self.new_block(&[]);
+        let exit = self.new_block(&[]);
         let mut exit_params = HashMap::new();
         for binding in &carried {
             exit_params.insert(*binding, self.builder.add_block_param(exit, Type::Top));
@@ -2042,8 +2423,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             break_target: exit,
             carried: carried.clone(),
             continue_prefix: vec![iterator],
+            exit_action_depth: self.exit_actions.len(),
         });
-        self.lower_stmt(body, false);
+        self.lower_scoped_stmt(body);
         self.loops.pop();
         if !self.current_terminated() {
             let mut back = vec![iterator];
@@ -2060,25 +2442,48 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     }
 
     fn lower_break(&mut self, span: Span) {
+        if self.in_cleanup != 0 {
+            self.error("WREN-L041", "`break` is not allowed inside defer/finally cleanup", span);
+            self.builder.emit0(Inst::Unreachable);
+            return;
+        }
         let Some(loop_context) = self.loops.last().cloned() else {
             self.error("WREN-L014", "'break' used outside a loop", span);
             return;
         };
+        self.emit_exit_actions_from(loop_context.exit_action_depth);
+        if self.current_terminated() {
+            return;
+        }
         let args = self.values_for_bindings(&loop_context.carried, &self.env);
         self.builder.jump(loop_context.break_target, args);
     }
 
     fn lower_continue(&mut self, span: Span) {
+        if self.in_cleanup != 0 {
+            self.error("WREN-L042", "`continue` is not allowed inside defer/finally cleanup", span);
+            self.builder.emit0(Inst::Unreachable);
+            return;
+        }
         let Some(loop_context) = self.loops.last().cloned() else {
             self.error("WREN-L015", "'continue' used outside a loop", span);
             return;
         };
+        self.emit_exit_actions_from(loop_context.exit_action_depth);
+        if self.current_terminated() {
+            return;
+        }
         let mut args = loop_context.continue_prefix;
         args.extend(self.values_for_bindings(&loop_context.carried, &self.env));
         self.builder.jump(loop_context.continue_target, args);
     }
 
     fn lower_return(&mut self, value: Option<&Expr>, span: Span) {
+        if self.in_cleanup != 0 {
+            self.error("WREN-L043", "`return` is not allowed inside defer/finally cleanup", span);
+            self.builder.emit0(Inst::Unreachable);
+            return;
+        }
         if let Some(instance) = self.constructor_this {
             if value.is_some() {
                 self.error(
@@ -2087,13 +2492,19 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     span,
                 );
             }
-            self.builder.ret(instance);
+            self.emit_exit_actions_from(0);
+            if !self.current_terminated() {
+                self.builder.ret(instance);
+            }
             return;
         }
         let value = value
             .map(|expr| self.lower_expr(expr))
             .unwrap_or_else(|| self.builder.const_null());
-        self.builder.ret(value);
+        self.emit_exit_actions_from(0);
+        if !self.current_terminated() {
+            self.builder.ret(value);
+        }
     }
 
     fn loop_carried_bindings(&self, condition: &Expr, body: &Stmt) -> Vec<BindingId> {
@@ -2395,9 +2806,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_logical(&mut self, left: &Expr, operator: LogicalOp, right: &Expr) -> ValueId {
         let left_value = self.lower_expr(left);
-        let rhs_block = self.builder.new_block(&[]);
-        let short_block = self.builder.new_block(&[]);
-        let join = self.builder.new_block(&[]);
+        let rhs_block = self.new_block(&[]);
+        let short_block = self.new_block(&[]);
+        let join = self.new_block(&[]);
         let result_param = self.builder.add_block_param(join, Type::Top);
         let incoming = self.env.clone();
 
@@ -2469,9 +2880,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_conditional(&mut self, condition: &Expr, then_expr: &Expr, else_expr: &Expr) -> ValueId {
         let condition = self.lower_expr(condition);
-        let then_block = self.builder.new_block(&[]);
-        let else_block = self.builder.new_block(&[]);
-        let join = self.builder.new_block(&[]);
+        let then_block = self.new_block(&[]);
+        let else_block = self.new_block(&[]);
+        let join = self.new_block(&[]);
         let result_param = self.builder.add_block_param(join, Type::Top);
         self.builder
             .branch(condition, then_block, Vec::new(), else_block, Vec::new());
@@ -2834,8 +3245,18 @@ fn collect_class_declarations<'a>(statements: &'a [Stmt], out: &mut Vec<(&'a Cla
                         walk(std::slice::from_ref(else_branch.as_ref()), out, false);
                     }
                 }
-                StmtKind::While { body, .. } | StmtKind::For { body, .. } => {
+                StmtKind::While { body, .. } | StmtKind::For { body, .. }
+                | StmtKind::Defer { body, .. } => {
                     walk(std::slice::from_ref(body.as_ref()), out, false)
+                }
+                StmtKind::Try { body, catch, finally_branch } => {
+                    walk(std::slice::from_ref(body.as_ref()), out, false);
+                    if let Some(catch) = catch {
+                        walk(std::slice::from_ref(catch.body.as_ref()), out, false);
+                    }
+                    if let Some(finally_branch) = finally_branch {
+                        walk(std::slice::from_ref(finally_branch.as_ref()), out, false);
+                    }
                 }
                 _ => {}
             }
@@ -2877,6 +3298,13 @@ fn collect_fields_stmt<'a>(stmt: &'a Stmt, instance: &mut SmallVec<[&'a str; 8]>
             }
         }
         StmtKind::Class(_) | StmtKind::Import(_) | StmtKind::Break | StmtKind::Continue => {}
+        StmtKind::Defer { body, .. } => collect_fields_stmt(body, instance, statics),
+        StmtKind::Try { body, catch, finally_branch } => {
+            collect_fields_stmt(body, instance, statics);
+            if let Some(catch) = catch { collect_fields_stmt(&catch.body, instance, statics); }
+            if let Some(finally_branch) = finally_branch { collect_fields_stmt(finally_branch, instance, statics); }
+        }
+        StmtKind::Throw(value) => collect_fields_expr(value, instance, statics),
         StmtKind::Block(statements) => {
             for statement in statements {
                 collect_fields_stmt(statement, instance, statics)
@@ -3019,6 +3447,13 @@ fn collect_method_keys_stmt(stmt: &Stmt, out: &mut HashSet<MethodKey>) {
             }
         }
         StmtKind::Import(_) | StmtKind::Break | StmtKind::Continue => {}
+        StmtKind::Defer { body, .. } => collect_method_keys_stmt(body, out),
+        StmtKind::Try { body, catch, finally_branch } => {
+            collect_method_keys_stmt(body, out);
+            if let Some(catch) = catch { collect_method_keys_stmt(&catch.body, out); }
+            if let Some(finally_branch) = finally_branch { collect_method_keys_stmt(finally_branch, out); }
+        }
+        StmtKind::Throw(value) => collect_method_keys_expr(value, out),
         StmtKind::Block(statements) => collect_method_keys_in_statements(statements, out),
         StmtKind::If {
             condition,
@@ -3232,6 +3667,13 @@ fn collect_strings_stmt(stmt: &Stmt, out: &mut Vec<Vec<u8>>) {
             }
         }
         StmtKind::Import(_) | StmtKind::Break | StmtKind::Continue => {}
+        StmtKind::Defer { body, .. } => collect_strings_stmt(body, out),
+        StmtKind::Try { body, catch, finally_branch } => {
+            collect_strings_stmt(body, out);
+            if let Some(catch) = catch { collect_strings_stmt(&catch.body, out); }
+            if let Some(finally_branch) = finally_branch { collect_strings_stmt(finally_branch, out); }
+        }
+        StmtKind::Throw(value) => collect_strings_expr(value, out),
         StmtKind::Block(statements) => collect_strings_in_statements(statements, out),
         StmtKind::If {
             condition,
@@ -3358,8 +3800,18 @@ fn collect_import_strings(statements: &[Stmt], out: &mut Vec<String>) {
                     collect_import_strings(std::slice::from_ref(else_branch.as_ref()), out)
                 }
             }
-            StmtKind::While { body, .. } | StmtKind::For { body, .. } => {
+            StmtKind::While { body, .. } | StmtKind::For { body, .. }
+            | StmtKind::Defer { body, .. } => {
                 collect_import_strings(std::slice::from_ref(body.as_ref()), out)
+            }
+            StmtKind::Try { body, catch, finally_branch } => {
+                collect_import_strings(std::slice::from_ref(body.as_ref()), out);
+                if let Some(catch) = catch {
+                    collect_import_strings(std::slice::from_ref(catch.body.as_ref()), out);
+                }
+                if let Some(finally_branch) = finally_branch {
+                    collect_import_strings(std::slice::from_ref(finally_branch.as_ref()), out);
+                }
             }
             _ => {}
         }
@@ -3383,6 +3835,13 @@ fn collect_written_bindings_stmt(
             }
         }
         StmtKind::Import(_) | StmtKind::Break | StmtKind::Continue => {}
+        StmtKind::Defer { body, .. } => collect_written_bindings_stmt(body, analysis, out),
+        StmtKind::Try { body, catch, finally_branch } => {
+            collect_written_bindings_stmt(body, analysis, out);
+            if let Some(catch) = catch { collect_written_bindings_stmt(&catch.body, analysis, out); }
+            if let Some(finally_branch) = finally_branch { collect_written_bindings_stmt(finally_branch, analysis, out); }
+        }
+        StmtKind::Throw(value) => collect_written_bindings_expr(value, analysis, out),
         StmtKind::Block(statements) => {
             for statement in statements {
                 collect_written_bindings_stmt(statement, analysis, out)

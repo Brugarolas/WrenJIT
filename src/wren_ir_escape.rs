@@ -29,6 +29,10 @@
 //!
 //! Allocations referenced by deoptimization snapshots are never virtualized
 //! because WIR has no rematerialization metadata for deopt yet.
+//! Protected throwing points pin only allocations live across those points;
+//! allocations outside that lifetime retain ordinary PEA/SROA, including in
+//! handlers. Pinned objects keep their original allocation and stores, so a
+//! handler observes the exact pre-throw state without virtual-object metadata.
 
 #![allow(dead_code)]
 
@@ -165,6 +169,17 @@ impl Cfg {
                 let target = edge.target.0 as usize;
                 if target < n && !succs[ix].contains(&target) {
                     succs[ix].push(target);
+                }
+            }
+        }
+
+        // Keep handlers and their successors reachable. These edges are used for
+        // dominance/liveness only: virtual state must never flow through them.
+        for region in &function.exception_regions {
+            for block in &region.protected_blocks {
+                let succ = &mut succs[block.0 as usize];
+                if !succ.contains(&(region.handler.0 as usize)) {
+                    succ.push(region.handler.0 as usize);
                 }
             }
         }
@@ -683,7 +698,9 @@ impl Analysis {
             .iter()
             .enumerate()
             .map(|(index, candidate)| {
-                if !valid[index] || candidate.slots.len() > MAX_FIELDS {
+                if !valid[index] || candidate.slots.len() > MAX_FIELDS
+                    || crosses_exception(function, &cfg, candidate, &uses[index])
+                {
                     Plan::default()
                 } else {
                     analyze_candidate(&cfg, candidate, &uses[index])
@@ -698,6 +715,64 @@ impl Analysis {
             plans,
         }
     }
+}
+
+/// Until exceptional snapshots can encode virtual objects, keep *this*
+/// allocation materialized if its lifetime crosses a protected throwing point.
+/// Backward liveness includes handlers and loop backedges and kills at the
+/// allocation, so an unrelated try, dead object, or post-throw allocation does
+/// not disable scalar replacement. Escaping aliases are already materialized by
+/// the ordinary PEA use classification.
+fn crosses_exception(
+    function: &Function,
+    cfg: &Cfg,
+    candidate: &Candidate,
+    uses: &HashMap<usize, Vec<Use>>,
+) -> bool {
+    if function.exception_regions.is_empty() {
+        return false;
+    }
+    let mut handlers = vec![Vec::new(); function.blocks.len()];
+    for region in &function.exception_regions {
+        for block in &region.protected_blocks {
+            handlers[block.0 as usize].push(region.handler.0 as usize);
+        }
+    }
+    let mut live_in = vec![false; function.blocks.len()];
+    loop {
+        let mut changed = false;
+        for &block in cfg.rpo.iter().rev() {
+            let live = block != candidate.block
+                && (uses.get(&block).is_some_and(|u| !u.is_empty())
+                    || cfg.succs[block].iter().any(|&s| live_in[s]));
+            changed |= live && !live_in[block];
+            live_in[block] |= live;
+        }
+        if !changed { break; }
+    }
+    for &block in &cfg.rpo {
+        if handlers[block].is_empty()
+            || !(block == candidate.block || cfg.strictly_dominates(candidate.block, block))
+        {
+            continue;
+        }
+        let mut live = cfg.succs[block].iter().any(|&s| live_in[s]);
+        for (pos, &inst) in function.blocks[block].insts.iter().enumerate().rev() {
+            if block == candidate.block && pos <= candidate.pos { break; }
+            let own_use = uses.get(&block).and_then(|u| u.iter().find(|u| u.pos == pos));
+            live |= own_use.is_some();
+            // Accesses proved valid on the virtual candidate cannot throw. A
+            // failing/dynamic collection access is an Escape and is retained.
+            let virtual_access = own_use.is_some_and(|u| matches!(u.op,
+                UseOp::LoadField(_) | UseOp::StoreField(_) | UseOp::LoadCell
+                | UseOp::StoreCell | UseOp::ListLen | UseOp::WriteBarrier
+                | UseOp::RefEq | UseOp::BranchCond));
+            if live && !virtual_access && function.nodes[inst.0 as usize].kind.may_throw() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 struct BlockSummary {
@@ -1588,6 +1663,48 @@ mod tests {
         let mut program = Program::new();
         let module = program.add_module("main", 0);
         (program, module)
+    }
+
+    #[test]
+    fn exceptional_liveness_pins_only_the_object_crossing_the_throw() {
+        let (mut program, module) = new_program();
+        let mut b = Builder::new(&mut program, module, "exceptions", FunctionKind::ModuleBody, vec![Type::Num], Type::Top);
+        let input = b.param(0);
+        let index = b.emit1(Inst::NumToInt32 { value: input }, Type::Int32);
+        let one = b.const_num(1.0);
+        let crossing = b.alloc_cell(one, Type::Num);
+        let body = b.new_block(&[]);
+        let handler = b.new_block(&[Type::Top]);
+        let error = b.block_param(handler, 0);
+        b.jump(body, vec![]);
+        b.position_at(body);
+        let dead_before_throw = b.alloc_cell(one, Type::Num);
+        let before = b.load_cell(dead_before_throw, Type::Num);
+        let list = b.emit1(Inst::AllocList { capacity: None }, Type::List(None));
+        b.emit0(Inst::ListAppend { list, value: before });
+        b.emit1(Inst::ListGet { list, index }, Type::Top);
+        let two = b.const_num(2.0);
+        b.store_cell(crossing, two);
+        let after_throw = b.alloc_cell(two, Type::Num);
+        let after = b.load_cell(after_throw, Type::Num);
+        b.ret(after);
+        b.position_at(handler);
+        let caught = b.load_cell(crossing, Type::Num);
+        let handler_local = b.alloc_cell(caught, Type::Num);
+        let result = b.load_cell(handler_local, Type::Num);
+        b.ret(result);
+        b.add_exception_region(vec![body], handler, error, 0);
+        let entry = b.finish();
+        let stats = sroa(&mut program, entry);
+        assert_eq!(stats.removed_allocations, 3);
+        assert_eq!(count(program.function(entry).unwrap(), |i| matches!(i, Inst::AllocCell { .. })), 1);
+        let bytecode = BytecodeCompiler::default().compile(&program).unwrap();
+        for (index, expected) in [(0, 2.0), (3, 1.0)] {
+            let mut vm = Interpreter::new(&bytecode).unwrap();
+            vm.set_jit_options(None);
+            let ExecutionResult::Returned(value) = vm.run_function(entry, &[crate::wren_interpreter::Value::from_num(index as f64)]).unwrap() else { panic!("expected return") };
+            assert_eq!(value.as_num(), Some(expected));
+        }
     }
 
     /// cell = Cell(1); if (p) cell = 2 else cell = 3; loop 3 times cell = cell + cell

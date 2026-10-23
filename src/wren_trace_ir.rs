@@ -35,7 +35,7 @@ pub enum TraceConstant {
     Null, Bool(bool), NumBits(u64), Int32(i32), F64Bits(u64), String(StringId), BuiltinClass(BuiltinId),
 }
 impl TraceConstant {
-    fn layout(self) -> (TraceType, TraceRep) {
+    pub(crate) fn layout(self) -> (TraceType, TraceRep) {
         match self {
             Self::Null => (TraceType::Null, TraceRep::Tagged),
             Self::Bool(_) => (TraceType::Bool, TraceRep::Tagged),
@@ -85,6 +85,8 @@ pub enum TraceInst {
     GuardType { value: TraceValueId, expected: TraceType, exit: SideExitId },
     /// Runtime class keys in the stable heap sidecar (independent of Rust layout).
     GuardClass { value: TraceValueId, classes: Vec<u64>, exit: SideExitId },
+    /// Method-table version captured by speculative inlining/devirtualization.
+    GuardMethodEpoch { expected: u64, exit: SideExitId },
     IntUnary { op: IntUnaryOp, value: TraceValueId },
     IntBinary { op: IntBinOp, lhs: TraceValueId, rhs: TraceValueId },
     IntBinaryChecked { op: IntBinOp, lhs: TraceValueId, rhs: TraceValueId, exit: SideExitId },
@@ -136,7 +138,7 @@ impl TraceInst {
     pub fn visit_operands(&mut self, mut f: impl FnMut(&mut TraceValueId)) {
         use TraceInst::*;
         match self {
-            Nop | LoadFrameSlot { .. } | Runtime { .. } => {},
+            Nop | LoadFrameSlot { .. } | Runtime { .. } | GuardMethodEpoch { .. } => {},
             Copy { value } | Reinterpret { value } | CommitFrameSlot { value, .. } | GuardTruthy { value, .. }
             | GuardFalsey { value, .. } | GuardNotNull { value, .. } | GuardF64 { value, .. }
             | GuardInt32 { value, .. } | GuardUInt32 { value, .. } | GuardType { value, .. } | GuardClass { value, .. } | IntUnary { value, .. }
@@ -185,7 +187,7 @@ impl TraceInst {
     pub fn exit(&self) -> Option<SideExitId> {
         use TraceInst::*;
         match self {
-            GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
+            GuardMethodEpoch { exit, .. } | GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
             | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. } | GuardType { exit, .. } | GuardClass { exit, .. }
             | GuardBounds { exit, .. } | GuardSwitch { exit, .. } | GuardEq { exit, .. }
             | IntBinaryChecked { exit, .. } | F64ToInt32 { exit, .. } | TaggedToHeapHandle { exit, .. }
@@ -196,6 +198,37 @@ impl TraceInst {
             | HeapMapSetShaped { exit, .. } | HeapStringLen { exit, .. }
             | HeapAwaitFulfilled { exit, .. } => Some(*exit),
             _ => None,
+        }
+    }
+
+    /// Pure checks permitted at entry with a fresh anchor snapshot. Heap class
+    /// identity is stable in a native trace without runtime/GC synchronization.
+    pub fn is_entry_guard(&self) -> bool {
+        matches!(self, Self::GuardMethodEpoch { .. } | Self::GuardTruthy { .. } | Self::GuardFalsey { .. }
+            | Self::GuardNotNull { .. } | Self::GuardType { .. } | Self::GuardClass { .. }
+            | Self::GuardBounds { .. } | Self::GuardEq { .. } | Self::GuardSwitch { .. }
+            | Self::GuardF64 { .. } | Self::GuardInt32 { .. } | Self::GuardUInt32 { .. })
+    }
+
+    pub fn is_heap_read(&self) -> bool {
+        matches!(self, Self::HeapLoadField { .. } | Self::HeapLoadCell { .. }
+            | Self::HeapListLen { .. } | Self::HeapListGet { .. }
+            | Self::HeapMapLen { .. } | Self::HeapMapGetShaped { .. }
+            | Self::HeapStringLen { .. })
+    }
+
+    pub fn set_exit(&mut self, new: SideExitId) {
+        use TraceInst::*;
+        match self {
+            GuardMethodEpoch { exit, .. } | GuardTruthy { exit, .. } | GuardFalsey { exit, .. } | GuardNotNull { exit, .. }
+            | GuardF64 { exit, .. } | GuardInt32 { exit, .. } | GuardUInt32 { exit, .. }
+            | GuardType { exit, .. } | GuardClass { exit, .. } | GuardBounds { exit, .. }
+            | GuardEq { exit, .. } | GuardSwitch { exit, .. }
+            | HeapLoadField { exit, .. } | HeapLoadCell { exit, .. }
+            | HeapListLen { exit, .. } | HeapListGet { exit, .. }
+            | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. }
+            | HeapStringLen { exit, .. } => *exit = new,
+            _ => panic!("instruction does not support entry exit replacement"),
         }
     }
 }
@@ -257,6 +290,20 @@ pub struct TraceStats {
     pub gvn_eliminated: usize,
     pub licm_hoisted: usize,
     pub pre_eliminated: usize,
+    pub sccp_folded: usize,
+    pub simplified_inductions: usize,
+    pub strength_reduced: usize,
+    pub eliminated_bounds_checks: usize,
+    pub eliminated_overflow_checks: usize,
+    pub hoisted_guards: usize,
+    pub unswitched_guards: usize,
+    pub forwarded_loads: usize,
+    pub eliminated_stores: usize,
+    pub loop_loads_reused: usize,
+    pub inlined_calls: usize,
+    pub devirtualized_calls: usize,
+    pub peephole_simplified: usize,
+    pub redundant_guards: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Trace {
@@ -547,7 +594,12 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
             continue;
         };
         if std::mem::replace(&mut preheader[id], true) { errors.push("duplicate preheader node".into()); }
-        if !node.kind.is_speculatable() && !matches!(node.kind, TraceInst::Nop) {
+        let entry_guard = (node.kind.is_entry_guard() || node.kind.is_heap_read()) && node.kind.exit().is_some_and(|id| {
+            t.exits.get(id.0 as usize).is_some_and(|exit|
+                matches!(exit.target, ExitTarget::Interpreter(location) if location == t.anchor.location)
+                && exit.frames.iter().all(|frame| frame.writes.is_empty()))
+        });
+        if !node.kind.is_speculatable() && !entry_guard && !matches!(node.kind, TraceInst::Nop) {
             errors.push("preheader operation may have effects or trap".into());
         }
         check_node(id, &mut available, &mut errors);
