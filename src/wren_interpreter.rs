@@ -5370,9 +5370,7 @@ impl<'p> Interpreter<'p> {
         } else {
             self.fibers.len() as u32
         };
-        if let PromiseState::Pending { cancel, .. } = unsafe { self.promise_cell(promise)?.get_mut() } {
-            *cancel = Some(CancelHandle::Task(id));
-        }
+        self.set_promise_cancel_handle(promise, Some(CancelHandle::Task(id)))?;
         let mut task_state = FiberState::new(Value::NULL, FiberStatus::Ready);
         task_state.async_promise = Some(promise);
         let task = Arc::new(FiberCell::new(task_state));
@@ -7347,13 +7345,13 @@ impl Interpreter<'_> {
             NativeBuiltin::SystemOs => {
                 self.mark_gc_point(op);
                 self.maybe_collect();
-                let value = self.allocate_string(std::env::consts::OS);
+                let value = HostContext { heap: &mut self.heap }.allocate_string(std::env::consts::OS);
                 unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
             }
             NativeBuiltin::SystemArch => {
                 self.mark_gc_point(op);
                 self.maybe_collect();
-                let value = self.allocate_string(std::env::consts::ARCH);
+                let value = HostContext { heap: &mut self.heap }.allocate_string(std::env::consts::ARCH);
                 unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
             }
             NativeBuiltin::SystemGc => {
@@ -8933,11 +8931,26 @@ impl TraceRuntime for Interpreter<'_> {
 
     fn trace_method_epoch(&self) -> u64 { self.method_epoch }
 
-    fn trace_inline_target(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<(FuncId, u64)> {
+    fn trace_inline_target(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<(FuncId, Vec<u64>)> {
         let class = self.heap.receiver_class(Value::from_word(receiver))?;
-        let cache = self.program.function(function)?.chunk.inline_caches.get(cache as usize)?;
-        let CallTarget::Bytecode(index) = self.lookup_method(class, cache.method, None)? else { return None };
-        Some((self.prepared.functions.get(index as usize)?.id, class.0))
+        let descriptor = self.program.function(function)?.chunk.inline_caches.get(cache as usize)?;
+        let target = self.lookup_method(class, descriptor.method, None)?;
+        let CallTarget::Bytecode(index) = target else { return None };
+        let mut classes = vec![class.0];
+        let function_index = *self.prepared.function_by_id.get(&function)? as usize;
+        let cache = self.inline_caches.get(function_index)?.get(cache as usize)?;
+        if !cache.megamorphic {
+            for entry in &cache.entries[..cache.len as usize] {
+                // Recheck the method table: a stale PIC must not authorize an
+                // inlined call to a different target.
+                if classes.len() < 4 && !classes.contains(&entry.class.0)
+                    && entry.target == target
+                    && self.lookup_method(entry.class, descriptor.method, None) == Some(target) {
+                    classes.push(entry.class.0);
+                }
+            }
+        }
+        Some((self.prepared.functions.get(index as usize)?.id, classes))
     }
 
     fn trace_standard_numeric_method(&self, function: FuncId, cache: u32) -> bool {
