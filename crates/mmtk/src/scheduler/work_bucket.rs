@@ -1,0 +1,538 @@
+use super::worker_monitor::WorkerMonitor;
+use super::*;
+use crate::vm::VMBinding;
+use crossbeam::deque::{Injector, Steal, Worker};
+use enum_map::Enum;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+pub(super) struct BucketQueue<VM: VMBinding> {
+    flag: AtomicBool,
+    queue0: Injector<Box<dyn GCWork<VM>>>,
+    queue1: Injector<Box<dyn GCWork<VM>>>,
+}
+
+impl<VM: VMBinding> BucketQueue<VM> {
+    fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            queue0: Injector::new(),
+            queue1: Injector::new(),
+        }
+    }
+
+    fn active_queue(&self) -> &Injector<Box<dyn GCWork<VM>>> {
+        if self.flag.load(Ordering::Relaxed) {
+            &self.queue1
+        } else {
+            &self.queue0
+        }
+    }
+
+    fn inactive_queue(&self) -> &Injector<Box<dyn GCWork<VM>>> {
+        if self.flag.load(Ordering::Relaxed) {
+            &self.queue0
+        } else {
+            &self.queue1
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.active_queue().is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.active_queue().len()
+    }
+
+    pub(super) fn steal(&self) -> Steal<Box<dyn GCWork<VM>>> {
+        self.active_queue().steal()
+    }
+
+    fn steal_batch_and_pop(
+        &self,
+        dest: &Worker<Box<dyn GCWork<VM>>>,
+    ) -> Steal<Box<dyn GCWork<VM>>> {
+        self.active_queue().steal_batch_and_pop(dest)
+    }
+
+    fn push(&self, w: Box<dyn GCWork<VM>>) {
+        self.active_queue().push(w);
+    }
+
+    fn push_all(&self, ws: Vec<Box<dyn GCWork<VM>>>) {
+        for w in ws {
+            self.active_queue().push(w);
+        }
+    }
+
+    fn push_inactive(&self, w: Box<dyn GCWork<VM>>) {
+        self.inactive_queue().push(w);
+    }
+
+    fn push_all_inactive(&self, ws: Vec<Box<dyn GCWork<VM>>>) {
+        for w in ws {
+            self.inactive_queue().push(w);
+        }
+    }
+
+    /// Remove and return every packet currently in this queue, leaving it empty.
+    fn drain(&self) -> Vec<Box<dyn GCWork<VM>>> {
+        let mut items = Vec::new();
+        loop {
+            match self.queue0.steal() {
+                Steal::Success(w) => items.push(w),
+                Steal::Retry => continue,
+                Steal::Empty => break,
+            }
+        }
+        loop {
+            match self.queue1.steal() {
+                Steal::Success(w) => items.push(w),
+                Steal::Retry => continue,
+                Steal::Empty => break,
+            }
+        }
+        items
+    }
+
+    /// Dump all the packets in this queue for debugging purpose.
+    /// This function may dump items from the queue temporarily, thus should only be called when it is safe to do so
+    /// (e.g. when the execution has failed already and the system is going to panic).
+    pub fn debug_dump_packets(&self) -> Vec<String> {
+        let mut items = Vec::new();
+        let queue = self.active_queue();
+
+        {
+            // Drain queue by stealing until empty
+            loop {
+                match queue.steal() {
+                    crossbeam::deque::Steal::Success(work) => {
+                        items.push(work);
+                    }
+                    crossbeam::deque::Steal::Retry => continue,
+                    crossbeam::deque::Steal::Empty => break,
+                }
+            }
+        }
+
+        // Format collected items (just type names or Debug, depending on GCWork)
+        let debug_items: Vec<String> = items
+            .iter()
+            .map(|i| i.get_type_name().to_string()) // placeholder since GCWork isn’t Debug
+            .collect();
+
+        // Push items back into the queue
+        {
+            for work in items {
+                queue.push(work);
+            }
+        }
+
+        debug_items
+    }
+}
+
+pub type BucketOpenCondition<VM> = Box<dyn (Fn(&GCWorkScheduler<VM>) -> bool) + Send>;
+
+pub struct WorkBucket<VM: VMBinding> {
+    /// Whether this bucket has been opened. Work from an open bucket can be fetched by workers.
+    open: AtomicBool,
+    /// Whether this bucket is enabled.
+    /// A disabled work bucket will behave as if it does not exist in terms of scheduling,
+    /// except that users can add work to a disabled bucket, and enable it later to allow those
+    /// work to be scheduled.
+    enabled: AtomicBool,
+    /// The stage name of this bucket.
+    stage: WorkBucketStage,
+    queue: BucketQueue<VM>,
+    monitor: Arc<WorkerMonitor>,
+    /// The open condition for a bucket. If this is `Some`, the bucket will be open
+    /// when the condition is met. If this is `None`, the bucket needs to be open manually.
+    can_open: Option<BucketOpenCondition<VM>>,
+    /// After this bucket is open and all pending work packets (including the packets in this
+    /// bucket) are drained, this work packet, if exists, will be added to this bucket.  When this
+    /// happens, it will prevent opening subsequent work packets.
+    ///
+    /// The sentinel work packet may set another work packet as the new sentinel which will be
+    /// added to this bucket again after all pending work packets are drained.  This may happend
+    /// again and again, causing the GC to stay at the same stage and drain work packets in a loop.
+    ///
+    /// This is useful for handling weak references that may expand the transitive closure
+    /// recursively, such as ephemerons and Java-style SoftReference and finalizers.  Sentinels
+    /// can be used repeatedly to discover and process more such objects.
+    sentinel: Mutex<Option<Box<dyn GCWork<VM>>>>,
+}
+
+impl<VM: VMBinding> WorkBucket<VM> {
+    pub(crate) fn new(stage: WorkBucketStage, monitor: Arc<WorkerMonitor>) -> Self {
+        Self {
+            open: AtomicBool::new(stage.is_open_by_default()),
+            enabled: AtomicBool::new(stage.is_enabled_by_default()),
+            stage,
+            queue: BucketQueue::new(),
+            monitor,
+            can_open: None,
+            sentinel: Mutex::new(None),
+        }
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst)
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn flip(&self) {
+        self.queue.flag.fetch_xor(true, Ordering::SeqCst);
+    }
+
+    fn notify_one_worker(&self) {
+        // If the bucket is not open, don't notify anyone.
+        if !self.is_open() || !self.is_enabled() {
+            return;
+        }
+        // Notify one if there're any parked workers.
+        self.monitor.notify_work_available(false);
+    }
+
+    pub fn notify_all_workers(&self) {
+        // If the bucket is not open, don't notify anyone.
+        if !self.is_open() || !self.is_enabled() {
+            return;
+        }
+        // Notify all if there're any parked workers.
+        self.monitor.notify_work_available(true);
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    /// Open the bucket
+    pub fn open(&self) {
+        self.open.store(true, Ordering::SeqCst);
+    }
+
+    /// Test if the bucket is drained
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn is_drained(&self) -> bool {
+        !self.is_enabled() || (self.is_open() && self.is_empty())
+    }
+
+    /// Remove and return every packet currently queued in this bucket (including the
+    /// prioritized queue, if any), leaving it empty.
+    ///
+    /// This does not synchronize with producers or consumers of this bucket in any way: the
+    /// caller must independently ensure that nothing can be concurrently adding to or polling
+    /// this bucket (e.g. by only calling this once all GC workers are known to be parked, and
+    /// after disabling the bucket so no new packets can be routed to it, as
+    /// `ConcurrentImmix::schedule_concurrent_marking_final_pause` does for `Concurrent`).
+    pub(crate) fn drain_all_packets(&self) -> Vec<Box<dyn GCWork<VM>>> {
+        self.queue.drain()
+    }
+
+    /// Close the bucket
+    pub fn close(&self) {
+        debug_assert!(
+            self.queue.is_empty(),
+            "Bucket {:?} not drained before close",
+            self.stage
+        );
+        self.open.store(false, Ordering::Relaxed);
+    }
+
+    fn warn_notify_add_if_disabled(&self) {
+        #[cfg(debug_assertions)]
+        if !self.is_enabled() {
+            // This is usually benign if it happens occasionally. But if we keep adding work to a disabled bucket,
+            // we keep waking up workers for new work that they can't work on.
+            warn!(
+                "Add a work to a disabled bucket with notifying one worker {:?}",
+                self.stage
+            );
+        }
+    }
+
+    /// Add a work packet to this bucket
+    pub fn add<W: GCWork<VM>>(&self, work: W) {
+        self.warn_notify_add_if_disabled();
+        self.queue.push(Box::new(work));
+        self.notify_one_worker();
+    }
+
+    /// Add a work packet to this bucket
+    pub fn add_boxed(&self, work: Box<dyn GCWork<VM>>) {
+        self.warn_notify_add_if_disabled();
+        self.queue.push(work);
+        self.notify_one_worker();
+    }
+
+    pub fn add_deferred(&self, work: Box<dyn GCWork<VM>>) {
+        self.queue.push_inactive(work);
+    }
+
+    pub fn bulk_add_deferred(&self, work_vec: Vec<Box<dyn GCWork<VM>>>) {
+        self.queue.push_all_inactive(work_vec);
+    }
+
+    /// Add a work packet to this bucket, but do not notify any workers.
+    /// This is useful when the current thread is holding the mutex of `WorkerMonitor` which is
+    /// used for notifying workers.  This usually happens if the current thread is the last worker
+    /// parked.
+    pub(crate) fn add_no_notify<W: GCWork<VM>>(&self, work: W) {
+        self.queue.push(Box::new(work));
+    }
+
+    /// Like [`WorkBucket::add_no_notify`], but the work is boxed.
+    pub(crate) fn add_boxed_no_notify(&self, work: Box<dyn GCWork<VM>>) {
+        self.queue.push(work);
+    }
+
+    /// Add multiple packets
+    pub fn bulk_add(&self, work_vec: Vec<Box<dyn GCWork<VM>>>) {
+        debug_assert!(self.is_enabled());
+        if work_vec.is_empty() {
+            return;
+        }
+        let len = work_vec.len();
+        self.queue.push_all(work_vec);
+        if self.is_open() {
+            if len == 1 {
+                self.notify_one_worker();
+            } else {
+                self.notify_all_workers();
+            }
+        }
+    }
+
+    /// Get a work packet from this bucket
+    pub fn poll(&self, worker: &Worker<Box<dyn GCWork<VM>>>) -> Steal<Box<dyn GCWork<VM>>> {
+        if !self.is_enabled() || !self.is_open() || self.is_empty() {
+            return Steal::Empty;
+        }
+        self.queue.steal_batch_and_pop(worker)
+    }
+
+    pub fn set_open_condition(
+        &mut self,
+        pred: impl Fn(&GCWorkScheduler<VM>) -> bool + Send + 'static,
+    ) {
+        self.can_open = Some(Box::new(pred));
+    }
+
+    pub fn set_sentinel(&self, new_sentinel: Box<dyn GCWork<VM>>) {
+        let mut sentinel = self.sentinel.lock().unwrap();
+        *sentinel = Some(new_sentinel);
+    }
+
+    pub fn has_sentinel(&self) -> bool {
+        let sentinel = self.sentinel.lock().unwrap();
+        sentinel.is_some()
+    }
+
+    pub fn update(&self, scheduler: &GCWorkScheduler<VM>) -> bool {
+        if let Some(can_open) = self.can_open.as_ref() {
+            if !self.is_open() && can_open(scheduler) {
+                debug!("Opening work bucket: {:?}", self.stage);
+                self.open();
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn maybe_schedule_sentinel(&self) -> bool {
+        debug_assert!(
+            self.is_open(),
+            "Attempted to schedule sentinel work while bucket is not open"
+        );
+        let maybe_sentinel = {
+            let mut sentinel = self.sentinel.lock().unwrap();
+            sentinel.take()
+        };
+        if let Some(work) = maybe_sentinel {
+            // We don't need to notify other workers because this function is called by the last
+            // parked worker.  After this function returns, the caller will notify workers because
+            // more work packets become available.
+            self.add_boxed_no_notify(work);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn get_queue(&self) -> &BucketQueue<VM> {
+        &self.queue
+    }
+
+    pub(super) fn get_stage(&self) -> WorkBucketStage {
+        self.stage
+    }
+}
+
+/// This enum defines all the work bucket types. The scheduler
+/// will instantiate a work bucket for each stage defined here.
+#[derive(Debug, Enum, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum WorkBucketStage {
+    /// This bucket is always open.
+    Unconstrained,
+    /// This bucket is intended for concurrent work. Though some concurrent work may be put and executed in the unconstrained bucket,
+    /// work in the unconstrained bucket will always be consumed during STW. Users can disable this bucket
+    /// and cache some concurrent work during STW, and only enable this bucket and allow concurrent execution once a STW is done.
+    Concurrent,
+    /// Concurrent work that may be resumed across a stop-the-world pause (LXR-specific), such as
+    /// concurrent marking packets discovered while processing reference-count increments during
+    /// `InitialMark`.  Unlike other stages, this bucket is allowed to remain non-empty when a STW
+    /// pause ends.
+    ConcurrentResumable,
+    /// The first stop-the-world stage (see [`WorkBucketStage::FIRST_STW_STAGE`]).  Used to join
+    /// outstanding concurrent work, e.g. flushing SATB mod-buffer packets recorded by the LXR
+    /// barrier, before the rest of the STW stages proceed.
+    FinishConcurrentWork,
+    /// Process the reference-count increments that must not move their objects.  LXR also scans
+    /// roots here (see `root_scanning_stage`); the roots a binding reports as objects rather than
+    /// as slots are counted in this stage because there is no slot to write a forwarding pointer
+    /// back into.  Counting them before `RCProcessIncs` opens is what keeps them in place.
+    ///
+    /// Only exists with the `non_moving_root` feature.  Without it no root is reported as an
+    /// object, so nothing would ever be put here, and scanning roots one stage ahead of
+    /// `RCProcessIncs` would only stop the two from overlapping.
+    #[cfg(feature = "non_moving_root")]
+    RCProcessIncsNonMoving,
+    /// Process reference-count increments from the LXR barrier and from root slots.  May
+    /// evacuate nursery objects, so it must run after `RCProcessIncsNonMoving`.
+    RCProcessIncs,
+    /// Preparation work.  Plans, spaces, GC workers, mutators, etc. should be prepared for GC at
+    /// this stage.
+    Prepare,
+    /// Clear the VO bit metadata.  Mainly used by ImmixSpace.
+    #[cfg(feature = "vo_bit")]
+    ClearVOBits,
+    /// Compute the transtive closure starting from transitively pinning (TP) roots following only strong references.
+    /// No objects in this closure are allow to move.
+    ///
+    /// Only exists with the `non_moving_root` feature.
+    #[cfg(feature = "non_moving_root")]
+    TPinningClosure,
+    /// Trace (non-transitively) pinning roots. Objects pointed by those roots must not move, but their children may. To ensure correctness, these must be processed after TPinningClosure
+    ///
+    /// Only exists with the `non_moving_root` feature.
+    #[cfg(feature = "non_moving_root")]
+    PinningRootsTrace,
+    /// Compute the transtive closure following only strong references.
+    Closure,
+    /// Handle Java-style soft references, and potentially expand the transitive closure.
+    SoftRefClosure,
+    /// Handle Java-style weak references.
+    WeakRefClosure,
+    /// Resurrect Java-style finalizable objects, and potentially expand the transitive closure.
+    FinalRefClosure,
+    /// Handle Java-style phantom references.
+    PhantomRefClosure,
+    /// Let the VM handle VM-specific weak data structures, including weak references, weak
+    /// collections, table of finalizable objects, ephemerons, etc.  Potentially expand the
+    /// transitive closure.
+    ///
+    /// NOTE: This stage is intended to replace the Java-specific weak reference handling stages
+    /// above.
+    VMRefClosure,
+    /// Compute the forwarding addresses of objects (mark-compact-only).
+    CalculateForwarding,
+    /// Scan roots again to initiate another transitive closure to update roots and reference
+    /// after computing the forwarding addresses (mark-compact-only).
+    SecondRoots,
+    /// Update Java-style weak references after computing forwarding addresses (mark-compact-only).
+    ///
+    /// NOTE: This stage should be updated to adapt to the VM-side reference handling.  It shall
+    /// be kept after removing `{Soft,Weak,Final,Phantom}RefClosure`.
+    RefForwarding,
+    /// Update the list of Java-style finalization cadidates and finalizable objects after
+    /// computing forwarding addresses (mark-compact-only).
+    FinalizableForwarding,
+    /// Let the VM handle the forwarding of reference fields in any VM-specific weak data
+    /// structures, including weak references, weak collections, table of finalizable objects,
+    /// ephemerons, etc., after computing forwarding addresses (mark-compact-only).
+    ///
+    /// NOTE: This stage is intended to replace Java-specific forwarding phases above.
+    VMRefForwarding,
+    /// Compact objects (mark-compact-only).
+    Compact,
+    /// Work packets that should be done just before GC shall go here.  This includes releasing
+    /// resources and setting states in plans, spaces, GC workers, mutators, etc.
+    Release,
+    /// Process reference-count decrements recorded by the LXR barrier, and sweep objects whose
+    /// reference count has dropped to zero, during a stop-the-world pause.  This is used when
+    /// lazy (concurrent) decrements are disabled for the current GC.
+    STWRCDecsAndSweep,
+    /// Resume mutators and end GC.
+    Final,
+}
+
+// Alias
+#[allow(non_upper_case_globals)]
+impl WorkBucketStage {
+    /// The first stop-the-world stage. This stage has no open condition, and will be opened manually
+    /// once all the mutators threads are stopped.
+    pub const FIRST_STW_STAGE: Self = WorkBucketStage::FinishConcurrentWork;
+
+    /// Is this the first stop-the-world stage? See [`Self::FIRST_STW_STAGE`].
+    pub const fn is_first_stw_stage(&self) -> bool {
+        matches!(self, &WorkBucketStage::FIRST_STW_STAGE)
+    }
+
+    /// Is this stage always open?
+    pub const fn is_always_open(&self) -> bool {
+        matches!(self, WorkBucketStage::Unconstrained)
+    }
+
+    /// Is this stage open by default?
+    pub const fn is_open_by_default(&self) -> bool {
+        matches!(
+            self,
+            WorkBucketStage::Unconstrained
+                | WorkBucketStage::Concurrent
+                | WorkBucketStage::ConcurrentResumable
+        )
+    }
+
+    /// Is this stage enabled by default?
+    pub const fn is_enabled_by_default(&self) -> bool {
+        !matches!(self, WorkBucketStage::Concurrent)
+            && !matches!(self, WorkBucketStage::ConcurrentResumable)
+    }
+
+    /// Is this stage sequentially opened? All the stop-the-world stages, except the first one, are sequentially opened.
+    pub const fn is_sequentially_opened(&self) -> bool {
+        self.is_stw() && !self.is_first_stw_stage()
+    }
+
+    /// Is this stage a stop-the-world stage?
+    pub const fn is_stw(&self) -> bool {
+        !self.is_concurrent()
+    }
+
+    /// Is this stage concurrent (which may be executed during mutator time)?
+    pub const fn is_concurrent(&self) -> bool {
+        matches!(
+            self,
+            WorkBucketStage::Unconstrained
+                | WorkBucketStage::Concurrent
+                | WorkBucketStage::ConcurrentResumable
+        )
+    }
+
+    /// Alias for [`WorkBucketStage::Closure`], used by LXR when scheduling mature-space
+    /// evacuation remset packets so that they are processed as part of the transitive closure
+    /// stage.
+    pub const RCEvacuateMature: Self = Self::Closure;
+}

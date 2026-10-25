@@ -1,0 +1,225 @@
+use atomic::Ordering;
+
+use crate::policy::sft::SFT;
+use crate::policy::space::{CommonSpace, Space};
+use crate::util::address::Address;
+use crate::util::heap::{MonotonePageResource, PageResource};
+use crate::util::metadata::mark_bit::MarkState;
+
+use crate::util::object_enum::{self, ObjectEnumerator};
+use crate::util::{metadata, ObjectReference};
+
+use crate::plan::tracing::{ObjectQueue, OptionObjectQueue};
+
+use crate::policy::sft::GCWorkerMutRef;
+use crate::vm::{ObjectModel, VMBinding};
+
+/// This type implements a simple immortal collection
+/// policy. Under this policy all that is required is for the
+/// "collector" to propagate marks in a liveness trace.  It does not
+/// actually collect.
+pub struct ImmortalSpace<VM: VMBinding> {
+    mark_state: MarkState,
+    common: CommonSpace<VM>,
+    pr: MonotonePageResource<VM>,
+}
+
+impl<VM: VMBinding> SFT for ImmortalSpace<VM> {
+    fn name(&self) -> &'static str {
+        self.get_name()
+    }
+    fn is_live(&self, _object: ObjectReference) -> bool {
+        true
+    }
+    fn is_reachable(&self, object: ObjectReference) -> bool {
+        self.mark_state.is_marked::<VM>(object)
+    }
+    #[cfg(feature = "object_pinning")]
+    fn pin_object(&self, _object: ObjectReference) -> bool {
+        false
+    }
+    #[cfg(feature = "object_pinning")]
+    fn unpin_object(&self, _object: ObjectReference) -> bool {
+        false
+    }
+    #[cfg(feature = "object_pinning")]
+    fn is_object_pinned(&self, _object: ObjectReference) -> bool {
+        true
+    }
+    fn is_movable(&self) -> bool {
+        false
+    }
+    #[cfg(feature = "sanity")]
+    fn is_sane(&self) -> bool {
+        true
+    }
+    fn initialize_object_metadata(&self, object: ObjectReference, bytes: usize) {
+        self.mark_state
+            .on_object_metadata_initialization::<VM>(object);
+        if self.common.unlog_allocated_object {
+            VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.mark_as_unlogged::<VM>(object, Ordering::SeqCst);
+            if self.common.needs_field_log_bit {
+                VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
+                    .as_spec()
+                    .extract_side_spec()
+                    .bset_metadata(object.to_object_start::<VM>(), bytes);
+            }
+        }
+        #[cfg(feature = "vo_bit")]
+        crate::util::metadata::vo_bit::set_vo_bit(object);
+    }
+    #[cfg(feature = "vo_bit")]
+    fn is_mmtk_object(&self, addr: Address) -> Option<ObjectReference> {
+        crate::util::metadata::vo_bit::is_vo_bit_set_for_addr(addr)
+    }
+    #[cfg(feature = "vo_bit")]
+    fn find_object_from_internal_pointer(
+        &self,
+        ptr: Address,
+        max_search_bytes: usize,
+    ) -> Option<ObjectReference> {
+        crate::util::metadata::vo_bit::find_object_from_internal_pointer::<VM>(
+            ptr,
+            max_search_bytes,
+        )
+    }
+    fn sft_trace_object(
+        &self,
+        queue: &mut OptionObjectQueue,
+        object: ObjectReference,
+        _worker: GCWorkerMutRef,
+    ) -> ObjectReference {
+        self.trace_object(queue, object)
+    }
+    fn debug_print_object_info(&self, object: ObjectReference) {
+        println!("marked = {}", self.mark_state.is_marked::<VM>(object));
+        self.common.debug_print_object_global_info(object);
+    }
+}
+
+impl<VM: VMBinding> Space<VM> for ImmortalSpace<VM> {
+    fn as_space(&self) -> &dyn Space<VM> {
+        self
+    }
+    fn as_sft(&self) -> &(dyn SFT + Sync + 'static) {
+        self
+    }
+    fn get_page_resource(&self) -> &dyn PageResource<VM> {
+        &self.pr
+    }
+    fn maybe_get_page_resource_mut(&mut self) -> Option<&mut dyn PageResource<VM>> {
+        Some(&mut self.pr)
+    }
+    fn common(&self) -> &CommonSpace<VM> {
+        &self.common
+    }
+
+    fn initialize_sft(&self, sft_map: &mut dyn crate::policy::sft_map::SFTMap) {
+        self.common().initialize_sft(self.as_sft(), sft_map)
+    }
+
+    fn release_multiple_pages(&mut self, _start: Address) {
+        panic!("immortalspace only releases pages enmasse")
+    }
+
+    fn enumerate_objects(&self, enumerator: &mut dyn ObjectEnumerator) {
+        object_enum::enumerate_blocks_from_monotonic_page_resource(enumerator, &self.pr);
+    }
+
+    fn clear_side_log_bits(&self) {
+        let log_bit = VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.extract_side_spec();
+        for (start, size) in self.pr.iterate_allocated_regions() {
+            log_bit.bzero_metadata(start, size);
+        }
+    }
+
+    fn set_side_log_bits(&self) {
+        let log_bit = VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.extract_side_spec();
+        for (start, size) in self.pr.iterate_allocated_regions() {
+            log_bit.bset_metadata(start, size);
+        }
+    }
+}
+
+use crate::scheduler::GCWorker;
+use crate::util::copy::CopySemantics;
+
+impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for ImmortalSpace<VM> {
+    fn trace_object<Q: ObjectQueue, const KIND: crate::policy::gc_work::TraceKind>(
+        &self,
+        queue: &mut Q,
+        object: ObjectReference,
+        _copy: Option<CopySemantics>,
+        _worker: &mut GCWorker<VM>,
+    ) -> ObjectReference {
+        self.trace_object(queue, object)
+    }
+    fn may_move_objects<const KIND: crate::policy::gc_work::TraceKind>() -> bool {
+        false
+    }
+}
+
+impl<VM: VMBinding> ImmortalSpace<VM> {
+    pub fn new(args: crate::policy::space::PlanCreateSpaceArgs<VM>) -> Self {
+        let vm_map = args.vm_map;
+        let is_discontiguous = args.vmrequest.is_discontiguous();
+        let common = CommonSpace::new(args.into_policy_args(
+            false,
+            true,
+            metadata::extract_side_metadata(&[*VM::VMObjectModel::LOCAL_MARK_BIT_SPEC]),
+        ));
+        ImmortalSpace {
+            mark_state: MarkState::new(),
+            pr: if is_discontiguous {
+                MonotonePageResource::new_discontiguous(vm_map)
+            } else {
+                MonotonePageResource::new_contiguous(common.start, common.extent, vm_map)
+            },
+            common,
+        }
+    }
+
+    pub fn prepare(&mut self) {
+        self.mark_state.on_global_prepare::<VM>();
+        // Reset the mark bit for the allocated regions.
+        for (addr, size) in self.pr.iterate_allocated_regions() {
+            debug!(
+                "{:?}: reset mark bit from {} to {}",
+                self.name(),
+                addr,
+                addr + size
+            );
+            self.mark_state.on_block_reset::<VM>(addr, size);
+        }
+    }
+
+    pub fn release(&mut self) {
+        self.mark_state.on_global_release::<VM>();
+    }
+
+    pub fn trace_object<Q: ObjectQueue>(
+        &self,
+        queue: &mut Q,
+        object: ObjectReference,
+    ) -> ObjectReference {
+        #[cfg(feature = "vo_bit")]
+        debug_assert!(
+            crate::util::metadata::vo_bit::is_vo_bit_set(object),
+            "{:x}: VO bit not set",
+            object
+        );
+        if self.mark_state.test_and_mark::<VM>(object) {
+            // Set the unlog bit if required
+            if self.common.unlog_traced_object {
+                VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.store_atomic::<VM, u8>(
+                    object,
+                    1,
+                    None,
+                    Ordering::SeqCst,
+                );
+            }
+            queue.enqueue(object);
+        }
+        object
+    }
+}

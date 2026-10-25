@@ -1,0 +1,846 @@
+use atomic::Ordering;
+
+use crate::global_state::{GcStatus, GlobalState};
+use crate::plan::Plan;
+use crate::policy::space::Space;
+use crate::scheduler::GCWorkScheduler;
+use crate::util::constants::BYTES_IN_PAGE;
+use crate::util::conversions;
+use crate::util::options::{GCTriggerSelector, Options, DEFAULT_MAX_NURSERY, DEFAULT_MIN_NURSERY};
+use crate::vm::VMBinding;
+use crate::MMTK;
+use std::mem::MaybeUninit;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+
+/// GCTrigger is responsible for triggering GCs based on the given policy.
+/// All the decisions about heap limit and GC triggering should be resolved here.
+/// Depending on the actual policy, we may either forward the calls either to the plan
+/// or to the binding/runtime.
+pub struct GCTrigger<VM: VMBinding> {
+    /// The current plan. This is uninitialized when we create it, and later initialized
+    /// once we have a fixed address for the plan.
+    plan: MaybeUninit<&'static dyn Plan<VM = VM>>,
+    /// The triggering policy.
+    pub policy: Box<dyn GCTriggerPolicy<VM>>,
+    scheduler: Arc<GCWorkScheduler<VM>>,
+    options: Arc<Options>,
+    state: Arc<GlobalState>,
+}
+
+impl<VM: VMBinding> GCTrigger<VM> {
+    pub fn new(
+        options: Arc<Options>,
+        scheduler: Arc<GCWorkScheduler<VM>>,
+        state: Arc<GlobalState>,
+    ) -> Self {
+        GCTrigger {
+            plan: MaybeUninit::uninit(),
+            policy: match *options.gc_trigger {
+                GCTriggerSelector::FixedHeapSize(size) => Box::new(FixedHeapSizeTrigger {
+                    total_pages: conversions::bytes_to_pages_up(size),
+                }),
+                GCTriggerSelector::DynamicHeapSize(min, max) => 'dynamic_heap_size: {
+                    let min_pages = conversions::bytes_to_pages_up(min);
+                    let max_pages = conversions::bytes_to_pages_up(max);
+
+                    if *options.plan == crate::util::options::PlanSelector::NoGC {
+                        warn!("Cannot use dynamic heap size with NoGC.  Using fixed heap size trigger instead.");
+                        break 'dynamic_heap_size Box::new(FixedHeapSizeTrigger {
+                            total_pages: max_pages,
+                        });
+                    }
+
+                    Box::new(MemBalancerTrigger::new(min_pages, max_pages))
+                }
+                GCTriggerSelector::Delegated => {
+                    <VM::VMCollection as crate::vm::Collection<VM>>::create_gc_trigger()
+                }
+            },
+            options,
+            scheduler,
+            state,
+        }
+    }
+
+    /// Set the plan. This is called in `create_plan()` after we created a boxed plan.
+    pub fn set_plan(&mut self, plan: &'static dyn Plan<VM = VM>) {
+        self.plan.write(plan);
+    }
+
+    fn plan(&self) -> &dyn Plan<VM = VM> {
+        unsafe { self.plan.assume_init() }
+    }
+
+    /// Request a GC.  Called by mutators when polling (during allocation) and when handling user
+    /// GC requests (e.g. `System.gc();` in Java).
+    /// Atomically check that collection is enabled, and if so, request a GC. This makes the
+    /// enabled-check and the request atomic with respect to [`GCTrigger::disable_collection`]
+    /// and [`GCTrigger::enable_collection`], so a GC is never requested after collection has
+    /// been disabled.
+    /// Returns whether a GC was actually requested.
+    fn request(&self) -> bool {
+        // `GCWorkScheduler::request_schedule_collection` needs to hold a mutex to communicate
+        // with GC workers, which is expensive for functions like `poll`. `try_request_pause`
+        // only returns `Ok` to the thread that actually wins the race to transition the status,
+        // so only that thread calls it, instead of every thread that observes the old status:
+        // calling it unconditionally would re-queue a `WorkerGoal::Gc` request that a previous
+        // winner's request already delivered and that the workers may already be acting on,
+        // tripping the `debug_is_requested` assertion in `GCWorkScheduler::on_last_parked`.
+        match self.state.gc_status.try_request_pause() {
+            Ok(cur_status) => {
+                if cur_status == GcStatus::InConcurrentGC {
+                    self.plan().concurrent().unwrap().on_concurrent_work_interrupted();
+                }
+                probe!(mmtk, gc_requested);
+                self.state.record_pause_requested_time();
+                self.scheduler.request_schedule_collection();
+                true
+            },
+            Err(GcStatus::Disabled(_)) => false,
+            // A GC is genuinely required (the heap policy has been exceeded), but MMTk has no GC
+            // worker threads to service it. Silently returning `false` here would let allocation
+            // grow the heap without bound instead of respecting the configured limit.
+            Err(GcStatus::Uninitialized) => panic!(
+                "GC is not allowed here: collection is not initialized (did you call initialize_collection()?)."
+            ),
+            Err(GcStatus::PauseRequested) => true,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Disable collection. On success, returns `Ok(true)` if this call actually switched
+    /// collection from enabled to disabled, `Ok(false)` if it only increased the nesting depth of
+    /// an already-disabled status. If MMTk is unable to disable GC right now (possibly a GC is in
+    /// progress, or a GC has been requested), returns `Err` with the status that prevented it;
+    /// users should invoke runtime safepoints or other mechanisms to prepare for a GC pause, and
+    /// then call this function again.
+    ///
+    /// This call is nestable. Each call must be paired with a matching call to
+    /// [`GCTrigger::enable_collection`].
+    pub fn disable_collection(&self) -> Result<bool, GcStatus> {
+        self.state.gc_status.set_disabled()
+    }
+
+    /// Re-enable collection. If collection is not currently disabled (e.g. there was no prior
+    /// matching call to [`GCTrigger::disable_collection`]), this is a no-op.
+    /// Returns `true` if this call actually re-enabled collection (i.e. it was the outermost
+    /// matching call), `false` if it only decremented the nesting depth, or if collection was
+    /// already enabled.
+    pub fn enable_collection(&self) -> bool {
+        self.state.gc_status.set_enabled()
+    }
+
+    /// Return whether collection is currently enabled.
+    pub fn is_collection_enabled(&self) -> bool {
+        !self.state.gc_status.is_disabled()
+    }
+
+    /// This method is called periodically by the allocation subsystem
+    /// (by default, each time a page is consumed), and provides the
+    /// collector with an opportunity to collect.
+    ///
+    /// Arguments:
+    /// * `space_full`: Space request failed, must recover pages within 'space'.
+    /// * `space`: The space that triggered the poll. This could `None` if the poll is not triggered by a space.
+    pub fn poll(&self, space_full: bool, space: Option<&dyn Space<VM>>) -> bool {
+        if !self.is_collection_enabled() {
+            return false;
+        }
+
+        let plan = self.plan();
+        if self
+            .policy
+            .is_gc_required(space_full, space.map(|s| SpaceStats::new(s)), plan)
+        {
+            info!(
+                "[POLL] {}{} ({}/{} pages)",
+                if let Some(space) = space {
+                    format!("{}: ", space.get_name())
+                } else {
+                    "".to_string()
+                },
+                "Triggering collection",
+                plan.get_reserved_pages(),
+                plan.get_total_pages(),
+            );
+            return self.request();
+        }
+        false
+    }
+
+    /// For [`crate::scheduler::GCWorkScheduler::on_last_parked`]'s use when the last parked GC
+    /// worker is about to go idle with no mutator-requested goal pending: check if we should poll
+    /// from a GC worker.
+    pub(crate) fn poll_from_last_parked_worker(&self) -> bool {
+        if !self.is_collection_enabled() {
+            return false;
+        }
+
+        // Currently only poll if a concurrent GC is in progress, and only if that work has actually drained.
+        let Some(concurrent_plan) = self.plan().concurrent() else {
+            return false;
+        };
+        if !concurrent_plan.concurrent_work_in_progress() {
+            return false;
+        }
+        if !self.scheduler.work_buckets[crate::scheduler::WorkBucketStage::Concurrent].is_drained()
+        {
+            return false;
+        }
+
+        let plan = self.plan();
+        if self.policy.is_gc_required(false, None, plan) {
+            match self.state.gc_status.try_request_pause() {
+                // This call won the race to request a GC. However, we cannot call request() now.
+                // The caller of this function is holding a mutex, and if we do request() here,
+                // we end up with deadlock. So we just return true to the caller, and let the caller do the request.
+                Ok(_) => {
+                    probe!(mmtk, gc_requested);
+                    self.state.record_pause_requested_time();
+                    info!(
+                        "[POLL] Requesting a concurrent GC's closing pause from the last parked GC worker"
+                    );
+                    true
+                }
+                Err(GcStatus::Disabled(_)) | Err(GcStatus::PauseRequested) => false,
+                Err(GcStatus::Uninitialized) => panic!(
+                    "GC is not allowed here: collection is not initialized (did you call initialize_collection()?)."
+                ),
+                _ => unreachable!(),
+            }
+        } else {
+            false
+        }
+    }
+
+    /// This method is called when the user manually requests a collection, such as `System.gc()` in Java.
+    /// Returns true if a collection is actually requested.
+    ///
+    /// # Arguments
+    /// * `force`: If true, we force a collection regardless of the settings. If false, we only trigger a collection if the settings allow it.
+    /// * `exhaustive`: If true, we try to make the collection exhaustive (e.g. full heap collection). If false, the collection kind is determined internally.
+    pub fn handle_user_collection_request(&self, force: bool, exhaustive: bool) -> bool {
+        if !self.plan().constraints().collects_garbage {
+            warn!("User attempted a collection request, but the plan can not do GC. The request is ignored.");
+            return false;
+        }
+
+        if force || !*self.options.ignore_system_gc && self.is_collection_enabled() {
+            info!("User triggering collection");
+            // TODO: this may not work reliably. If a GC has been triggered, this will not force it to be a full heap GC.
+            if exhaustive {
+                if let Some(gen) = self.plan().generational() {
+                    gen.force_full_heap_collection();
+                }
+            }
+
+            self.state
+                .user_triggered_collection
+                .store(true, Ordering::Relaxed);
+            return self.request();
+        }
+
+        false
+    }
+
+    /// MMTK has requested stop-the-world activity (e.g., stw within a concurrent gc).
+    // TODO: We should use this for concurrent GC. E.g. in concurrent Immix, when the initial mark is done, we
+    // can use this function to immediately trigger the final mark pause. The current implementation uses
+    // normal collection_required check, which may delay the final mark unnecessarily.
+    #[allow(unused)]
+    pub fn trigger_internal_collection_request(&self) {
+        self.state
+            .last_internal_triggered_collection
+            .store(true, Ordering::Relaxed);
+        self.state
+            .internal_triggered_collection
+            .store(true, Ordering::Relaxed);
+        // TODO: The current `request()` is probably incorrect for internally triggered GC.
+        // Consider removing functions related to "internal triggered collection".
+        self.request();
+        // TODO: Make sure this function works correctly for concurrent GC.
+        unimplemented!()
+    }
+
+    pub fn should_do_stress_gc(&self) -> bool {
+        Self::should_do_stress_gc_inner(&self.state, &self.options)
+    }
+
+    /// Check if we should do a stress GC now. If GC is initialized and the allocation bytes exceeds
+    /// the stress factor, we should do a stress GC.
+    pub(crate) fn should_do_stress_gc_inner(state: &GlobalState, options: &Options) -> bool {
+        state.is_initialized()
+            && (state.allocation_bytes.load(Ordering::SeqCst) > *options.stress_factor)
+    }
+
+    /// Check if the heap is full
+    pub fn is_heap_full(&self) -> bool {
+        self.policy.is_heap_full(self.plan())
+    }
+
+    /// Return upper bound of the nursery size (in number of bytes)
+    pub fn get_max_nursery_bytes(&self) -> usize {
+        use crate::util::options::NurserySize;
+        debug_assert!(self.plan().generational().is_some());
+        match *self.options.nursery {
+            NurserySize::Bounded { min: _, max } => max,
+            NurserySize::ProportionalBounded { min: _, max } => {
+                let heap_size_bytes =
+                    conversions::pages_to_bytes(self.policy.get_current_heap_size_in_pages());
+                let max_bytes = heap_size_bytes as f64 * max;
+                let max_bytes = conversions::raw_align_up(max_bytes as usize, BYTES_IN_PAGE);
+                if max_bytes > DEFAULT_MAX_NURSERY {
+                    warn!("Proportional nursery with max size {} ({}) is larger than DEFAULT_MAX_NURSERY ({}). Use DEFAULT_MAX_NURSERY instead.", max, max_bytes, DEFAULT_MAX_NURSERY);
+                    DEFAULT_MAX_NURSERY
+                } else {
+                    max_bytes
+                }
+            }
+            NurserySize::Fixed(sz) => sz,
+        }
+    }
+
+    /// Return lower bound of the nursery size (in number of bytes)
+    pub fn get_min_nursery_bytes(&self) -> usize {
+        use crate::util::options::NurserySize;
+        debug_assert!(self.plan().generational().is_some());
+        match *self.options.nursery {
+            NurserySize::Bounded { min, max: _ } => min,
+            NurserySize::ProportionalBounded { min, max: _ } => {
+                let min_bytes =
+                    conversions::pages_to_bytes(self.policy.get_current_heap_size_in_pages())
+                        as f64
+                        * min;
+                let min_bytes = conversions::raw_align_up(min_bytes as usize, BYTES_IN_PAGE);
+                if min_bytes < DEFAULT_MIN_NURSERY {
+                    warn!("Proportional nursery with min size {} ({}) is smaller than DEFAULT_MIN_NURSERY ({}). Use DEFAULT_MIN_NURSERY instead.", min, min_bytes, DEFAULT_MIN_NURSERY);
+                    DEFAULT_MIN_NURSERY
+                } else {
+                    min_bytes
+                }
+            }
+            NurserySize::Fixed(sz) => sz,
+        }
+    }
+
+    /// Return upper bound of the nursery size (in number of pages)
+    pub fn get_max_nursery_pages(&self) -> usize {
+        crate::util::conversions::bytes_to_pages_up(self.get_max_nursery_bytes())
+    }
+
+    /// Return lower bound of the nursery size (in number of pages)
+    pub fn get_min_nursery_pages(&self) -> usize {
+        crate::util::conversions::bytes_to_pages_up(self.get_min_nursery_bytes())
+    }
+
+    /// A check for the obvious out-of-memory case: if the requested size is larger than
+    /// the heap size, it is definitely an OOM. We would like to identify that, and
+    /// allows the binding to deal with OOM. Without this check, we will attempt
+    /// to allocate from the page resource. If the requested size is unrealistically large
+    /// (such as `usize::MAX`), it breaks the assumptions of our implementation of
+    /// page resource, vm map, etc. This check prevents that, and allows us to
+    /// handle the OOM case.
+    /// Each allocator that may request an arbitrary size should call this method before
+    /// acquring memory from the space. For example, bump pointer allocator and large object
+    /// allocator need to call this method. On the other hand, allocators that only allocate
+    /// memory in fixed size blocks do not need to call this method.
+    /// An allocator should call this method before doing any computation on the size to
+    /// avoid arithmatic overflow. If we have to do computation in the allocation fastpath and
+    /// overflow happens there, there is nothing we can do about it.
+    /// Return a boolean to indicate if we will be out of memory, determined by the check.
+    pub fn will_oom_on_alloc(&self, size: usize) -> bool {
+        let max_pages = self.policy.get_max_heap_size_in_pages();
+        let requested_pages = size >> crate::util::constants::LOG_BYTES_IN_PAGE;
+        requested_pages > max_pages
+    }
+}
+
+/// Provides statistics about the space. This is exposed to bindings, as it is used
+/// in both [`crate::plan::Plan`] and [`GCTriggerPolicy`].
+// This type exists so we do not need to expose the `Space` trait to the bindings.
+pub struct SpaceStats<'a, VM: VMBinding>(pub(crate) &'a dyn Space<VM>);
+
+impl<'a, VM: VMBinding> SpaceStats<'a, VM> {
+    /// Create new SpaceStats.
+    fn new(space: &'a dyn Space<VM>) -> Self {
+        Self(space)
+    }
+
+    /// Get the number of reserved pages for the space.
+    pub fn reserved_pages(&self) -> usize {
+        self.0.reserved_pages()
+    }
+
+    // We may expose more methods to bindings if they need more information for implementing GC triggers.
+    // But we should never expose `Space` itself.
+}
+
+/// This trait describes a GC trigger policy. A triggering policy have hooks to be informed about
+/// GC start/end so they can collect some statistics about GC and allocation. The policy needs to
+/// decide the (current) heap limit and decide whether a GC should be performed.
+pub trait GCTriggerPolicy<VM: VMBinding>: Sync + Send {
+    /// Inform the triggering policy that we have pending allocation.
+    /// Any GC trigger policy with dynamic heap size should take this into account when calculating a new heap size.
+    /// Failing to do so may result in unnecessay GCs, or result in an infinite loop if the new heap size
+    /// can never accomodate the pending allocation.
+    fn on_pending_allocation(&self, _pages: usize) {}
+    /// Inform the triggering policy that a GC cycle starts. A GC cycle consists of one or more
+    /// GC pauses (see [`Self::on_pause_start`]) plus any concurrent work in between the pauses.
+    /// For a stop-the-world GC, a GC cycle is just a single pause, and this is called at the same
+    /// time as [`Self::on_pause_start`]. For a concurrent GC that splits a cycle into multiple
+    /// pauses (e.g. an initial mark pause and a final mark pause with concurrent marking in
+    /// between), this is only called once per cycle, for the first pause in the cycle.
+    fn on_gc_start(&self, _mmtk: &'static MMTK<VM>) {}
+    /// Inform the triggering policy that a GC cycle ends. See [`Self::on_gc_start`] for what
+    /// a GC cycle is. This is only called once per GC cycle, for the last pause in the cycle.
+    fn on_gc_end(&self, _mmtk: &'static MMTK<VM>) {}
+    /// Inform the triggering policy that a pause starts. For a concurrent GC, this is called once
+    /// for every STW pause in a GC cycle, not just once per cycle. See
+    /// [`Self::on_gc_start`] for the hook that is only called once per GC cycle.
+    fn on_pause_start(&self, _mmtk: &'static MMTK<VM>) {}
+    /// Inform the triggering policy that a pause ends. For a concurrent GC, this is called once
+    /// for every STW pause in a GC cycle, not just once per cycle. See [`Self::on_gc_end`]
+    /// for the hook that is only called once per GC cycle.
+    fn on_pause_end(&self, _mmtk: &'static MMTK<VM>) {}
+    /// Inform the triggering policy that a GC is about to start the release work. This is called
+    /// in the global Release work packet. This means we assume a plan
+    /// do not schedule any work that reclaims memory before the global `Release` work. The current plans
+    /// satisfy this assumption: they schedule other release work in `plan.release()`.
+    fn on_gc_release(&self, _mmtk: &'static MMTK<VM>) {}
+    /// Is a GC required now? The GC trigger may implement its own heuristics to decide when
+    /// a GC should be performed. However, we recommend the implementation to do its own checks
+    /// first, and always call `plan.collection_required(space_full, space)` at the end as a fallback to see if the plan needs
+    /// to do a GC.
+    ///
+    /// Arguments:
+    /// * `space_full`: Is any space full?
+    /// * `space`: The space that is full. The GC trigger may access some stats of the space.
+    /// * `plan`: The reference to the plan in use.
+    fn is_gc_required(
+        &self,
+        space_full: bool,
+        space: Option<SpaceStats<VM>>,
+        plan: &dyn Plan<VM = VM>,
+    ) -> bool;
+    /// Is current heap full?
+    fn is_heap_full(&self, plan: &dyn Plan<VM = VM>) -> bool;
+    /// Return the current heap size (in pages)
+    fn get_current_heap_size_in_pages(&self) -> usize;
+    /// Return the upper bound of heap size
+    fn get_max_heap_size_in_pages(&self) -> usize;
+    /// Can the heap size grow?
+    fn can_heap_size_grow(&self) -> bool;
+}
+
+/// A simple GC trigger that uses a fixed heap size.
+pub struct FixedHeapSizeTrigger {
+    total_pages: usize,
+}
+impl<VM: VMBinding> GCTriggerPolicy<VM> for FixedHeapSizeTrigger {
+    fn is_gc_required(
+        &self,
+        space_full: bool,
+        space: Option<SpaceStats<VM>>,
+        plan: &dyn Plan<VM = VM>,
+    ) -> bool {
+        // Let the plan decide
+        plan.collection_required(space_full, space)
+    }
+
+    fn is_heap_full(&self, plan: &dyn Plan<VM = VM>) -> bool {
+        // If reserved pages is larger than the total pages, the heap is full.
+        plan.get_reserved_pages() > self.total_pages
+    }
+
+    fn get_current_heap_size_in_pages(&self) -> usize {
+        self.total_pages
+    }
+
+    fn get_max_heap_size_in_pages(&self) -> usize {
+        self.total_pages
+    }
+
+    fn can_heap_size_grow(&self) -> bool {
+        false
+    }
+}
+
+use atomic_refcell::AtomicRefCell;
+use std::time::Instant;
+
+/// An implementation of MemBalancer (Optimal heap limits for reducing browser memory use, <https://dl.acm.org/doi/10.1145/3563323>)
+/// We use MemBalancer to decide a heap limit between the min heap and the max heap.
+/// The current implementation is a simplified version of mem balancer and it does not take collection/allocation speed into account,
+/// and uses a fixed constant instead.
+// TODO: implement a complete mem balancer.
+pub struct MemBalancerTrigger {
+    /// The min heap size
+    min_heap_pages: usize,
+    /// The max heap size
+    max_heap_pages: usize,
+    /// The current heap size
+    current_heap_pages: AtomicUsize,
+    /// The number of pending allocation pages. The allocation requests for them have failed, and a GC is triggered.
+    /// We will need to take them into consideration so that the new heap size can accomodate those allocations.
+    pending_pages: AtomicUsize,
+    /// Statistics
+    stats: AtomicRefCell<MemBalancerStats>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct MemBalancerStats {
+    // Allocation/collection stats in the previous estimation. We keep this so we can use them to smooth the current value
+    /// Previous allocated memory in pages.
+    allocation_pages_prev: Option<f64>,
+    /// Previous allocation duration in secs
+    allocation_time_prev: Option<f64>,
+    /// Previous collected memory in pages
+    collection_pages_prev: Option<f64>,
+    /// Previous colleciton duration in secs
+    collection_time_prev: Option<f64>,
+
+    // Allocation/collection stats in this estimation.
+    /// Allocated memory in pages
+    allocation_pages: f64,
+    /// Allocation duration in secs
+    allocation_time: f64,
+    /// Collected memory in pages (memory traversed during collection)
+    collection_pages: f64,
+    /// Collection duration in secs
+    collection_time: f64,
+
+    /// The time when this GC starts
+    gc_start_time: Instant,
+    /// The time when this GC ends
+    gc_end_time: Instant,
+
+    /// The live pages before we release memory.
+    gc_release_live_pages: usize,
+    /// The live pages at the GC end
+    gc_end_live_pages: usize,
+}
+
+impl std::default::Default for MemBalancerStats {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            allocation_pages_prev: None,
+            allocation_time_prev: None,
+            collection_pages_prev: None,
+            collection_time_prev: None,
+            allocation_pages: 0f64,
+            allocation_time: 0f64,
+            collection_pages: 0f64,
+            collection_time: 0f64,
+            gc_start_time: now,
+            gc_end_time: now,
+            gc_release_live_pages: 0,
+            gc_end_live_pages: 0,
+        }
+    }
+}
+
+use crate::plan::GenerationalPlan;
+
+impl MemBalancerStats {
+    // Collect mem stats for generational plans:
+    // * We ignore nursery GCs.
+    // * allocation = objects in mature space = promoted + pretentured = live pages in mature space before release - live pages at the end of last mature GC
+    // * collection = live pages in mature space at the end of GC -  live pages in mature space before release
+
+    fn generational_mem_stats_on_gc_start<VM: VMBinding>(
+        &mut self,
+        _plan: &dyn GenerationalPlan<VM = VM>,
+    ) {
+        // We don't need to do anything
+    }
+    fn generational_mem_stats_on_gc_release<VM: VMBinding>(
+        &mut self,
+        plan: &dyn GenerationalPlan<VM = VM>,
+    ) {
+        if !plan.is_current_gc_nursery() {
+            self.gc_release_live_pages = plan.get_mature_reserved_pages();
+
+            // Calculate the promoted pages (including pre tentured objects)
+            let promoted = self
+                .gc_release_live_pages
+                .saturating_sub(self.gc_end_live_pages);
+            self.allocation_pages = promoted as f64;
+            trace!(
+                "promoted = mature live before release {} - mature live at prev gc end {} = {}",
+                self.gc_release_live_pages,
+                self.gc_end_live_pages,
+                promoted
+            );
+            trace!(
+                "allocated pages (accumulated to) = {}",
+                self.allocation_pages
+            );
+        }
+    }
+    /// Return true if we should compute a new heap limit. Only do so at the end of a mature GC
+    fn generational_mem_stats_on_gc_end<VM: VMBinding>(
+        &mut self,
+        plan: &dyn GenerationalPlan<VM = VM>,
+    ) -> bool {
+        if !plan.is_current_gc_nursery() {
+            self.gc_end_live_pages = plan.get_mature_reserved_pages();
+            // Use live pages as an estimate for pages traversed during GC
+            self.collection_pages = self.gc_end_live_pages as f64;
+            trace!(
+                "collected pages = mature live at gc end {} - mature live at gc release {} = {}",
+                self.gc_release_live_pages,
+                self.gc_end_live_pages,
+                self.collection_pages
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    // Collect mem stats for non generational plans
+    // * allocation = live pages at the start of GC - live pages at the end of last GC
+    // * collection = live pages at the end of GC - live pages before release
+
+    fn non_generational_mem_stats_on_gc_start<VM: VMBinding>(&mut self, mmtk: &'static MMTK<VM>) {
+        self.allocation_pages = mmtk
+            .get_plan()
+            .get_reserved_pages()
+            .saturating_sub(self.gc_end_live_pages) as f64;
+        trace!(
+            "allocated pages = used {} - live in last gc {} = {}",
+            mmtk.get_plan().get_reserved_pages(),
+            self.gc_end_live_pages,
+            self.allocation_pages
+        );
+    }
+    fn non_generational_mem_stats_on_gc_release<VM: VMBinding>(&mut self, mmtk: &'static MMTK<VM>) {
+        self.gc_release_live_pages = mmtk.get_plan().get_reserved_pages();
+        trace!("live before release = {}", self.gc_release_live_pages);
+    }
+    fn non_generational_mem_stats_on_gc_end<VM: VMBinding>(&mut self, mmtk: &'static MMTK<VM>) {
+        self.gc_end_live_pages = mmtk.get_plan().get_reserved_pages();
+        trace!("live pages = {}", self.gc_end_live_pages);
+        // Use live pages as an estimate for pages traversed during GC
+        self.collection_pages = self.gc_end_live_pages as f64;
+        trace!(
+            "collected pages = live at gc end {} - live at gc release {} = {}",
+            self.gc_release_live_pages,
+            self.gc_end_live_pages,
+            self.collection_pages
+        );
+    }
+}
+
+impl<VM: VMBinding> GCTriggerPolicy<VM> for MemBalancerTrigger {
+    fn is_gc_required(
+        &self,
+        space_full: bool,
+        space: Option<SpaceStats<VM>>,
+        plan: &dyn Plan<VM = VM>,
+    ) -> bool {
+        // Let the plan decide
+        plan.collection_required(space_full, space)
+    }
+
+    fn on_pending_allocation(&self, pages: usize) {
+        self.pending_pages.fetch_add(pages, Ordering::SeqCst);
+    }
+
+    fn on_gc_start(&self, mmtk: &'static MMTK<VM>) {
+        trace!("=== on_gc_start ===");
+        self.access_stats(|stats| {
+            stats.gc_start_time = Instant::now();
+            stats.allocation_time += (stats.gc_start_time - stats.gc_end_time).as_secs_f64();
+            trace!(
+                "gc_start = {:?}, allocation_time = {}",
+                stats.gc_start_time,
+                stats.allocation_time
+            );
+
+            if let Some(plan) = mmtk.get_plan().generational() {
+                stats.generational_mem_stats_on_gc_start(plan);
+            } else {
+                stats.non_generational_mem_stats_on_gc_start(mmtk);
+            }
+        });
+    }
+
+    fn on_gc_release(&self, mmtk: &'static MMTK<VM>) {
+        trace!("=== on_gc_release ===");
+        self.access_stats(|stats| {
+            if let Some(plan) = mmtk.get_plan().generational() {
+                stats.generational_mem_stats_on_gc_release(plan);
+            } else {
+                stats.non_generational_mem_stats_on_gc_release(mmtk);
+            }
+        });
+    }
+
+    fn on_gc_end(&self, mmtk: &'static MMTK<VM>) {
+        trace!("=== on_gc_end ===");
+        self.access_stats(|stats| {
+            stats.gc_end_time = Instant::now();
+            stats.collection_time += (stats.gc_end_time - stats.gc_start_time).as_secs_f64();
+            trace!(
+                "gc_end = {:?}, collection_time = {}",
+                stats.gc_end_time,
+                stats.collection_time
+            );
+
+            if let Some(plan) = mmtk.get_plan().generational() {
+                if stats.generational_mem_stats_on_gc_end(plan) {
+                    self.compute_new_heap_limit(
+                        mmtk.get_plan().get_reserved_pages(),
+                        // We reserve an extra of min nursery. This ensures that we will not trigger
+                        // a full heap GC in the next GC (if available pages is smaller than min nursery, we will force a full heap GC)
+                        mmtk.get_plan().get_collection_reserved_pages()
+                            + mmtk.gc_trigger.get_min_nursery_pages(),
+                        stats,
+                    );
+                }
+            } else {
+                stats.non_generational_mem_stats_on_gc_end(mmtk);
+                self.compute_new_heap_limit(
+                    mmtk.get_plan().get_reserved_pages(),
+                    mmtk.get_plan().get_collection_reserved_pages(),
+                    stats,
+                );
+            }
+        });
+        // Clear pending allocation pages at the end of GC, no matter we used it or not.
+        self.pending_pages.store(0, Ordering::SeqCst);
+    }
+
+    fn is_heap_full(&self, plan: &dyn Plan<VM = VM>) -> bool {
+        // If reserved pages is larger than the current heap size, the heap is full.
+        plan.get_reserved_pages() > self.current_heap_pages.load(Ordering::Relaxed)
+    }
+
+    fn get_current_heap_size_in_pages(&self) -> usize {
+        self.current_heap_pages.load(Ordering::Relaxed)
+    }
+
+    fn get_max_heap_size_in_pages(&self) -> usize {
+        self.max_heap_pages
+    }
+
+    fn can_heap_size_grow(&self) -> bool {
+        self.current_heap_pages.load(Ordering::Relaxed) < self.max_heap_pages
+    }
+}
+impl MemBalancerTrigger {
+    fn new(min_heap_pages: usize, max_heap_pages: usize) -> Self {
+        Self {
+            min_heap_pages,
+            max_heap_pages,
+            pending_pages: AtomicUsize::new(0),
+            // start with min heap
+            current_heap_pages: AtomicUsize::new(min_heap_pages),
+            stats: AtomicRefCell::new(Default::default()),
+        }
+    }
+
+    fn access_stats<F>(&self, mut f: F)
+    where
+        F: FnMut(&mut MemBalancerStats),
+    {
+        let mut stats = self.stats.borrow_mut();
+        f(&mut stats);
+    }
+
+    fn compute_new_heap_limit(
+        &self,
+        live: usize,
+        extra_reserve: usize,
+        stats: &mut MemBalancerStats,
+    ) {
+        trace!("compute new heap limit: {:?}", stats);
+
+        // Constants from the original paper
+        const ALLOCATION_SMOOTH_FACTOR: f64 = 0.95;
+        const COLLECTION_SMOOTH_FACTOR: f64 = 0.5;
+        const TUNING_FACTOR: f64 = 0.2;
+
+        // Smooth memory/time for allocation/collection
+        let smooth = |prev: Option<f64>, cur, factor| {
+            prev.map(|p| p * factor + cur * (1.0f64 - factor))
+                .unwrap_or(cur)
+        };
+        let alloc_mem = smooth(
+            stats.allocation_pages_prev,
+            stats.allocation_pages,
+            ALLOCATION_SMOOTH_FACTOR,
+        );
+        let alloc_time = smooth(
+            stats.allocation_time_prev,
+            stats.allocation_time,
+            ALLOCATION_SMOOTH_FACTOR,
+        );
+        let gc_mem = smooth(
+            stats.collection_pages_prev,
+            stats.collection_pages,
+            COLLECTION_SMOOTH_FACTOR,
+        );
+        let gc_time = smooth(
+            stats.collection_time_prev,
+            stats.collection_time,
+            COLLECTION_SMOOTH_FACTOR,
+        );
+        trace!(
+            "after smoothing, alloc mem = {}, alloc_time = {}",
+            alloc_mem,
+            alloc_time
+        );
+        trace!(
+            "after smoothing, gc mem    = {}, gc_time    = {}",
+            gc_mem,
+            gc_time
+        );
+
+        // We got the smoothed stats. Now save the current stats as previous stats
+        stats.allocation_pages_prev = Some(stats.allocation_pages);
+        stats.allocation_pages = 0f64;
+        stats.allocation_time_prev = Some(stats.allocation_time);
+        stats.allocation_time = 0f64;
+        stats.collection_pages_prev = Some(stats.collection_pages);
+        stats.collection_pages = 0f64;
+        stats.collection_time_prev = Some(stats.collection_time);
+        stats.collection_time = 0f64;
+
+        // Calculate the square root
+        let e: f64 = if alloc_mem != 0f64 && gc_mem != 0f64 && alloc_time != 0f64 && gc_time != 0f64
+        {
+            let mut e = live as f64;
+            e *= alloc_mem / alloc_time;
+            e /= TUNING_FACTOR;
+            e /= gc_mem / gc_time;
+            e.sqrt()
+        } else {
+            // If any collected stat is abnormal, we use the fallback heuristics.
+            (live as f64 * 4096f64).sqrt()
+        };
+
+        // Get pending allocations
+        let pending_pages = self.pending_pages.load(Ordering::SeqCst);
+
+        // This is the optimal heap limit due to mem balancer. We will need to clamp the value to the defined min/max range.
+        let optimal_heap = live + e as usize + extra_reserve + pending_pages;
+        trace!(
+            "optimal = live {} + sqrt(live) {} + extra {}",
+            live,
+            e,
+            extra_reserve
+        );
+
+        // The new heap size must be within min/max.
+        let new_heap = optimal_heap.clamp(self.min_heap_pages, self.max_heap_pages);
+        debug!(
+            "MemBalander: new heap limit = {} pages (optimal = {}, clamped to [{}, {}])",
+            new_heap, optimal_heap, self.min_heap_pages, self.max_heap_pages
+        );
+        self.current_heap_pages.store(new_heap, Ordering::Relaxed);
+    }
+}
