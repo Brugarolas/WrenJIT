@@ -2,11 +2,9 @@
 
 **WrenJIT** is a high-performance, Wren-derived language runtime built around a register VM, a multi-stage optimizing compiler, a tracing JIT backed by Cranelift, precise moving garbage collection, and an extended asynchronous runtime.
 
-> **Project status:** WrenJIT is entering its final feature-freeze and documentation/compatibility audit. After that audit, this engine will be preserved as the final Wren-derived release. Further language development will continue separately as **Napalm**, which is free to abandon Wren syntax and compatibility entirely.
-
 WrenJIT began as an attempt to make Wren dramatically faster. It eventually grew beyond that goal: the runtime now contains its own SSA IR, register bytecode, optimizing interpreter, tracing JIT, moving GC integration, structured exceptions, `defer`, `async`/`await`, cancellable Promises, microtasks, timers, and a static module graph.
 
-WrenJIT should therefore be understood as **Wren-derived, not as a promise of drop-in compatibility with every official Wren embedding or implementation detail**.
+WrenJIT should therefore be understood as **Wren-derived, not as a promise of drop-in compatibility with every official Wren embedding or implementation detail, although compatibility is sear 100%**.
 
 ---
 
@@ -53,6 +51,10 @@ For published numbers:
 7. Verify checksums before accepting timing results.
 8. Treat process-startup/compile latency as a **separate benchmark**. The in-script `System.clock` measurements intentionally focus on execution throughput.
 9. Report regressions as well as wins. A benchmark table is more valuable if it is reproducible than if every row is flattering.
+
+# Project Status
+
+> **Project status:** WrenJIT is entering its final feature-freeze and documentation/compatibility audit. After that audit, this engine will be preserved as the final Wren-derived release. Further language development will continue separately as **Napalm**, which is free to abandon Wren syntax and compatibility entirely.
 
 ---
 
@@ -635,24 +637,3 @@ In particular, upstream Wren's concurrency model is based on cooperative Fibers,
 
 Before publishing WrenJIT, keep the upstream copyright/license notices required by the Wren code or assets actually carried by the repository.
 
----
-
-# Final-release checklist
-
-Before tagging the frozen WrenJIT release:
-
-- [ ] audit README claims against every current source module;
-- [ ] audit every Wren language feature for compatibility or document deviations;
-- [ ] run the full Rust unit/integration suite in release mode;
-- [ ] run all existing GC/JIT/hot-function scripts;
-- [ ] run every new portable benchmark on Wren, WrenLift and WrenJIT;
-- [ ] verify checksums match before recording timing data;
-- [ ] run WrenJIT-only async/timer/exception/module regressions;
-- [ ] fill the performance tables with reproducible medians;
-- [ ] record hardware, OS, compiler versions and git revisions;
-- [ ] verify GC stress with small heaps and repeated forced collections;
-- [ ] verify JIT-off mode separately from JIT-on mode;
-- [ ] verify final package/module search paths on each supported OS;
-- [ ] verify license/attribution files;
-- [ ] tag and freeze WrenJIT;
-- [ ] begin Napalm (Reloaded).
