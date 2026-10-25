@@ -30,3 +30,5 @@ mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually fast
 #bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator similar to arena allocator
 cranelift = { version = "0.137.0", features = ["jit", "module", "native"] } #JIT
 mmtk = { version = "0.33.0", path = "crates/mmtk/" }
+libffi = "5.2.0" # Native C calls
+libloading = "0.9.0" # Dynamic library loading

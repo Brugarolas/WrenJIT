@@ -296,13 +296,16 @@ pub enum BuiltinId {
     Date = 12,
     Random = 13,
     Promise = 14,
+    Timer = 15,
+    FFI = 16,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
+        Self::Timer, Self::FFI,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -314,6 +317,8 @@ impl BuiltinId {
             Self::Date => "Date",
             Self::Random => "Random",
             Self::Promise => "Promise",
+            Self::Timer => "Timer",
+            Self::FFI => "FFI",
         }
     }
     #[inline] pub const fn index(self) -> usize { self as usize }
