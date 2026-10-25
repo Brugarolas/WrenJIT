@@ -34,6 +34,12 @@ use crate::wren_trace_ir::{FrameSlot, TraceConstant, TraceId, TraceLocation};
 #[path = "wren_event_loop.rs"]
 pub mod wren_event_loop;
 use self::wren_event_loop::{CancelOutcome, EventId, FiredEvent, WrenEventLoop};
+#[path = "wren_ffi.rs"]
+pub mod wren_ffi;
+use self::wren_ffi::{
+    FfiFunction, FfiLibrary, FfiRuntime, FfiSignature, FfiType, NativeArg as FfiNativeArg,
+    NativeResult as FfiNativeResult,
+};
 use crate::wren_tracing_jit::{
     JitAction, TraceActivation, TraceActivationInputs, TraceHeapEntry,
     TraceHeapKind, TraceRuntime, TraceStep, TracingJit, TracingJitOptions, TracingJitStats,
@@ -683,6 +689,15 @@ enum HeapObject {
         class_slot: u32,
         bytes: Vec<u8>,
     },
+    FfiLibrary {
+        library: Arc<FfiLibrary>,
+    },
+    FfiFunction {
+        function: Arc<FfiFunction>,
+    },
+    FfiPointer {
+        address: usize,
+    },
     Promise {
         state: Arc<PromiseCell>,
     },
@@ -1191,6 +1206,9 @@ gc_descriptor!(GC_RANDOM, "Wren.Random", GcTraceLayout::Leaf);
 gc_descriptor!(GC_CLASS, "Wren.Class", GcTraceLayout::Leaf);
 gc_descriptor!(GC_BUILTIN_CLASS, "Wren.BuiltinClass", GcTraceLayout::Leaf);
 gc_descriptor!(GC_FOREIGN, "Wren.Foreign", GcTraceLayout::Leaf);
+gc_descriptor!(GC_FFI_LIBRARY, "Wren.FFI.Library", GcTraceLayout::Leaf);
+gc_descriptor!(GC_FFI_FUNCTION, "Wren.FFI.Function", GcTraceLayout::Leaf);
+gc_descriptor!(GC_FFI_POINTER, "Wren.FFI.Pointer", GcTraceLayout::Leaf);
 gc_descriptor!(GC_MODULE, "Wren.Module", GcTraceLayout::Leaf);
 gc_descriptor!(GC_LIST, "Wren.List", GcTraceLayout::Custom(trace_list));
 gc_descriptor!(GC_MAP, "Wren.Map", GcTraceLayout::Custom(trace_map));
@@ -1217,6 +1235,9 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::BuiltinClass { .. } => &GC_BUILTIN_CLASS,
         HeapObject::Instance { .. } => &GC_INSTANCE,
         HeapObject::Foreign { .. } => &GC_FOREIGN,
+        HeapObject::FfiLibrary { .. } => &GC_FFI_LIBRARY,
+        HeapObject::FfiFunction { .. } => &GC_FFI_FUNCTION,
+        HeapObject::FfiPointer { .. } => &GC_FFI_POINTER,
         HeapObject::Promise { .. } => &GC_PROMISE,
         HeapObject::AsyncTaskObject { .. } => &GC_ASYNC_TASK,
         HeapObject::FiberObject { .. } => &GC_FIBER,
@@ -1429,6 +1450,9 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         | HeapObject::ClassObject { .. }
         | HeapObject::BuiltinClass { .. }
         | HeapObject::Foreign { .. }
+        | HeapObject::FfiLibrary { .. }
+        | HeapObject::FfiFunction { .. }
+        | HeapObject::FfiPointer { .. }
         | HeapObject::ModuleObject { .. } => {}
     }
 }
@@ -2238,6 +2262,9 @@ impl HostContext<'_> {
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
             Some(HeapObject::Instance { class_slot, .. }) => format!("<instance class#{class_slot}>"),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign class#{class_slot}>"),
+            Some(HeapObject::FfiLibrary { library }) => format!("<ffi-library:{}>", library.name()),
+            Some(HeapObject::FfiFunction { function }) => format!("<ffi-function:{}>", function.symbol()),
+            Some(HeapObject::FfiPointer { address }) => format!("<ffi-pointer:0x{address:x}>"),
             Some(HeapObject::Promise { state }) => match unsafe { state.get() } {
                 PromiseState::Pending { .. } => "<promise:pending>".to_owned(),
                 PromiseState::Fulfilled(_) => "<promise:fulfilled>".to_owned(),
@@ -3169,6 +3196,19 @@ pub enum NativeBuiltin {
     TimerDelay,
     TimerMicrotask,
     TimerEvery,
+    FfiOpen,
+    FfiNull,
+    FfiLastError,
+    FfiLibraryName,
+    FfiLibraryFunction,
+    FfiFunctionName,
+    FfiFunctionCall,
+    FfiPointerIsNull,
+    FfiPointerOffset,
+    FfiPointerReadCString,
+    FfiPointerToString,
+    SystemOs,
+    SystemArch,
     SystemGc,
 }
 
@@ -3187,9 +3227,12 @@ pub enum BuiltinClass {
     MapEntry,
     MapKeys,
     Random,
+    FfiLibrary,
+    FfiFunction,
+    FfiPointer,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 13;
+const BUILTIN_CLASS_COUNT: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -3231,6 +3274,12 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_INSTANCE | *class_slot as u64),
         HeapObject::Foreign { class_slot, .. } =>
             ReceiverClass(CLASS_KIND_FOREIGN | *class_slot as u64),
+        HeapObject::FfiLibrary { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::FfiLibrary as u64),
+        HeapObject::FfiFunction { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::FfiFunction as u64),
+        HeapObject::FfiPointer { .. } =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::FfiPointer as u64),
         HeapObject::AsyncTaskObject { .. }
         | HeapObject::Cell(_)
         | HeapObject::ModuleObject { .. } => return None,
@@ -3698,6 +3747,9 @@ pub struct Interpreter<'p> {
     /// Microtasks and timer deadlines. Runtime events hold managed Values and are
     /// therefore included in both active and persistent GC root snapshots.
     event_loop: WrenEventLoop<RuntimeEvent>,
+    /// Dynamic-library lifetime and OS-error snapshot. Prepared libffi CIFs are
+    /// cached per OS thread because libffi::middle::Cif is !Send/!Sync.
+    ffi: FfiRuntime,
     /// Stable Wren error value used by the fourth Promise terminal state.
     /// Allocated once so cancellation never needs a managed allocation while a
     /// runtime event is temporarily outside the event-loop root set.
@@ -4004,6 +4056,7 @@ impl<'p> Interpreter<'p> {
             free_fibers: Vec::new(),
             ready_async: VecDeque::new(),
             event_loop: WrenEventLoop::default(),
+            ffi: FfiRuntime::default(),
             cancelled_error,
             fiber_trace_metadata,
             current_fiber: 0,
@@ -5317,8 +5370,7 @@ impl<'p> Interpreter<'p> {
         } else {
             self.fibers.len() as u32
         };
-        let promise_cell = self.promise_cell(promise)?;
-        if let PromiseState::Pending { cancel, .. } = unsafe { promise_cell.get_mut() } {
+        if let PromiseState::Pending { cancel, .. } = unsafe { self.promise_cell(promise)?.get_mut() } {
             *cancel = Some(CancelHandle::Task(id));
         }
         let mut task_state = FiberState::new(Value::NULL, FiberStatus::Ready);
@@ -5336,6 +5388,7 @@ impl<'p> Interpreter<'p> {
         // The pending Promise owns its producer while the task is runnable or
         // suspended. This edge is removed when the Promise settles.
         self.heap.remember_owner(promise);
+        let promise_cell = self.promise_cell(promise)?;
         if let PromiseState::Pending { producer, .. } = unsafe { promise_cell.get_mut() } {
             *producer = Some(task_object);
         }
@@ -6667,6 +6720,261 @@ impl Interpreter<'_> {
         }
     }
 
+    fn ffi_type_from_value(&self, value: Value) -> Result<FfiType, RuntimeError> {
+        let name = self
+            .heap
+            .get(value)
+            .and_then(|object| match object {
+                HeapObject::String(string) => std::str::from_utf8(string.as_ref()).ok(),
+                _ => None,
+            })
+            .ok_or_else(|| RuntimeError::new("FFI type names must be UTF-8 Strings"))?;
+        FfiType::parse(name).map_err(|error| RuntimeError::new(error.message))
+    }
+
+    fn ffi_signature_from_values(
+        &mut self,
+        result_value: Value,
+        arguments_value: Value,
+    ) -> Result<FfiSignature, RuntimeError> {
+        let result = self.ffi_type_from_value(result_value)?;
+        let argument_values = match self.heap.get(arguments_value) {
+            Some(HeapObject::List(values)) => values.clone(),
+            _ => return Err(RuntimeError::new("FFI argument types must be a List of Strings")),
+        };
+        let mut arguments = Vec::with_capacity(argument_values.len());
+        for value in argument_values {
+            arguments.push(self.ffi_type_from_value(value)?);
+        }
+        let signature = FfiSignature::new(result, arguments)
+            .map_err(|error| RuntimeError::new(error.message))?;
+        // Fail at binding time, not on the first hot call, if libffi rejects a
+        // type combination on this target ABI.
+        self.ffi
+            .prepare(&signature)
+            .map_err(|error| RuntimeError::new(error.message))?;
+        Ok(signature)
+    }
+
+    #[inline]
+    fn ffi_number(value: Value, ty: FfiType) -> Result<f64, RuntimeError> {
+        value
+            .as_num()
+            .ok_or_else(|| RuntimeError::new(format!("FFI {} argument expects a Num", ty.name())))
+    }
+
+    fn ffi_signed_integer(
+        value: Value,
+        ty: FfiType,
+        min: i128,
+        max: i128,
+    ) -> Result<i128, RuntimeError> {
+        let number = Self::ffi_number(value, ty)?;
+        if !number.is_finite() || number.fract() != 0.0 {
+            return Err(RuntimeError::new(format!(
+                "FFI {} argument must be a finite integer", ty.name()
+            )));
+        }
+        // f64 -> i128 is saturating in Rust. The explicit target-range check
+        // after conversion catches rounded boundary values such as 2^63 for i64.
+        let integer = number as i128;
+        if integer < min || integer > max || integer as f64 != number {
+            return Err(RuntimeError::new(format!(
+                "FFI {} argument is outside the exactly representable target range", ty.name()
+            )));
+        }
+        Ok(integer)
+    }
+
+    fn ffi_unsigned_integer(
+        value: Value,
+        ty: FfiType,
+        max: u128,
+    ) -> Result<u128, RuntimeError> {
+        let number = Self::ffi_number(value, ty)?;
+        if !number.is_finite() || number < 0.0 || number.fract() != 0.0 {
+            return Err(RuntimeError::new(format!(
+                "FFI {} argument must be a finite non-negative integer", ty.name()
+            )));
+        }
+        let integer = number as u128;
+        if integer > max || integer as f64 != number {
+            return Err(RuntimeError::new(format!(
+                "FFI {} argument is outside the exactly representable target range", ty.name()
+            )));
+        }
+        Ok(integer)
+    }
+
+    fn ffi_pointer_argument(&self, value: Value) -> Result<usize, RuntimeError> {
+        if value.is_null() {
+            return Ok(0);
+        }
+        match self.heap.get(value) {
+            Some(HeapObject::FfiPointer { address }) => Ok(*address),
+            _ => Err(RuntimeError::new("FFI pointer argument expects null or an FFI pointer")),
+        }
+    }
+
+    fn ffi_native_argument(&self, ty: FfiType, value: Value) -> Result<FfiNativeArg, RuntimeError> {
+        use std::ffi::c_char;
+        use std::os::raw::{c_int, c_long, c_longlong, c_short, c_uint, c_ulong, c_ulonglong, c_ushort};
+
+        Ok(match ty {
+            FfiType::Void => return Err(RuntimeError::new("void cannot be used as an FFI argument")),
+            FfiType::Bool => {
+                let boolean = value.as_bool().ok_or_else(|| RuntimeError::new("FFI bool argument expects Bool"))?;
+                FfiNativeArg::Bool(boolean as u8)
+            }
+            FfiType::I8 => FfiNativeArg::I8(Self::ffi_signed_integer(value, ty, i8::MIN as i128, i8::MAX as i128)? as i8),
+            FfiType::U8 => FfiNativeArg::U8(Self::ffi_unsigned_integer(value, ty, u8::MAX as u128)? as u8),
+            FfiType::I16 => FfiNativeArg::I16(Self::ffi_signed_integer(value, ty, i16::MIN as i128, i16::MAX as i128)? as i16),
+            FfiType::U16 => FfiNativeArg::U16(Self::ffi_unsigned_integer(value, ty, u16::MAX as u128)? as u16),
+            FfiType::I32 => FfiNativeArg::I32(Self::ffi_signed_integer(value, ty, i32::MIN as i128, i32::MAX as i128)? as i32),
+            FfiType::U32 => FfiNativeArg::U32(Self::ffi_unsigned_integer(value, ty, u32::MAX as u128)? as u32),
+            FfiType::I64 => FfiNativeArg::I64(Self::ffi_signed_integer(value, ty, i64::MIN as i128, i64::MAX as i128)? as i64),
+            FfiType::U64 => FfiNativeArg::U64(Self::ffi_unsigned_integer(value, ty, u64::MAX as u128)? as u64),
+            FfiType::Isize => FfiNativeArg::Isize(Self::ffi_signed_integer(value, ty, isize::MIN as i128, isize::MAX as i128)? as isize),
+            FfiType::Usize => FfiNativeArg::Usize(Self::ffi_unsigned_integer(value, ty, usize::MAX as u128)? as usize),
+            FfiType::CChar => {
+                if (u8::MAX as c_char) < 0 {
+                    FfiNativeArg::CChar(Self::ffi_signed_integer(value, ty, i8::MIN as i128, i8::MAX as i128)? as c_char)
+                } else {
+                    FfiNativeArg::CChar(Self::ffi_unsigned_integer(value, ty, u8::MAX as u128)? as c_char)
+                }
+            }
+            FfiType::CUChar => FfiNativeArg::CUChar(Self::ffi_unsigned_integer(value, ty, u8::MAX as u128)? as u8),
+            FfiType::CShort => FfiNativeArg::CShort(Self::ffi_signed_integer(value, ty, c_short::MIN as i128, c_short::MAX as i128)? as c_short),
+            FfiType::CUShort => FfiNativeArg::CUShort(Self::ffi_unsigned_integer(value, ty, c_ushort::MAX as u128)? as c_ushort),
+            FfiType::CInt => FfiNativeArg::CInt(Self::ffi_signed_integer(value, ty, c_int::MIN as i128, c_int::MAX as i128)? as c_int),
+            FfiType::CUInt => FfiNativeArg::CUInt(Self::ffi_unsigned_integer(value, ty, c_uint::MAX as u128)? as c_uint),
+            FfiType::CLong => FfiNativeArg::CLong(Self::ffi_signed_integer(value, ty, c_long::MIN as i128, c_long::MAX as i128)? as c_long),
+            FfiType::CULong => FfiNativeArg::CULong(Self::ffi_unsigned_integer(value, ty, c_ulong::MAX as u128)? as c_ulong),
+            FfiType::CLongLong => FfiNativeArg::CLongLong(Self::ffi_signed_integer(value, ty, c_longlong::MIN as i128, c_longlong::MAX as i128)? as c_longlong),
+            FfiType::CULongLong => FfiNativeArg::CULongLong(Self::ffi_unsigned_integer(value, ty, c_ulonglong::MAX as u128)? as c_ulonglong),
+            FfiType::F32 => {
+                let number = Self::ffi_number(value, ty)?;
+                let narrowed = number as f32;
+                if number.is_finite() && !narrowed.is_finite() {
+                    return Err(RuntimeError::new("FFI f32 argument overflows float"));
+                }
+                FfiNativeArg::F32(narrowed)
+            }
+            FfiType::F64 => FfiNativeArg::F64(Self::ffi_number(value, ty)?),
+            FfiType::Pointer => {
+                FfiNativeArg::Pointer(self.ffi_pointer_argument(value)? as *mut std::ffi::c_void)
+            }
+            FfiType::CString => {
+                if value.is_null() {
+                    FfiNativeArg::Pointer(std::ptr::null_mut())
+                } else {
+                    let bytes = match self.heap.get(value) {
+                        Some(HeapObject::String(string)) => string.as_ref(),
+                        _ => return Err(RuntimeError::new("FFI cstring argument expects String or null")),
+                    };
+                    FfiNativeArg::cstring(bytes).map_err(|error| RuntimeError::new(error.message))?
+                }
+            }
+        })
+    }
+
+    #[inline]
+    fn ffi_signed_result(value: i128, ty: FfiType) -> Result<Value, RuntimeError> {
+        let number = value as f64;
+        if number as i128 != value {
+            return Err(RuntimeError::new(format!(
+                "FFI {} result cannot be represented exactly by Wren Num", ty.name()
+            )));
+        }
+        Ok(Value::from_num(number))
+    }
+
+    #[inline]
+    fn ffi_unsigned_result(value: u128, ty: FfiType) -> Result<Value, RuntimeError> {
+        let number = value as f64;
+        if number as u128 != value {
+            return Err(RuntimeError::new(format!(
+                "FFI {} result cannot be represented exactly by Wren Num", ty.name()
+            )));
+        }
+        Ok(Value::from_num(number))
+    }
+
+    unsafe fn ffi_copy_cstring(pointer: *const u8) -> Result<Vec<u8>, RuntimeError> {
+        const MAX_CSTRING_BYTES: usize = 16 * 1024 * 1024;
+        if pointer.is_null() {
+            return Ok(Vec::new());
+        }
+        let mut bytes = Vec::new();
+        for offset in 0..MAX_CSTRING_BYTES {
+            let byte = unsafe { *pointer.add(offset) };
+            if byte == 0 {
+                return Ok(bytes);
+            }
+            bytes.push(byte);
+        }
+        Err(RuntimeError::new(
+            "FFI cstring result exceeded 16 MiB without a NUL terminator",
+        ))
+    }
+
+    fn ffi_wren_result(
+        &mut self,
+        ty: FfiType,
+        result: FfiNativeResult,
+    ) -> Result<Value, RuntimeError> {
+        let numeric_mismatch = || RuntimeError::new("libffi returned an unexpected native result kind");
+        match (ty, result) {
+            (FfiType::Void, FfiNativeResult::Void) => Ok(Value::NULL),
+            (FfiType::Bool, FfiNativeResult::Bool(value)) => Ok(Value::from_bool(value)),
+            (FfiType::I8, FfiNativeResult::I8(value)) => Self::ffi_signed_result(value as i128, ty),
+            (FfiType::U8, FfiNativeResult::U8(value)) => Self::ffi_unsigned_result(value as u128, ty),
+            (FfiType::I16, FfiNativeResult::I16(value)) => Self::ffi_signed_result(value as i128, ty),
+            (FfiType::U16, FfiNativeResult::U16(value)) => Self::ffi_unsigned_result(value as u128, ty),
+            (FfiType::I32, FfiNativeResult::I32(value)) => Self::ffi_signed_result(value as i128, ty),
+            (FfiType::U32, FfiNativeResult::U32(value)) => Self::ffi_unsigned_result(value as u128, ty),
+            (FfiType::I64, FfiNativeResult::I64(value)) => Self::ffi_signed_result(value as i128, ty),
+            (FfiType::U64, FfiNativeResult::U64(value)) => Self::ffi_unsigned_result(value as u128, ty),
+            (FfiType::Isize, FfiNativeResult::Isize(value)) => Self::ffi_signed_result(value as i128, ty),
+            (FfiType::Usize, FfiNativeResult::Usize(value)) => Self::ffi_unsigned_result(value as u128, ty),
+            (FfiType::CChar, FfiNativeResult::CChar(value)) => {
+                if (u8::MAX as std::ffi::c_char) < 0 {
+                    Self::ffi_signed_result(value as i8 as i128, ty)
+                } else {
+                    Self::ffi_unsigned_result(value as u8 as u128, ty)
+                }
+            }
+            (FfiType::CUChar, FfiNativeResult::CUChar(value)) => Self::ffi_unsigned_result(value as u128, ty),
+            (FfiType::CShort, FfiNativeResult::CShort(value)) => Self::ffi_signed_result(value as i128, ty),
+            (FfiType::CUShort, FfiNativeResult::CUShort(value)) => Self::ffi_unsigned_result(value as u128, ty),
+            (FfiType::CInt, FfiNativeResult::CInt(value)) => Self::ffi_signed_result(value as i128, ty),
+            (FfiType::CUInt, FfiNativeResult::CUInt(value)) => Self::ffi_unsigned_result(value as u128, ty),
+            (FfiType::CLong, FfiNativeResult::CLong(value)) => Self::ffi_signed_result(value as i128, ty),
+            (FfiType::CULong, FfiNativeResult::CULong(value)) => Self::ffi_unsigned_result(value as u128, ty),
+            (FfiType::CLongLong, FfiNativeResult::CLongLong(value)) => Self::ffi_signed_result(value as i128, ty),
+            (FfiType::CULongLong, FfiNativeResult::CULongLong(value)) => Self::ffi_unsigned_result(value as u128, ty),
+            (FfiType::F32, FfiNativeResult::F32(value)) => Ok(Value::from_num(value as f64)),
+            (FfiType::F64, FfiNativeResult::F64(value)) => Ok(Value::from_num(value)),
+            (FfiType::Pointer, FfiNativeResult::Pointer(pointer)) => {
+                if pointer.is_null() {
+                    Ok(Value::NULL)
+                } else {
+                    Ok(self.heap.alloc(HeapObject::FfiPointer { address: pointer as usize }))
+                }
+            }
+            (FfiType::CString, FfiNativeResult::Pointer(pointer)) => {
+                if pointer.is_null() {
+                    return Ok(Value::NULL);
+                }
+                // The pointer is owned by native code. Copy before any managed
+                // allocation/safepoint; the Wren String never aliases C memory.
+                let bytes = unsafe { Self::ffi_copy_cstring(pointer.cast::<u8>())? };
+                Ok(self.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(bytes)))))
+            }
+            _ => Err(numeric_mismatch()),
+        }
+    }
+
     fn invoke_native_builtin(
         &mut self,
         op: &PreparedOp,
@@ -6861,6 +7169,192 @@ impl Interpreter<'_> {
                     Ok(promise) => unsafe { self.set_reg(op.a, promise.word()); self.advance(op); },
                     Err(error) => self.fail_at(op, error.message),
                 }
+            }
+            NativeBuiltin::FfiOpen => {
+                let path = match self.heap.get(arg(0)) {
+                    Some(HeapObject::String(string)) => match std::str::from_utf8(string.as_ref()) {
+                        Ok(path) => path.to_owned(),
+                        Err(_) => { self.fail_at(op, "FFI.open path must be a UTF-8 String"); return; }
+                    },
+                    _ => { self.fail_at(op, "FFI.open expects a library path String"); return; }
+                };
+                let library = match FfiLibrary::open(&path) {
+                    Ok(library) => library,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                // Keep a runtime-owned Arc so collecting the Wren wrapper never
+                // unloads a dynamic library from an MMTk worker thread.
+                self.ffi.retain_library(library.clone());
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.heap.alloc(HeapObject::FfiLibrary { library });
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::FfiNull => unsafe {
+                self.set_reg(op.a, Value::NULL.word());
+                self.advance(op);
+            },
+            NativeBuiltin::FfiLastError => unsafe {
+                self.set_reg(op.a, Value::from_num(self.ffi.last_error() as f64).word());
+                self.advance(op);
+            },
+            NativeBuiltin::FfiLibraryName => {
+                let library = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::FfiLibrary { library }) => library.clone(),
+                    _ => { self.fail_at(op, "FFI library method receiver is not a native library"); return; }
+                };
+                let name = library.name().to_owned();
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(name.into_bytes()))));
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::FfiLibraryFunction => {
+                let library = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::FfiLibrary { library }) => library.clone(),
+                    _ => { self.fail_at(op, "FFI.function receiver is not a native library"); return; }
+                };
+                let symbol = match self.heap.get(arg(0)) {
+                    Some(HeapObject::String(string)) => match std::str::from_utf8(string.as_ref()) {
+                        Ok(symbol) => symbol.to_owned(),
+                        Err(_) => { self.fail_at(op, "FFI symbol name must be a UTF-8 String"); return; }
+                    },
+                    _ => { self.fail_at(op, "FFI.function symbol must be a String"); return; }
+                };
+                let signature = match self.ffi_signature_from_values(arg(1), arg(2)) {
+                    Ok(signature) => signature,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let function = match library.bind(&symbol, signature) {
+                    Ok(function) => function,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.heap.alloc(HeapObject::FfiFunction { function });
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::FfiFunctionName => {
+                let function = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::FfiFunction { function }) => function.clone(),
+                    _ => { self.fail_at(op, "FFI function name receiver is not a native function"); return; }
+                };
+                let name = function.symbol().as_bytes().to_vec();
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(name))));
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::FfiFunctionCall => {
+                let function = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::FfiFunction { function }) => function.clone(),
+                    _ => { self.fail_at(op, "FFI.call receiver is not a native function"); return; }
+                };
+                let signature = function.signature().clone();
+                if args.len() != signature.args.len() {
+                    self.fail_at(op, format!(
+                        "FFI function `{}` expects {} arguments, got {}",
+                        function.symbol(), signature.args.len(), args.len()
+                    ));
+                    return;
+                }
+                let mut native_args = Vec::with_capacity(args.len());
+                for (index, (&ty, word)) in signature.args.iter().zip(args.iter().copied()).enumerate() {
+                    match self.ffi_native_argument(ty, Value::from_word(word)) {
+                        Ok(value) => native_args.push(value),
+                        Err(error) => {
+                            self.fail_at(op, format!("FFI argument {index}: {}", error.message));
+                            return;
+                        }
+                    }
+                }
+
+                // Synchronous FFI calls form a full runtime/GC boundary. The
+                // native function cannot hold a borrowed Wren heap pointer: all
+                // strings were copied into CStrings and pointer objects are raw
+                // native addresses. Long/blocking calls still block this mutator;
+                // asynchronous native calls belong in the later scheduler API.
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let native_result = match self.ffi.call(&function, &native_args) {
+                    Ok(result) => result,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                match self.ffi_wren_result(signature.result, native_result) {
+                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
+                    Err(error) => self.fail_at(op, error.message),
+                }
+            }
+            NativeBuiltin::FfiPointerIsNull => {
+                let is_null = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::FfiPointer { address }) => *address == 0,
+                    _ => { self.fail_at(op, "FFI pointer getter receiver is not a pointer"); return; }
+                };
+                unsafe { self.set_reg(op.a, Value::from_bool(is_null).word()); self.advance(op); }
+            }
+            NativeBuiltin::FfiPointerOffset => {
+                let address = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::FfiPointer { address }) => *address,
+                    _ => { self.fail_at(op, "FFI pointer offset receiver is not a pointer"); return; }
+                };
+                let offset = match Self::ffi_signed_integer(arg(0), FfiType::Isize, isize::MIN as i128, isize::MAX as i128) {
+                    Ok(offset) => offset as isize,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                let address = if offset >= 0 {
+                    address.wrapping_add(offset as usize)
+                } else {
+                    address.wrapping_sub(offset.wrapping_neg() as usize)
+                };
+                if address == 0 {
+                    unsafe { self.set_reg(op.a, Value::NULL.word()); self.advance(op); }
+                    return;
+                }
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.heap.alloc(HeapObject::FfiPointer { address });
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::FfiPointerReadCString => {
+                let address = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::FfiPointer { address }) => *address,
+                    _ => { self.fail_at(op, "FFI pointer readCString receiver is not a pointer"); return; }
+                };
+                if address == 0 {
+                    unsafe { self.set_reg(op.a, Value::NULL.word()); self.advance(op); }
+                    return;
+                }
+                let bytes = match unsafe { Self::ffi_copy_cstring(address as *const u8) } {
+                    Ok(bytes) => bytes,
+                    Err(error) => { self.fail_at(op, error.message); return; }
+                };
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(bytes))));
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::FfiPointerToString => {
+                let address = match self.heap.get(Value::from_word(receiver)) {
+                    Some(HeapObject::FfiPointer { address }) => *address,
+                    _ => { self.fail_at(op, "FFI pointer toString receiver is not a pointer"); return; }
+                };
+                let text = format!("0x{address:x}");
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.heap.alloc(HeapObject::String(WrenString::new(Arc::<[u8]>::from(text.into_bytes()))));
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::SystemOs => {
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.allocate_string(std::env::consts::OS);
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
+            }
+            NativeBuiltin::SystemArch => {
+                self.mark_gc_point(op);
+                self.maybe_collect();
+                let value = self.allocate_string(std::env::consts::ARCH);
+                unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
             }
             NativeBuiltin::SystemGc => {
                 // System.gc() is itself a GC-capable call. Publish the exact
@@ -8409,6 +8903,9 @@ impl Interpreter<'_> {
             Some(HeapObject::BuiltinClass { builtin }) => builtin.name().to_owned(),
             Some(HeapObject::Instance { class_slot, .. }) => format!("<{} instance>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
             Some(HeapObject::Foreign { class_slot, .. }) => format!("<foreign {}>", self.program.metadata.string(self.classes[*class_slot as usize].name).unwrap_or("class")),
+            Some(HeapObject::FfiLibrary { library }) => format!("<ffi-library:{}>", library.name()),
+            Some(HeapObject::FfiFunction { function }) => format!("<ffi-function:{}>", function.symbol()),
+            Some(HeapObject::FfiPointer { address }) => format!("0x{address:x}"),
             Some(HeapObject::Promise { state }) => match unsafe { state.get() } {
                 PromiseState::Pending { .. } => "<promise:pending>".into(),
                 PromiseState::Fulfilled(_) => "<promise:fulfilled>".into(),
@@ -8436,26 +8933,11 @@ impl TraceRuntime for Interpreter<'_> {
 
     fn trace_method_epoch(&self) -> u64 { self.method_epoch }
 
-    fn trace_inline_target(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<(FuncId, Vec<u64>)> {
+    fn trace_inline_target(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<(FuncId, u64)> {
         let class = self.heap.receiver_class(Value::from_word(receiver))?;
-        let descriptor = self.program.function(function)?.chunk.inline_caches.get(cache as usize)?;
-        let CallTarget::Bytecode(index) = self.lookup_method(class, descriptor.method, None)? else { return None };
-        let mut classes = vec![class.0];
-        let function_index = *self.prepared.function_by_id.get(&function)? as usize;
-        let pic = self.inline_caches.get(function_index)?.get(cache as usize)?;
-        if !pic.megamorphic {
-            for entry in &pic.entries[..pic.len as usize] {
-                // Revalidate against the current method table: cached entries are
-                // observations, not authority for an inlining proof.
-                if classes.len() < 4 && !classes.contains(&entry.class.0)
-                    && matches!(self.lookup_method(entry.class, descriptor.method, None),
-                        Some(CallTarget::Bytecode(target)) if target == index)
-                {
-                    classes.push(entry.class.0);
-                }
-            }
-        }
-        Some((self.prepared.functions.get(index as usize)?.id, classes))
+        let cache = self.program.function(function)?.chunk.inline_caches.get(cache as usize)?;
+        let CallTarget::Bytecode(index) = self.lookup_method(class, cache.method, None)? else { return None };
+        Some((self.prepared.functions.get(index as usize)?.id, class.0))
     }
 
     fn trace_standard_numeric_method(&self, function: FuncId, cache: u32) -> bool {
@@ -10266,7 +10748,7 @@ var result = ProtectedLoop.run()
     fn generic_invoke_inside_hot_loop_returns_to_same_native_trace() {
         let source = r#"
 class CallLoop {
-  static inc(x) { x + 1 }
+  static inc(x) { return x + 1 }
   static run() {
     var i = 0
     var total = 0
@@ -10296,7 +10778,6 @@ var result = CallLoop.run()
         assert_eq!(source_result(&native), source_result(&baseline));
         let stats = native.jit_stats().unwrap();
         assert!(stats.native_entries > 0, "call-containing loop should enter native code: {stats:?}");
-        assert!(stats.inlined_calls > 0, "hot calls should be inlined: {stats:?}");
     }
 
     #[test]

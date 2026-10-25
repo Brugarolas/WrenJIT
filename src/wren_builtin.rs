@@ -238,6 +238,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::MapEntry,
         BuiltinClass::MapKeys,
         BuiltinClass::Random,
+        BuiltinClass::FfiLibrary,
+        BuiltinClass::FfiFunction,
+        BuiltinClass::FfiPointer,
     ] {
         manifest.register(program, instance(class), "==", MethodKind::Method, 1, BuiltinPrimitive::ObjectEq);
         manifest.register(program, instance(class), "!=", MethodKind::Method, 1, BuiltinPrimitive::ObjectNe);
@@ -456,9 +459,45 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     // owns suspended continuation edges and participates directly in scheduling.
     manifest.register_native(program, static_(BuiltinId::Promise), "resolve", MethodKind::Method, 1, NativeBuiltin::PromiseResolve);
     manifest.register_native(program, static_(BuiltinId::Promise), "reject", MethodKind::Method, 1, NativeBuiltin::PromiseReject);
+    manifest.register_native(program, instance(BuiltinClass::Promise), "cancel", MethodKind::Method, 0, NativeBuiltin::PromiseCancel);
     manifest.register_native(program, instance(BuiltinClass::Promise), "isPending", MethodKind::Getter, 0, NativeBuiltin::PromiseIsPending);
     manifest.register_native(program, instance(BuiltinClass::Promise), "isFulfilled", MethodKind::Getter, 0, NativeBuiltin::PromiseIsFulfilled);
     manifest.register_native(program, instance(BuiltinClass::Promise), "isRejected", MethodKind::Getter, 0, NativeBuiltin::PromiseIsRejected);
+    manifest.register_native(program, instance(BuiltinClass::Promise), "isCancelled", MethodKind::Getter, 0, NativeBuiltin::PromiseIsCancelled);
+
+    // Timer is a static-only engine class. All operations return cancellable
+    // Promises; trailing Wren blocks are simply the final closure argument.
+    manifest.register_native(program, static_(BuiltinId::Timer), "delay", MethodKind::Method, 1, NativeBuiltin::TimerDelay);
+    manifest.register_native(program, static_(BuiltinId::Timer), "delay", MethodKind::Method, 2, NativeBuiltin::TimerDelay);
+    manifest.register_native(program, static_(BuiltinId::Timer), "microtask", MethodKind::Method, 1, NativeBuiltin::TimerMicrotask);
+    manifest.register_native(program, static_(BuiltinId::Timer), "every", MethodKind::Method, 2, NativeBuiltin::TimerEvery);
+
+    // Dynamic C FFI. The embedding Host::call_foreign API remains a separate
+    // mechanism; these objects are user-visible handles to dlopen/LoadLibrary +
+    // libffi calls made by the VM itself.
+    manifest.register_native(program, static_(BuiltinId::FFI), "open", MethodKind::Method, 1, NativeBuiltin::FfiOpen);
+    manifest.register_native(program, static_(BuiltinId::FFI), "null", MethodKind::Getter, 0, NativeBuiltin::FfiNull);
+    manifest.register_native(program, static_(BuiltinId::FFI), "lastError", MethodKind::Getter, 0, NativeBuiltin::FfiLastError);
+
+    manifest.register_native(program, instance(BuiltinClass::FfiLibrary), "name", MethodKind::Getter, 0, NativeBuiltin::FfiLibraryName);
+    manifest.register_native(program, instance(BuiltinClass::FfiLibrary), "function", MethodKind::Method, 3, NativeBuiltin::FfiLibraryFunction);
+
+    manifest.register_native(program, instance(BuiltinClass::FfiFunction), "name", MethodKind::Getter, 0, NativeBuiltin::FfiFunctionName);
+    for arity in 0..=16u8 {
+        manifest.register_native(
+            program,
+            instance(BuiltinClass::FfiFunction),
+            "call",
+            MethodKind::Method,
+            arity,
+            NativeBuiltin::FfiFunctionCall,
+        );
+    }
+
+    manifest.register_native(program, instance(BuiltinClass::FfiPointer), "isNull", MethodKind::Getter, 0, NativeBuiltin::FfiPointerIsNull);
+    manifest.register_native(program, instance(BuiltinClass::FfiPointer), "offset", MethodKind::Method, 1, NativeBuiltin::FfiPointerOffset);
+    manifest.register_native(program, instance(BuiltinClass::FfiPointer), "readCString", MethodKind::Method, 0, NativeBuiltin::FfiPointerReadCString);
+    manifest.register_native(program, instance(BuiltinClass::FfiPointer), "toString", MethodKind::Getter, 0, NativeBuiltin::FfiPointerToString);
 
     // System and Date are static-only engine classes.
     let system = static_(BuiltinId::System);
@@ -466,6 +505,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register(program, system, "print", MethodKind::Method, 1, BuiltinPrimitive::SystemPrint);
     manifest.register(program, system, "write", MethodKind::Method, 1, BuiltinPrimitive::SystemWrite);
     manifest.register(program, system, "clock", MethodKind::Getter, 0, BuiltinPrimitive::SystemClock);
+    manifest.register_native(program, system, "os", MethodKind::Method, 0, NativeBuiltin::SystemOs);
+    manifest.register_native(program, system, "arch", MethodKind::Method, 0, NativeBuiltin::SystemArch);
     manifest.register_native(program, system, "gc", MethodKind::Method, 0, NativeBuiltin::SystemGc);
 
     let date = static_(BuiltinId::Date);
