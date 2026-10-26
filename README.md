@@ -1,10 +1,12 @@
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/brugarolas)
+
 # WrenJIT
 
 **WrenJIT** is a high-performance, Wren-derived language runtime built around a register VM, a multi-stage optimizing compiler, a tracing JIT backed by Cranelift, precise moving garbage collection, and an extended asynchronous runtime.
 
 WrenJIT began as an attempt to make Wren dramatically faster. It eventually grew beyond that goal: the runtime now contains a register-based direct-threaded interpreter with super-instructions, its own two SSA IR, register bytecode, optimizing interpreter, tracing optimizing JIT, moving GC integration, generational Sticky Immix garbage collector, structured exceptions, `defer`, `async`/`await`, cancellable Promises, microtasks, timers, and a static module graph.
 
-WrenJIT should therefore be understood as **Wren-derived, not as a promise of drop-in compatibility with every official Wren embedding or implementation detail, although compatibility is near 100%**.
+WrenJIT should therefore be understood as **Wren-derived, not as a promise of drop-in compatibility with every official Wren embedding or implementation detail, although compatibility is near or 100% already**.
 
 WrenJIT should work in AMD64 and ARM64, in Linux, Windows, and MacOS: but only AMD64 Windows and ARM64 MacOS has been tested.
 
