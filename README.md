@@ -1,4 +1,6 @@
-[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/brugarolas)
+<p align="center">
+  <a href="https://www.buymeacoffee.com/brugarolas"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffe"></a>
+</p>
 
 # WrenJIT
 
@@ -9,6 +11,10 @@ WrenJIT began as an attempt to make Wren dramatically faster. It eventually grew
 WrenJIT should therefore be understood as **Wren-derived, not as a promise of drop-in compatibility with every official Wren embedding or implementation detail, although compatibility is near or 100% already**.
 
 WrenJIT should work in AMD64 and ARM64, in Linux, Windows, and MacOS: but only AMD64 Windows and ARM64 MacOS has been tested.
+
+<p align="center">
+  <img src="https://repobeats.axiom.co/api/embed/8287b3608613142a7039c8262663c883ae954871.svg" alt="Repobeats analytics image">
+</p>
 
 ---
 
